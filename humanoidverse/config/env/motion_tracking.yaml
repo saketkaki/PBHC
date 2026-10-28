@@ -78,6 +78,27 @@ env:
         level_down_threshold: 40
         level_up_threshold: 42
 
+    # Terrain-aware motion tracking (all off by default = original PBHC behaviour)
+    terrain_aware:
+      ground_relative_ref: False # shift the reference by the local ground height under its feet
+      recenter_motion_xy: False # place each motion's start xy at the tile centre (where terrain features are); use for all terrain runs
+      support_height_tau: 0.02 # [m] softness of the soft-max over the supporting feet
+      per_foot_ref: False # also shift each leg towards the ground under its own foot (ankle 1, knee 0.5)
+      support_lift_tau: 0.03 # [m] per_foot_ref only: softness of the stance-foot weighting by reference foot lift
+      ref_velocity_correction: True # add the rate of change of the terrain offsets to the reference z velocities
+      ref_velocity_correction_max: 1.0 # [m/s] clamp of that correction (offsets jump when a foot crosses a step edge)
+      feet_ground_footprint: 0.04 # [m] half-length of the footprint the ground under a foot is averaged over (0 = point lookup);
+                                  # smooths offset jumps at step edges at the cost of slight target penetration there
+      spawn_clearance: 0.0 # [m] extra root height at reset
+      leg_joint_pos_weight: 1.0 # weight of hip/knee/ankle joints in the joint-position tracking reward
+      height_scan: # used by the `height_scan` observation
+        x_range: [-0.5, 0.5] # [m] in the robot heading frame
+        y_range: [-0.3, 0.3]
+        resolution: 0.1 # 11 x 7 = 77 points with the defaults; must match obs_dims.height_scan
+        base_offset: 0.75 # [m] observation = root_z - base_offset - terrain_height
+        clip: 1.0
+      debug_draw_height_scan: False # draw the scan points of env 0 in the viewer
+
 
 
 # Globally accessible parameters

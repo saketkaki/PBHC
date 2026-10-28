@@ -76,6 +76,10 @@ class MHPPO(BaseAlgo):
         self.load_optimizer = self.config.load_optimizer
         self.num_learning_iterations = self.config.num_learning_iterations
         self.init_at_random_ep_len = self.config.init_at_random_ep_len
+        # fine-tuning: update only the critic for the first iterations of this run, so that a value function
+        # trained on another task (e.g. flat ground) can adapt before it drives the actor updates
+        self.actor_warmup_iterations = self.config.get('actor_warmup_iterations', 0)
+        self._learn_iteration = 0
 
         # Algorithm related Config
 
@@ -219,8 +223,10 @@ class MHPPO(BaseAlgo):
         
         # do not use track, because it will confict with motion loading bar
         # for it in track(range(self.current_learning_iteration, tot_iter), description="Learning Iterations"):
+        start_iter = self.current_learning_iteration
         for it in range(self.current_learning_iteration, tot_iter):
             self.start_time = time.time()
+            self._learn_iteration = it - start_iter
 
             obs_dict =self._rollout_step(obs_dict)
 
@@ -446,8 +452,10 @@ class MHPPO(BaseAlgo):
         sigma_batch = self.actor.action_std
         entropy_batch = self.actor.entropy
 
-        # KL
-        if self.desired_kl != None and self.schedule == 'adaptive':
+        actor_warmup = self._learn_iteration < self.actor_warmup_iterations
+
+        # KL (not during the actor warm-up: the frozen actor has KL 0, which would drive both learning rates up)
+        if self.desired_kl != None and self.schedule == 'adaptive' and not actor_warmup:
             with torch.inference_mode():
                 kl = torch.sum(
                     torch.log(sigma_batch / old_sigma_batch + 1.e-5) + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / (2.0 * torch.square(sigma_batch)) - 0.5, axis=-1)
@@ -515,14 +523,16 @@ class MHPPO(BaseAlgo):
         self.critic_optimizer.zero_grad()
         
         # print("skip backward")
-        actor_loss.backward()
+        if not actor_warmup:
+            actor_loss.backward()
         critic_loss.backward()
 
         # Gradient step
         nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
-        self.actor_optimizer.step()
+        if not actor_warmup:
+            self.actor_optimizer.step()
         self.critic_optimizer.step()
 
         loss_dict['Value'] += value_loss.item()

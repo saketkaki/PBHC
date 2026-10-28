@@ -1,0 +1,36 @@
+# @package _global_
+
+# Uneven footing for (mostly in-place) highly-dynamic motions: the terrain features
+# pass through the centre of each tile, where the robot performs the motion.
+
+defaults:
+  - terrain_base
+
+terrain:
+  mesh_type : 'trimesh' # none, plane, heightfield or trimesh
+  horizontal_scale : 0.1 # [m]
+  vertical_scale : 0.005 # [m]
+  border_size : 5 # [m]
+  curriculum : False
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0
+  # rough terrain only:
+  measure_heights : False # height scan is configured in env.config.terrain_aware.height_scan
+  measured_points_x : [ 0.]
+  measured_points_y : [ 0.]
+  selected : False
+  terrain_kwargs : null
+  max_init_terrain_level : 4 # starting curriculum state
+  terrain_length : 4.
+  terrain_width : 4.
+  num_rows: 5 # number of terrain rows (difficulty levels)
+  num_cols : 8 # number of terrain cols
+  terrain_types : ['flat', 'rough', 'tilt', 'step']  # do not duplicate!
+  terrain_proportions : [0.1, 0.3, 0.3, 0.3]
+  # trimesh only:
+  slope_treshold : 0.75 # slopes above this threshold will be corrected to vertical surfaces
+  # terrain-aware tracking:
+  fixed_difficulty : null # set in [0, 1] to evaluate a single difficulty level
+  tilt_max_deg : 12.0 # incline at difficulty 1
+  step_height_range : [0.03, 0.10] # [m] step height at difficulty 0 and 1

@@ -182,6 +182,7 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             self._motion_lib.load_motions(random_sample=False)
         else:
             self._motion_lib.load_motions(random_sample=True)
+        self._update_motion_start_xy()
 
         ref_init_state = self.kick_motion_res() ; self._kick_motion_res_counter = -1
         self.ref_init_rpy = get_euler_xyz_in_tensor(ref_init_state['root_rot'][:1]) # [1,3]
@@ -257,7 +258,201 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self.motion_ids = torch.arange(self.num_envs).to(self.device)
         self.motion_start_times = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device, requires_grad=False)
         self.motion_len = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device, requires_grad=False)
-        
+        self._init_terrain_aware()
+
+    ###########################################################################
+    #### Terrain-aware motion tracking
+    ###########################################################################
+    def _init_terrain_aware(self):
+        ta = self.config.get('terrain_aware', None) or {}
+        self._ground_relative_ref = bool(ta.get('ground_relative_ref', False))
+        self._recenter_motion_xy = bool(ta.get('recenter_motion_xy', False))
+        self._support_height_tau = float(ta.get('support_height_tau', 0.02))
+        self._spawn_clearance = float(ta.get('spawn_clearance', 0.0))
+        self._debug_draw_height_scan = bool(ta.get('debug_draw_height_scan', False))
+        self._per_foot_ref = bool(ta.get('per_foot_ref', False))
+        self._support_lift_tau = float(ta.get('support_lift_tau', 0.03))
+        self._ref_velocity_correction = bool(ta.get('ref_velocity_correction', True))
+        self._ref_velocity_correction_max = float(ta.get('ref_velocity_correction_max', 1.0))
+        self._feet_ground_footprint = float(ta.get('feet_ground_footprint', 0.04))
+        self._custom_ref_offset = self._ground_relative_ref or self._recenter_motion_xy
+        if self._ground_relative_ref:
+            logger.info(colored(f"Terrain-aware tracking: ground-relative reference (recenter_motion_xy={self._recenter_motion_xy}, "
+                                f"per_foot_ref={self._per_foot_ref}, ref_velocity_correction={self._ref_velocity_correction}, "
+                                f"feet_ground_footprint={self._feet_ground_footprint})", "green"))
+
+        # per-foot reference: share of the foot's own ground offset given to each body of that leg
+        # (ankle 1, knee 0.5, hip and above 0); the 3 extended bodies (hands, head) get 0
+        body_names = list(self.config.robot.body_names)
+        num_ref_bodies = len(body_names) + self.config.robot.motion.get('nums_extend_bodies', 0)
+        self._leg_body_share = torch.zeros(2, num_ref_bodies, dtype=torch.float, device=self.device)
+        for leg, side in enumerate(['left', 'right']):  # same order as feet_indices (body order)
+            for i, name in enumerate(body_names):
+                if name.startswith(side):
+                    self._leg_body_share[leg, i] = 1.0 if 'ankle' in name else 0.5 if 'knee' in name else 0.
+        # terrain height under each reference foot, relative to which the feet reward measures clearance
+        self.ref_feet_ground_height = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
+        r = self._feet_ground_footprint
+        self._footprint_offsets = torch.tensor([[dx, dy] for dx in (-r, 0., r) for dy in (-r / 2, 0., r / 2)],
+                                               dtype=torch.float, device=self.device)
+
+        # per-env reference support height (terrain height under the reference feet)
+        self.ref_support_height = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        # start xy of each env's motion, used to re-centre motions on their terrain tile
+        self._motion_start_xy = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
+
+        # down-weighting of leg joints in the joint-position reward (legs must deviate on uneven ground)
+        self._leg_joint_pos_weight = float(ta.get('leg_joint_pos_weight', 1.0))
+        self._joint_pos_weights = torch.ones(self.num_dofs, dtype=torch.float, device=self.device)
+        for i, name in enumerate(self.config.robot.dof_names):
+            if any(k in name for k in ['hip', 'knee', 'ankle']):
+                self._joint_pos_weights[i] = self._leg_joint_pos_weight
+
+        # height-scan grid in the robot heading frame
+        hs = ta.get('height_scan', None) or {}
+        x_range, y_range = hs.get('x_range', [-0.5, 0.5]), hs.get('y_range', [-0.3, 0.3])
+        res = hs.get('resolution', 0.1)
+        xs = torch.linspace(x_range[0], x_range[1], int(round((x_range[1] - x_range[0]) / res)) + 1, device=self.device)
+        ys = torch.linspace(y_range[0], y_range[1], int(round((y_range[1] - y_range[0]) / res)) + 1, device=self.device)
+        grid_x, grid_y = torch.meshgrid(xs, ys, indexing='ij')
+        self.num_height_scan_points = grid_x.numel()
+        self._height_scan_points = torch.zeros(self.num_envs, self.num_height_scan_points, 3, device=self.device, requires_grad=False)
+        self._height_scan_points[:, :, 0] = grid_x.flatten()
+        self._height_scan_points[:, :, 1] = grid_y.flatten()
+        self._height_scan_base_offset = hs.get('base_offset', 0.75)
+        self._height_scan_clip = hs.get('clip', 1.0)
+
+    def _terrain_height_at(self, xy):
+        """ Terrain height [m] at world positions xy [..., 2] (same lookup as legged_gym). """
+        if self.config.terrain.mesh_type not in ['heightfield', 'trimesh']:
+            return torch.zeros(xy.shape[:-1], dtype=torch.float, device=self.device)
+        height_samples = self.simulator.height_samples
+        scale = self.config.terrain.horizontal_scale
+        border = self.config.terrain.border_size
+        px = ((xy[..., 0] + border) / scale).long().clamp(0, height_samples.shape[0] - 2)
+        py = ((xy[..., 1] + border) / scale).long().clamp(0, height_samples.shape[1] - 2)
+        heights = torch.min(torch.min(height_samples[px, py], height_samples[px + 1, py]), height_samples[px, py + 1])
+        return heights.float() * self.config.terrain.vertical_scale
+
+    def _feet_ground_height(self, feet_xy):
+        """ Terrain height under feet [..., 2] averaged over a foot-sized footprint, so that it changes
+        continuously (over ~2 * footprint) when a foot moves across a step edge instead of jumping. """
+        if self._feet_ground_footprint <= 0:
+            return self._terrain_height_at(feet_xy)
+        points = feet_xy[..., None, :] + self._footprint_offsets  # [..., 9, 2]
+        return self._terrain_height_at(points).mean(dim=-1)
+
+    def _update_motion_start_xy(self):
+        start = self._motion_lib.get_motion_state(self.motion_ids, torch.zeros(self.num_envs, device=self.device))
+        self._motion_start_xy[:] = start['root_pos'][:, :2]
+        self._kick_motion_res_counter = -1
+        self._kick_motion_res_counter_multistep = -1
+
+    def _ref_offset(self):
+        """ World offset of the reference motion. Original PBHC: env origin (incl. a fixed terrain height). """
+        if not self._custom_ref_offset:
+            return self.env_origins
+        offset = self.env_origins.clone()
+        if self._ground_relative_ref:
+            offset[:, 2] = 0.  # the per-frame support height replaces the fixed origin height
+        if self._recenter_motion_xy:
+            offset[:, :2] -= self._motion_start_xy
+        return offset
+
+    def _ground_relative_z_offsets(self, motion_res):
+        """ Vertical offsets that move the reference (authored on flat ground at z=0) onto the local terrain.
+
+        Rigid shift (per_foot_ref=False): every body is shifted by one support height, a soft maximum
+        of the terrain under the supporting feet, so no reference foot ends up below the ground; the
+        foot over lower ground is pulled down by the ground-relative feet reward. Feet lifted in the
+        reference are ignored by subtracting their lift.
+
+        Per-foot (per_foot_ref=True): the support height is a lift-weighted mean of the ground under
+        the feet (both feet down: the middle; one foot lifted: the stance foot), and each leg is
+        additionally shifted towards the ground under its own foot (ankle fully, knee half), so both
+        reference feet stand on their own ground.
+
+        Both are continuous in time, need no state, and are exactly 0 on flat ground.
+        Returns (support height [N], per-body offsets [N, num_ref_bodies], ground under the ref feet [N, 2]).
+        """
+        ref_feet = motion_res['rg_pos_t'][:, self.feet_indices]  # [N, 2, 3]
+        feet_ground = self._feet_ground_height(ref_feet[..., :2])
+        feet_lift = ref_feet[..., 2] - ref_feet[..., 2].min(dim=-1, keepdim=True)[0]
+        if self._per_foot_ref:
+            weights = torch.softmax(-feet_lift / self._support_lift_tau, dim=-1)
+        else:
+            weights = torch.softmax((feet_ground - feet_lift) / self._support_height_tau, dim=-1)
+        support_height = (weights * feet_ground).sum(dim=-1)  # [N]
+
+        body_offsets = support_height[:, None].expand(-1, self._leg_body_share.shape[1])
+        feet_offsets = support_height[:, None].expand(-1, 2)
+        if self._per_foot_ref:
+            feet_delta = feet_ground - support_height[:, None]  # [N, 2]
+            body_offsets = body_offsets + feet_delta @ self._leg_body_share
+            feet_offsets = feet_ground
+        return support_height, body_offsets, feet_offsets
+
+    def _apply_ground_relative_ref(self, motion_res, prev_motion_res=None):
+        """ Shift the reference onto the local terrain (see _ground_relative_z_offsets). If the reference
+        of the previous control step is given, the rate of change of the offsets is added to the
+        reference z velocities, so that velocity and position targets stay consistent. """
+        support_height, body_offsets, feet_offsets = self._ground_relative_z_offsets(motion_res)
+        num_bodies = motion_res['rg_pos'].shape[1]
+
+        motion_res['root_pos'][:, 2] += body_offsets[:, 0]
+        motion_res['rg_pos'][..., 2] += body_offsets[:, :num_bodies]
+        if motion_res['rg_pos_t'] is not motion_res['rg_pos']:
+            motion_res['rg_pos_t'][..., 2] += body_offsets[:, :motion_res['rg_pos_t'].shape[1]]
+        if prev_motion_res is not None:
+            _, prev_body_offsets, _ = self._ground_relative_z_offsets(prev_motion_res)
+            body_vel_z = ((body_offsets - prev_body_offsets) / self.dt).clamp(  # a foot crossing a step edge makes the
+                -self._ref_velocity_correction_max, self._ref_velocity_correction_max)  # offset jump; no velocity spike for that
+            motion_res['root_vel'][:, 2] += body_vel_z[:, 0]
+            motion_res['body_vel'][..., 2] += body_vel_z[:, :num_bodies]
+            if motion_res['body_vel_t'] is not motion_res['body_vel']:
+                motion_res['body_vel_t'][..., 2] += body_vel_z[:, :motion_res['body_vel_t'].shape[1]]
+        motion_res['ref_support_height'] = support_height
+        motion_res['ref_feet_ground_height'] = feet_offsets
+        return motion_res
+
+    def _update_terrain_curriculum(self, env_ids):
+        """ Terrain curriculum over the difficulty rows: robots that tracked the motion to its end (over at
+        least half of the motion) move one row up, robots whose episode ended before half of the remaining
+        motion move one row down, and robots that solve the hardest row go to a random row (legged_gym). """
+        if not self.init_done or self.common_step_counter == 0:
+            return
+        elapsed = self.last_episode_length_buf[env_ids] * self.dt
+        motion_end = self.reset_buf_terminate_by.get('motion_end')
+        completed = motion_end[env_ids] if motion_end is not None else torch.zeros_like(elapsed, dtype=torch.bool)
+        remaining = self.motion_len[env_ids] - self.motion_start_times[env_ids]
+        move_up = completed & (elapsed >= 0.5 * self.motion_len[env_ids])
+        move_down = ~completed & (elapsed < 0.5 * remaining)
+        levels = self.terrain_levels[env_ids] + move_up.long() - move_down.long()
+        levels = torch.where(levels >= self.max_terrain_level, torch.randint_like(levels, self.max_terrain_level),
+                             torch.clip(levels, min=0))
+        self.terrain_levels[env_ids] = levels
+        self.env_origins[env_ids] = self.terrain_origins[levels, self.terrain_types[env_ids]]
+        self.log_dict["terrain_level"] = self.terrain_levels.float().mean()
+
+    def _get_obs_height_scan(self):
+        root_states = self.simulator.robot_root_states
+        heading_rot = calc_heading_quat(root_states[:, 3:7].clone(), w_last=True)
+        num_points = self.num_height_scan_points
+        points = my_quat_rotate(heading_rot.repeat_interleave(num_points, dim=0),
+                                self._height_scan_points.view(-1, 3)).view(self.num_envs, num_points, 3)
+        points_xy = points[..., :2] + root_states[:, None, :2]
+        heights = self._terrain_height_at(points_xy)
+        return torch.clip(root_states[:, 2:3] - self._height_scan_base_offset - heights,
+                          -self._height_scan_clip, self._height_scan_clip)
+
+    def _height_scan_world_points(self, env_id):
+        root_states = self.simulator.robot_root_states
+        heading_rot = calc_heading_quat(root_states[env_id:env_id+1, 3:7].clone(), w_last=True)
+        points = my_quat_rotate(heading_rot.repeat(self.num_height_scan_points, 1), self._height_scan_points[env_id])
+        points[:, :2] += root_states[env_id, :2]
+        points[:, 2] = self._terrain_height_at(points[:, :2])
+        return points
+
     def _init_domain_rand_buffers(self):
         super()._init_domain_rand_buffers()
         self.ref_episodic_offset = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
@@ -274,7 +469,10 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         
         self.log_dict["end_time_ratio"] = self.end_time_ratio_buf.mean()
         self.log_dict["end_time_ratio_std"] = self.end_time_ratio_buf.std()
-        
+
+        if self.custom_origins and self.config.terrain.curriculum:
+            self._update_terrain_curriculum(env_ids)  # before the motion times are resampled
+
         # env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self._resample_motion_times(env_ids) # need to resample before reset root states
         if self.config.termination.terminate_when_motion_far and self.config.termination_curriculum.terminate_when_motion_far_curriculum:
@@ -364,6 +562,7 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         if self.motion_start_idx >= self.num_motions:
             self.motion_start_idx = 0
         self._motion_lib.load_motions(random_sample=False, start_idx=self.motion_start_idx)
+        self._update_motion_start_xy()
         self.reset_all()
 
     def _resample_motion_times(self, env_ids):
@@ -384,7 +583,8 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
 
     def resample_motion(self):
         self._motion_lib.load_motions(random_sample=True)
-        
+        self._update_motion_start_xy()
+
         
         self.reset_envs_idx(torch.arange(self.num_envs, device=self.device))
 
@@ -409,6 +609,16 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self.log_dict["lower_body_diff_norm"] = lower_body_diff_norm
         self.log_dict["vr_3point_diff_norm"] = vr_3point_diff_norm
         self.log_dict["joint_pos_diff_norm"] = joint_pos_diff_norm
+
+        if self._ground_relative_ref:
+            # sanity of the terrain-adapted reference: the lower reference foot should sit on the ground (~ankle height)
+            ref_feet = self.ref_body_pos_extend[:, self.feet_indices]
+            ref_feet_clearance = ref_feet[..., 2] - self._terrain_height_at(ref_feet[..., :2])
+            robot_feet = self.simulator._rigid_body_pos[:, self.feet_indices]
+            robot_feet_clearance = robot_feet[..., 2] - self._terrain_height_at(robot_feet[..., :2])
+            self.log_dict["ref_support_height"] = self.ref_support_height.mean()
+            self.log_dict["ref_feet_min_clearance"] = ref_feet_clearance.min(dim=-1)[0].mean()
+            self.log_dict["robot_feet_min_clearance"] = robot_feet_clearance.min(dim=-1)[0].mean()
         
         if 'enable' in self.config.soft_dynamic_correction and self.config.soft_dynamic_correction.enable:
             self.log_dict["sdc_alpha"] = torch.tensor(self.sdc_alpha, dtype=torch.float, device=self.device)
@@ -436,6 +646,10 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
                     # import ipdb; ipdb.set_trace()
                     self.simulator.draw_sphere(pos_joint, 0.04, color_inner, env_id, pos_id)
 
+                if self._debug_draw_height_scan:
+                    for point in self._height_scan_world_points(env_id):
+                        self.simulator.draw_sphere(point, 0.015, (0.1, 0.6, 1.0), env_id)
+
 
             else:
                 # draw teleop joints
@@ -452,7 +666,7 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         """
         # base position
         # breakpoint()
-        if self.custom_origins: # trimesh
+        if self.custom_origins and not self._ground_relative_ref: # trimesh (original PBHC path)
             motion_times = (self.episode_length_buf) * self.dt + self.motion_start_times # next frames so +1
             offset = self.env_origins
             # motion_res = self._motion_lib.get_motion_state(self.motion_ids, motion_times, offset=offset)
@@ -507,6 +721,8 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             self.simulator.robot_root_states[env_ids, 10:13] = root_ang_vel + torch.randn_like(root_ang_vel) * root_ang_vel_noise
 
         # self.simulator.robot_root_states[env_ids, 2] += 0.05 # in case under the terrain
+        if self._spawn_clearance > 0:
+            self.simulator.robot_root_states[env_ids, 2] += self._spawn_clearance
 
     def small_random_quaternions(self, n, max_angle):
             # XYZW
@@ -552,9 +768,14 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self._kick_motion_res_counter = self.common_step_counter
         
         motion_times = (self.episode_length_buf + 1) * self.dt + self.motion_start_times # next frames so +1
-        offset = self.env_origins
+        offset = self._ref_offset()
         self._kick_motion_res_buffer = self._motion_lib.get_motion_state(self.motion_ids, motion_times, offset=offset)
-        
+        if self._ground_relative_ref:
+            prev_motion_res = None
+            if self._ref_velocity_correction:  # reference one control step earlier, for the offset rate of change
+                prev_motion_res = self._motion_lib.get_motion_state(self.motion_ids, motion_times - self.dt, offset=offset)
+            self._apply_ground_relative_ref(self._kick_motion_res_buffer, prev_motion_res)
+
         return self._kick_motion_res_buffer
     
     _kick_motion_res_counter_multistep = -1
@@ -568,8 +789,10 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
 
         for i in range(self.config.obs.future_ref_steps):
             motion_times = (self.episode_length_buf + 1 + i) * self.dt + self.motion_start_times
-            offset = self.env_origins
+            offset = self._ref_offset()
             motion= self._motion_lib.get_motion_state(self.motion_ids, motion_times, offset=offset)
+            if self._ground_relative_ref:
+                self._apply_ground_relative_ref(motion)
             for k, v in motion.items():
                 if k not in buffer:
                     buffer[k] = []
@@ -591,6 +814,9 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         # # motion_res = self._get_state_from_motionlib_cache_trimesh(self.motion_ids, motion_times, offset= offset)
         # motion_res = self._motion_lib.get_motion_state(self.motion_ids, motion_times, offset=offset)
         motion_res = self.kick_motion_res()
+        if self._ground_relative_ref:
+            self.ref_support_height[:] = motion_res['ref_support_height']
+            self.ref_feet_ground_height[:] = motion_res['ref_feet_ground_height']
         if "future_ref_steps" in self.config.obs and self.config.obs.future_ref_steps > 0:
             future_motion_res = self.kick_motion_res_multiplestep()
             future_ref_joint_pos = future_motion_res["dof_pos"] # [num_envs, num_future_steps, num_dofs]
@@ -869,7 +1095,8 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
                     self.saved_motion_dict[k] = torch.stack(v[3:]).transpose(0,1).numpy()
                     print("DEBUG: ",k,self.saved_motion_dict[k].shape, self.saved_motion_dict[k].dtype)
                     
-                self.saved_motion_dict['root_trans_offset'] -= self.env_origins.cpu().numpy().reshape(-1, 1, 3)
+                if not self._custom_ref_offset: # otherwise the offset was already removed per frame
+                    self.saved_motion_dict['root_trans_offset'] -= self.env_origins.cpu().numpy().reshape(-1, 1, 3)
                 self.saved_motion_dict['motion_times'] = torch.stack(self.motion_times_buf[3:]).transpose(0,1).numpy()
                 
                 dump_data = {}
@@ -904,6 +1131,12 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
                     
                     
             root_trans = self.simulator.robot_root_states[:, 0:3].cpu()
+            if self._custom_ref_offset:
+                # express the root in the reference motion's frame (flat ground at z=0)
+                ref_offset = self._ref_offset().clone()
+                if self._ground_relative_ref:
+                    ref_offset[:, 2] += self.ref_support_height
+                root_trans = root_trans - ref_offset.cpu()
             if self.config.simulator.config.name == "isaacgym":
                 root_rot = self.simulator.robot_root_states[:, 3:7].cpu() # xyzw
             elif self.config.simulator.config.name == "isaacsim":
@@ -1210,6 +1443,13 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
     def _reward_teleop_body_position_feet(self):
 
         feet_diff = self.dif_global_body_pos[:, self.feet_indices, :]
+        if self._ground_relative_ref:
+            # compare foot heights above the local ground instead of world z
+            robot_feet = self.simulator._rigid_body_pos[:, self.feet_indices]
+            robot_clearance = robot_feet[..., 2] - self._feet_ground_height(robot_feet[..., :2])
+            ref_clearance = self.ref_body_pos_extend[:, self.feet_indices, 2] - self.ref_feet_ground_height
+            feet_diff = feet_diff.clone()
+            feet_diff[..., 2] = ref_clearance - robot_clearance
         feet_dist = (feet_diff**2).mean(dim=-1).mean(dim=-1)
         # feet_dist_feet = (feet_diff**2).mean(dim=-1)
         # print(f"{feet_dist=} | {feet_dist_feet.max()=} | {feet_dist_feet.min()=}")
@@ -1264,8 +1504,11 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
 
     def _reward_teleop_joint_position(self):
         joint_pos_diff = self.dif_joint_angles
-        diff_joint_pos_dist = (joint_pos_diff**2).mean(dim=-1)
-        
+        if self._leg_joint_pos_weight == 1.0:
+            diff_joint_pos_dist = (joint_pos_diff**2).mean(dim=-1)
+        else:
+            diff_joint_pos_dist = ((joint_pos_diff**2) * self._joint_pos_weights).sum(dim=-1) / self._joint_pos_weights.sum()
+
         # diff_joint = (joint_pos_diff**2)
         # print(f"{diff_joint_pos_dist=} \t| {diff_joint.max()=} \t| {diff_joint.min()=}")
         r_joint_pos = torch.exp(-diff_joint_pos_dist / self.config.rewards.reward_tracking_sigma.teleop_joint_pos)

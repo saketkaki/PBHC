@@ -52,6 +52,11 @@ class Terrain:
             difficulty = np.random.choice([0.5, 0.75, 0.9])
             if terrain_type == 'smooth_slope' or terrain_type == 'rough_slope':
                 difficulty = i / self.cfg.num_rows
+            if terrain_type in ['tilt', 'step']:
+                difficulty = (i + 1) / self.cfg.num_rows
+            # fixed difficulty for evaluation on a single difficulty level
+            if self.cfg.get('fixed_difficulty', None) is not None:
+                difficulty = self.cfg.fixed_difficulty
             terrain = self.make_terrain(terrain_type, difficulty)
             self.add_terrain_to_map(terrain, i, j)
         print('\n generated all randomized terrains!')
@@ -161,6 +166,28 @@ class Terrain:
         terrain_utils.pyramid_sloped_terrain(terrain, slope=slope, platform_size=0.)
         terrain_utils.random_uniform_terrain(terrain, min_height=-0.05, max_height=0.05, step=0.005,
                                                 downsampled_scale=0.2)
+
+    def _centered_direction(self, terrain):
+        # signed distance [m] of each height-field cell from a random line through the tile centre
+        xs = (np.arange(terrain.height_field_raw.shape[0]) - terrain.height_field_raw.shape[0] / 2) * terrain.horizontal_scale
+        ys = (np.arange(terrain.height_field_raw.shape[1]) - terrain.height_field_raw.shape[1] / 2) * terrain.horizontal_scale
+        xx, yy = np.meshgrid(xs, ys, indexing='ij')
+        phi = np.random.uniform(0, 2 * np.pi)
+        return xx * np.cos(phi) + yy * np.sin(phi)
+
+    def tilt_terrain_func(self, terrain, difficulty):
+        # planar ramp passing through the tile centre, so the robot performs on the incline
+        max_angle = np.deg2rad(self.cfg.get('tilt_max_deg', 12.0))
+        dist = self._centered_direction(terrain)
+        terrain.height_field_raw = np.tan(max_angle * difficulty) * dist / terrain.vertical_scale
+
+    def step_terrain_func(self, terrain, difficulty):
+        # one half of the tile is raised; the edge lies near the centre, i.e. between the robot's feet
+        h_min, h_max = self.cfg.get('step_height_range', [0.03, 0.10])
+        step_height = h_min + (h_max - h_min) * difficulty
+        edge = np.random.uniform(-0.15, 0.15)
+        dist = self._centered_direction(terrain)
+        terrain.height_field_raw = (dist > edge) * step_height / terrain.vertical_scale
 
     def low_obst_terrain_func(self, terrain, difficulty):
         max_height = 0.03 * difficulty / 0.9
