@@ -5,7 +5,7 @@ plays at real time (50 fps) and clips of different policies line up frame by fra
 fixed on the robot's start position.
 
 usage (from the repo root, env `pbhc` active, a display available):
-  python scripts/record_video.py record CKPT --out clip.mp4 [--seconds 10] [--label TEXT]
+  python scripts/record_video.py record CKPT --out clip.mp4 [--seconds 10] [--label TEXT] [--far 0.7]
          [--wandb-run ENTITY/PROJECT/RUN_ID] [--wandb-key videos/step_d10] [--merge cfg.yaml ...] [key=value ...]
   python scripts/record_video.py stack OUT.mp4 IN1.mp4 IN2.mp4 ...   # side by side
 
@@ -59,6 +59,13 @@ def record(args, overrides):
         for key in cfg:  # replace whole groups (e.g. `terrain`), like a hydra group override
             config[key] = cfg[key]
     config = OmegaConf.merge(config, OmegaConf.from_dotlist(['headless=False', 'num_envs=1'] + overrides))
+    # same episode ends as terrain_eval.py, so every checkpoint is judged alike (training configs carry their own,
+    # e.g. a motion-far threshold from 0.3 to 1.5 m with its curriculum still running)
+    termination = config.env.config.termination
+    for key in termination:
+        termination[key] = key in ('terminate_when_motion_end', 'terminate_by_gravity', 'terminate_when_motion_far')
+    config.env.config.termination_scales.termination_motion_far_threshold = args.far
+    config.env.config.termination_curriculum.terminate_when_motion_far_curriculum = False
     pre_process_config(config)
     frames_dir = Path(tempfile.mkdtemp(prefix='pbhc_frames_'))
     config.env.config.save_rendering_dir = str(frames_dir)  # required by the viewer setup; its own recorder is not used
@@ -127,10 +134,15 @@ def record(args, overrides):
     if args.wandb_run:
         import wandb
         entity, project, run_id = args.wandb_run.split('/')
-        run = wandb.init(entity=entity, project=project, id=run_id, resume='allow')
-        run.log({args.wandb_key: wandb.Video(str(out), fps=50, format='mp4', caption=caption)})
-        run.finish()
-        print(f'uploaded to {args.wandb_run} as {args.wandb_key}')
+        # the video is already written: a W&B network error only skips the upload
+        try:
+            run = wandb.init(entity=entity, project=project, id=run_id, resume='allow',
+                             settings=wandb.Settings(init_timeout=300))
+            run.log({args.wandb_key: wandb.Video(str(out), fps=50, format='mp4', caption=caption)})
+            run.finish()
+            print(f'uploaded to {args.wandb_run} as {args.wandb_key}')
+        except Exception as e:
+            print(f'WARNING: upload to {args.wandb_run} failed ({e}); video kept at {out}')
 
 
 if __name__ == '__main__':
@@ -142,6 +154,7 @@ if __name__ == '__main__':
     rec.add_argument('--seconds', type=float, default=10.0)
     rec.add_argument('--label', default='')
     rec.add_argument('--seed', type=int, default=0)
+    rec.add_argument('--far', type=float, default=0.7, help='motion-far termination threshold [m], as in terrain_eval.py')
     rec.add_argument('--device', default='cuda:0')
     rec.add_argument('--cam-offset', type=float, nargs=3, default=[1.8, -1.8, 0.6], help='camera position relative to the start root [m]')
     rec.add_argument('--merge', action='append', default=[])

@@ -3,8 +3,9 @@
 The first layer of the actor and of the critic is rebuilt for the new observation layout: the weights of every
 observation term present in the old layout are copied to that term's new position, and new terms (e.g.
 `height_scan`) get zero weights. The expanded network therefore computes exactly the same actions and values
-as the original until training changes the new weights. The optimizer state is dropped (fine-tune with
-`algo.config.load_optimizer=False`); the iteration counter is kept.
+as the original until training changes the new weights. The Adam moments of the first layers are expanded the
+same way (zero for new terms), so the optimizer state can be loaded too (`algo.config.load_optimizer=True`);
+the iteration counter is kept.
 
 usage (from the repo root, env `pbhc` active):
   python scripts/expand_checkpoint.py CKPT NEW_OBS_YAML OUT_CKPT
@@ -55,8 +56,12 @@ for net, obs_key, model_key, layer in (('actor', 'actor_obs', 'actor_model_state
     assert weight.shape[1] == old_dims[obs_key], f'{net}: checkpoint input {weight.shape[1]} != config {old_dims[obs_key]}'
     print(f'{net}: {old_dims[obs_key]} -> {new_dims[obs_key]} inputs')
     state[model_key][layer] = expand_first_layer(weight, old_slices[obs_key], new_slices[obs_key], new_dims[obs_key])
-state.pop('actor_optimizer_state_dict')
-state.pop('critic_optimizer_state_dict')
+    # optimizer state is indexed by parameter order, which is the order of the model state dict
+    optimizer_state = state[f'{net}_optimizer_state_dict']['state'][list(state[model_key]).index(layer)]
+    for moment in ('exp_avg', 'exp_avg_sq'):
+        assert optimizer_state[moment].shape == weight.shape, f'{net} {moment}: shape {optimizer_state[moment].shape}'
+        optimizer_state[moment] = expand_first_layer(optimizer_state[moment], old_slices[obs_key], new_slices[obs_key],
+                                                     new_dims[obs_key])
 
 out.parent.mkdir(parents=True, exist_ok=True)
 torch.save(state, out)

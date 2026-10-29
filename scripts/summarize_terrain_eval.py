@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-TERRAINS = ['flat', 'rough_d09', 'tilt_d05', 'tilt_d10', 'step_d05', 'step_d10']
+TERRAINS = ['flat', 'rough_d09', 'bumps_d10', 'tilt_d05', 'tilt_d10', 'step_d05', 'step_d10']
 PERCENT = {'completion_rate', 'fall_rate', 'drift_rate', 'episode_length_ratio'}
 
 parser = argparse.ArgumentParser()

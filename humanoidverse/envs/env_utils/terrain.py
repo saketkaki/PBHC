@@ -52,7 +52,7 @@ class Terrain:
             difficulty = np.random.choice([0.5, 0.75, 0.9])
             if terrain_type == 'smooth_slope' or terrain_type == 'rough_slope':
                 difficulty = i / self.cfg.num_rows
-            if terrain_type in ['tilt', 'step']:
+            if terrain_type in ['tilt', 'step', 'bumps']:
                 difficulty = (i + 1) / self.cfg.num_rows
             # fixed difficulty for evaluation on a single difficulty level
             if self.cfg.get('fixed_difficulty', None) is not None:
@@ -82,6 +82,10 @@ class Terrain:
             for j in range(start_col, end_col):
                 for i in range(self.cfg.num_rows):
                     difficulty = i / self.cfg.num_rows
+                    # terrain-aware types: rows span difficulty 1/num_rows .. 1 (as in randomized_terrain), so the
+                    # top row is the hardest evaluation setting
+                    if terrain_type in ['tilt', 'step', 'bumps']:
+                        difficulty = (i + 1) / self.cfg.num_rows
                     terrain = self.make_terrain(terrain_type, difficulty)
                     self.add_terrain_to_map(terrain, i, j)
         print('\n generated all curriculum terrains!')
@@ -188,6 +192,17 @@ class Terrain:
         edge = np.random.uniform(-0.15, 0.15)
         dist = self._centered_direction(terrain)
         terrain.height_field_raw = (dist > edge) * step_height / terrain.vertical_scale
+
+    def bumps_terrain_func(self, terrain, difficulty):
+        # smooth random bumps around zero height: heights drawn every `bumps_spacing` m, bilinear in between.
+        # Unlike `rough` (independent noise in every 0.1 m cell), the bumps are large enough for the height scan
+        amplitude = self.cfg.get('bumps_max_height', 0.04) * difficulty
+        spacing = self.cfg.get('bumps_spacing', 0.3)
+        fine = [np.arange(n) * terrain.horizontal_scale for n in terrain.height_field_raw.shape]
+        coarse = [np.arange(0, axis[-1] + spacing, spacing) for axis in fine]
+        heights = np.random.uniform(-amplitude, amplitude, [len(axis) for axis in coarse])
+        points = np.stack(np.meshgrid(*fine, indexing='ij'), axis=-1)
+        terrain.height_field_raw = np.rint(interpolate.RegularGridInterpolator(coarse, heights)(points) / terrain.vertical_scale)
 
     def low_obst_terrain_func(self, terrain, difficulty):
         max_height = 0.03 * difficulty / 0.9

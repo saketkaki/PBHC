@@ -169,7 +169,7 @@ The paper trains each model for 27 h on an RTX 4090; our RTX 5090 is shared, so 
 
 Survey terrain-conditioned humanoid motion imitation from 2025 before claiming novelty (e.g. VideoMimic, which we believe does terrain-aware imitation from video; verify). Frame our contribution as: **adding terrain awareness to PBHC's adaptive motion-tracking framework for highly-dynamic skills, via ground-relative reference adaptation and height-scan perception**, and state clearly how it differs.
 
-## 8. Implementation status (Steps 0–3 done, 2026-10-27)
+## 8. Implementation status (Steps 0–4 done, 2026-10-28)
 
 Branch: `terrain-aware-tracking`. Everything is **off by default**, so existing configs and checkpoints behave exactly as before.
 
@@ -278,7 +278,7 @@ python humanoidverse/ratio_eps.py +device=cuda:0 +checkpoint=<run>/model_<N>.pt 
 
 To evaluate the released checkpoint (which predates these options), add `+env.config.terrain_aware.recenter_motion_xy=True` and, for the ground-relative variant, `+env.config.terrain_aware.ground_relative_ref=True`.
 
-**Videos.** `scripts/record_video.py record CKPT --out clip.mp4 [--seconds 10] [--label ...] [--wandb-run ENTITY/PROJECT/RUN_ID] [overrides]` renders one frame per control step (real-time 50 fps, unlike the viewer's own R-key recorder, which drops frames), uses a fixed camera on the start position, prints when and why each episode ended, and burns the fall count into the video. Terrain and tile assignment are seeded (`--seed`, default 0), so different checkpoints are filmed on the same tile and step edge. `record_video.py stack OUT.mp4 IN1.mp4 IN2.mp4 ...` puts clips side by side. `scripts/record_pilot_videos.sh B_RUN_DIR C_RUN_DIR` records A (released), B and C (latest checkpoints) on step 1.0/0.5, tilt 1.0, rough 0.9 and flat, attaches each clip to its W&B run (`videos/<terrain>`) and the A | B | C comparisons to both runs (`videos/compare_<terrain>`). Videos need a display (the viewer window opens).
+**Videos.** `scripts/record_video.py record CKPT --out clip.mp4 [--seconds 10] [--label ...] [--wandb-run ENTITY/PROJECT/RUN_ID] [overrides]` renders one frame per control step (real-time 50 fps, unlike the viewer's own R-key recorder, which drops frames), uses a fixed camera on the start position, prints when and why each episode ended, and burns the fall count into the video. Terrain and tile assignment are seeded (`--seed`, default 0), so different checkpoints are filmed on the same tile and step edge. `record_video.py stack OUT.mp4 IN1.mp4 IN2.mp4 ...` puts clips side by side. `scripts/record_pilot_videos.sh TAG=RUN_DIR|CKPT ...` (e.g. `B=... C=... E=...`; `SECONDS_PER_CLIP` and `OUT` as environment variables) records A (released) and each given run (a run directory means its latest checkpoint) on step 1.0/0.5, tilt 1.0/0.5, rough 0.9 and flat, attaches each clip to its W&B run (`videos/<terrain>`) and the side-by-side comparisons (A first) to every run (`videos/compare_<terrain>`). Videos need a display (the viewer window opens).
 
 ### Pilot results (B and C, 2 h each, 2026-10-27)
 
@@ -334,9 +334,88 @@ Baseline A (released checkpoint, zero-shot, ground-relative reference; `eval_ter
 | Episode-length ratio | 99.5% | 20.2% | 16.1% | 11.2% | 12.3% | 12.8% |
 | Root-relative body error | 20.4 mm | 51 mm | 57 mm | 61 mm | 58 mm | 54 mm |
 
-Runs (3 h each, all three in parallel, ~6.7 GB GPU memory and ~2.7–3.3 s per iteration each; iteration numbers continue from 50,000): W&B `ft_B_naive` = `pdle14pn`, `ft_C_ground_rel` = `6k6a8guf`, `ft_E_full` = `zts2025b`.
+Runs (all three in parallel, 1536 envs, ~6.7 GB GPU memory each; iteration numbers continue from 50,000). Every row ran to iteration **53,500** (3,500 fine-tuning iterations):
+
+| Row | First part (W&B) | Resumed part (W&B) | Final checkpoint |
+|---|---|---|---|
+| B | `ft_B_naive` = `pdle14pn`, to it. 51,500 | `ft_B_naive_resume` = `8v6l43xv` | `logs/MotionTracking/20261028_091228-ft_B_naive_resume-…/model_53500.pt` |
+| C | `ft_C_ground_rel` = `6k6a8guf`, to it. 51,500 | `ft_C_ground_rel_resume` = `ub9hc8tw` | `logs/MotionTracking/20261028_091228-ft_C_ground_rel_resume-…/model_53500.pt` |
+| E | `ft_E_full` = `zts2025b`, to it. 51,250 | `ft_E_full_resume` = `e60m9jmo` | `logs/MotionTracking/20261028_091228-ft_E_full_resume-…/model_53500.pt` |
+
+**Interruption and resume.** The first runs died together at ~23:10 on 2026-10-27 (exit status 120, logs cut mid-line) because the shared root volume filled up; the runs themselves wrote only a few MB per hour. On 2026-10-28 each was resumed from its last checkpoint with `algo.config.load_optimizer=True` (weights, Adam state and learning rate), `+algo.config.actor_warmup_iterations=0`, `terminate_when_motion_far_initial_threshold=0.3` (where the curriculum had arrived), the last logged adaptive σ values passed as `rewards.reward_tracking_sigma.*` overrides (the error EMA starts at the configured σ, so this continues the adaptation), and `algo.config.num_learning_iterations` set so that all rows end at 53,500. Learning rate and action noise continue smoothly across the restart. The terrain level is not stored in checkpoints and restarted at 0; it was back to ~0.8–1.0 after 50 iterations. Training-log values at the end (random motion phases, curriculum terrain):
+
+| Row | terrain_level | end_time_ratio | motion_far terminations | action noise std |
+|---|---|---|---|---|
+| B | 1.69 | 0.854 | 32% | 0.59 |
+| C | 1.75 | 0.857 | 32% | 0.59 |
+| E | 2.37 | 0.883 | 27% | 0.56 |
+
+Note on checkpoint names: `mh_ppo.learn` saves the final policy as `model_<last save iteration>.pt`, so in each resumed run `model_53250.pt` holds the final weights (the true 53,250 snapshot was overwritten). It was copied to `model_53500.pt`.
+
+#### Results at iteration 53,500
+
+`eval_terrain_matrix.sh CKPT env.config.terrain_aware.ground_relative_ref=True` for all rows (the actor never sees the reference positions, so the ground-relative reference changes only the drift termination and the global error, and all rows are measured against the same reference), seeds 0 and 1, 200 episodes each; mean over seeds (± std where it exceeds 3 points). Results: `<run>/metrics/terrain_eval/model_53500/`.
+
+Episode-length ratio (share of the motion tracked before the episode ends):
+
+| Row | flat | rough 0.9 | tilt 6° | tilt 12° | step 6.5 cm | step 10 cm |
+|---|---|---|---|---|---|---|
+| A released, zero-shot | **99.5%** | 20.2% | 16.1% | 11.2% | 12.3% | 12.8% |
+| B naive reference | 61.1% | 37.4% | 31.7 ± 5.2% | 18.2% | 19.1% | 15.4% |
+| C ground-relative reference | 74.0% | **39.0%** | 36.8% | 17.0% | 18.0% | 15.8% |
+| E + height scan (full) | 95.2% | 38.5% | **81.0%** | **42.0%** | **28.4 ± 8.8%** | **20.1%** |
+
+Completed episodes / falls (gravity termination):
+
+| Row | flat | rough 0.9 | tilt 6° | tilt 12° | step 6.5 cm | step 10 cm |
+|---|---|---|---|---|---|---|
+| A | 99% / 1% | 0% / 21% | 0% / 18% | 0% / 11% | 0% / 6% | 0% / 7% |
+| B | 42% / 14% | 11% / 23% | 7 ± 7% / 32% | 0% / 30% | 0% / 34% | 0% / 36% |
+| C | 62% / 2% | 12% / 7% | 14% / 5% | 0% / 1% | 0% / 3% | 0% / 2% |
+| E | 92% / 2% | 11% / 32% | 69% / 5% | 16% / 15% | 9 ± 9% / 36% | 0% / 24% |
+
+Root-relative body error [mm]:
+
+| Row | flat | rough 0.9 | tilt 6° | tilt 12° | step 6.5 cm | step 10 cm |
+|---|---|---|---|---|---|---|
+| A | **20.4** | 51.0 | 57.3 | 61.4 | 57.5 | **54.3** |
+| B | 49.8 | 57.2 | 58.2 | 67.3 | 65.7 | 65.6 |
+| C | 45.8 | 51.5 | 54.0 | 61.5 | 59.2 | 61.7 |
+| E | 45.1 | 58.6 | **48.3** | **60.0** | 58.1 | 64.9 |
+
+Findings:
+
+- **Perception (E) is what makes terrain tracking work.** E is the only row that completes whole motions on tilts and steps (69% on 6° tilt, 16% on 12°, 9% on 6.5 cm steps) and tracks 2–5× more of the motion than A on tilts; it also keeps flat ground close to A (95% vs. 99.5%).
+- **The ground-relative reference alone (C vs. B) barely changes how much of the motion is tracked, but almost removes falls** (1–7% vs. 23–36%): C's episodes end by drifting from the reference, not by tipping over, and its tracking error is lower than B's on every terrain. Without perception, the policy still cannot place its feet for the terrain.
+- **Rough 0.9 is the same for B, C and E** (~38%, about twice A): the bumps are too small and irregular for the 10 cm scan grid to add much.
+- **The 10 cm step remains unsolved** (≤ 20% of the motion, no completed episode).
+- **All fine-tuned rows lost flat-ground precision** (root-relative error 20 → 45–50 mm; see below), so the terrain gains above are measured from a degraded starting point.
+
+#### Diagnosis: fine-tuning damaged the released policy early
+
+The released weights evaluated with the fine-tuning run's own config (`ft_B_naive/model_50000.pt`, identical to the released actor because of the critic-only warm-up) give 99% completed and 20.6 mm on flat ground, so the evaluation setup is not the cause. Row B on flat ground (seed 0) during fine-tuning:
+
+| Checkpoint | Actor updates | Completed | Root-relative error |
+|---|---|---|---|
+| 50,000 (released weights) | 0 | 99% | 21 mm |
+| 50,250 | 100 | **0%** | 41 mm |
+| 51,500 | 1,350 | 69% | 53 mm |
+| 53,500 (final) | 3,350 | 39% | 50 mm |
+
+The policy collapses within the first 100 actor updates and only partly recovers. Over the first ~1,000 iterations of every row, the action noise std rises from 0.21 to ~0.59 and the action-rate penalty from −0.22 to ~−1.4 (actions become much jerkier). Likely causes: a fresh Adam state (`load_optimizer=False`) whose first steps move every parameter by about the full learning rate; the starting learning rate of 3e-4 (the KL-adaptive schedule cut it to ~5e-5 only afterwards); and the entropy bonus driving the noise up while terrain rewards are low.
+
+Proposed settings for the next round:
+
+- B and C: load the released optimizer state (`load_optimizer=True`; not possible for E, whose first layer changes size).
+- Learning rate 1e-5–3e-5, with a short warm-up ramp.
+- Entropy coefficient 0, and the noise std fixed or capped at ~0.25.
+- Keep some flat terrain in the curriculum.
+- Evaluate on flat ground every 500 iterations to catch forgetting early.
+
+Videos of A, B, C and E at iteration 53,500 on all test terrains: `logs/MotionTracking/videos_ft_it53500/` (side-by-side `compare_<terrain>.mp4`, A | B | C | E), also attached to the resumed W&B runs under `videos/`.
 
 ### Not done yet
 
-- Rows C′, C+ and D; final evaluation matrix of the fine-tuned B, C and E.
+- Re-run B, C and E with the gentler fine-tuning settings above.
+- Rows C′, C+ and D.
 - Teacher–student distillation (stretch goal).

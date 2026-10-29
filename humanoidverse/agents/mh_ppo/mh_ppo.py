@@ -79,6 +79,13 @@ class MHPPO(BaseAlgo):
         # fine-tuning: update only the critic for the first iterations of this run, so that a value function
         # trained on another task (e.g. flat ground) can adapt before it drives the actor updates
         self.actor_warmup_iterations = self.config.get('actor_warmup_iterations', 0)
+        # fine-tuning: ramp the actor learning rate linearly from 0 over this many iterations after the warm-up
+        # (fixed schedule only; the adaptive schedule sets the learning rate itself)
+        self.actor_lr_ramp_iterations = self.config.get('actor_lr_ramp_iterations', 0)
+        # fine-tuning: keep the action noise std of the loaded checkpoint (no gradient)
+        self.fix_noise_std = self.config.get('fix_noise_std', False)
+        # with load_optimizer: False keeps the configured learning rates instead of the checkpoint's
+        self.load_optimizer_lr = self.config.get('load_optimizer_lr', True)
         self._learn_iteration = 0
 
         # Algorithm related Config
@@ -148,6 +155,8 @@ class MHPPO(BaseAlgo):
             
         print(self.actor)
         print(self.critic)
+        if self.fix_noise_std:
+            self.actor.std.requires_grad_(False)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.actor_learning_rate)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.critic_learning_rate)
 
@@ -187,9 +196,15 @@ class MHPPO(BaseAlgo):
             if self.load_optimizer:
                 self.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
                 self.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
-                self.actor_learning_rate = loaded_dict['actor_optimizer_state_dict']['param_groups'][0]['lr']
-                self.critic_learning_rate = loaded_dict['critic_optimizer_state_dict']['param_groups'][0]['lr']
-                self.set_learning_rate(self.actor_learning_rate, self.critic_learning_rate)
+                if self.load_optimizer_lr:
+                    self.actor_learning_rate = loaded_dict['actor_optimizer_state_dict']['param_groups'][0]['lr']
+                    self.critic_learning_rate = loaded_dict['critic_optimizer_state_dict']['param_groups'][0]['lr']
+                    self.set_learning_rate(self.actor_learning_rate, self.critic_learning_rate)
+                else:
+                    for optimizer, lr in ((self.actor_optimizer, self.actor_learning_rate),
+                                          (self.critic_optimizer, self.critic_learning_rate)):
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = lr
                 logger.info(f"Optimizer loaded from checkpoint")
                 logger.info(f"Actor Learning rate: {self.actor_learning_rate}")
                 logger.info(f"Critic Learning rate: {self.critic_learning_rate}")
@@ -472,6 +487,10 @@ class MHPPO(BaseAlgo):
                     param_group['lr'] = self.actor_learning_rate
                 for param_group in self.critic_optimizer.param_groups:
                     param_group['lr'] = self.critic_learning_rate
+        elif self.actor_lr_ramp_iterations > 0 and not actor_warmup:
+            ramp = min(1.0, (self._learn_iteration - self.actor_warmup_iterations + 1) / self.actor_lr_ramp_iterations)
+            for param_group in self.actor_optimizer.param_groups:
+                param_group['lr'] = self.actor_learning_rate * ramp
 
         # Surrogate loss
         ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -602,8 +621,8 @@ class MHPPO(BaseAlgo):
                 
             for loss_key, loss_value in log_dict['loss_dict'].items():
                 self.writer.add_scalar(f'Learn/{loss_key}', loss_value, log_dict['it'])
-            self.writer.add_scalar('Learn/actor_learning_rate', self.actor_learning_rate, log_dict['it'])
-            self.writer.add_scalar('Learn/critic_learning_rate', self.critic_learning_rate, log_dict['it'])
+            self.writer.add_scalar('Learn/actor_learning_rate', self.actor_optimizer.param_groups[0]['lr'], log_dict['it'])
+            self.writer.add_scalar('Learn/critic_learning_rate', self.critic_optimizer.param_groups[0]['lr'], log_dict['it'])
             self.writer.add_scalar('Learn/mean_noise_std', self.actor.std.mean().item(), log_dict['it'])
             
             

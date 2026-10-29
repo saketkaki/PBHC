@@ -26,7 +26,7 @@ terrain:
   terrain_width : 4.
   num_rows: 5 # number of terrain rows (difficulty levels)
   num_cols : 8 # number of terrain cols
-  terrain_types : ['flat', 'rough', 'tilt', 'step']  # do not duplicate!
+  terrain_types : ['flat', 'bumps', 'tilt', 'step']  # do not duplicate!
   terrain_proportions : [0.1, 0.3, 0.3, 0.3]
   # trimesh only:
   slope_treshold : 0.75 # slopes above this threshold will be corrected to vertical surfaces
@@ -34,3 +34,5 @@ terrain:
   fixed_difficulty : null # set in [0, 1] to evaluate a single difficulty level
   tilt_max_deg : 12.0 # incline at difficulty 1
   step_height_range : [0.03, 0.10] # [m] step height at difficulty 0 and 1
+  bumps_max_height : 0.04 # [m] bump amplitude (heights in ±amplitude) at difficulty 1
+  bumps_spacing : 0.3 # [m] distance between random bump heights (bilinear in between)
