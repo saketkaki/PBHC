@@ -31,7 +31,9 @@ terrain:
   # trimesh only:
   slope_treshold : 0.75 # slopes above this threshold will be corrected to vertical surfaces
   # terrain-aware tracking:
-  fixed_difficulty : null # set in [0, 1] to evaluate a single difficulty level
+  fixed_difficulty : null # set in [0, 1] to evaluate a single difficulty level (> 1 extrapolates linearly)
+  curriculum_max_difficulty : 1.0 # difficulty of the top curriculum row of tilt/step/bumps (rows span max/num_rows .. max)
+  curriculum_graduate_rows : null # robots that solve the top row go to a random one of this many hardest rows (null = any row)
   tilt_max_deg : 12.0 # incline at difficulty 1
   step_height_range : [0.03, 0.10] # [m] step height at difficulty 0 and 1
   bumps_max_height : 0.04 # [m] bump amplitude (heights in ±amplitude) at difficulty 1

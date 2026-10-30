@@ -13,7 +13,9 @@ from isaac_utils.rotations import (
     xyzw_to_wxyz,
     wxyz_to_xyzw,
     get_euler_xyz_in_tensor,
-    calc_yaw_heading_quat_inv
+    calc_yaw_heading_quat_inv,
+    matrix_to_quaternion,
+    quaternion_to_matrix,
 )
 # from isaacgym import gymtorch, gymapi, gymutil
 from scipy.spatial.transform import Rotation as sRot
@@ -275,10 +277,15 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self._ref_velocity_correction = bool(ta.get('ref_velocity_correction', True))
         self._ref_velocity_correction_max = float(ta.get('ref_velocity_correction_max', 1.0))
         self._feet_ground_footprint = float(ta.get('feet_ground_footprint', 0.04))
+        self._leg_ik_ref = bool(ta.get('leg_ik_ref', False))
+        self._leg_ik_iterations = int(ta.get('leg_ik_iterations', 6))
+        self._leg_ik_support_ratio = float(ta.get('leg_ik_support_ratio', 0.0))
+        assert not (self._leg_ik_ref and self._per_foot_ref), 'leg_ik_ref replaces per_foot_ref'
         self._custom_ref_offset = self._ground_relative_ref or self._recenter_motion_xy
         if self._ground_relative_ref:
             logger.info(colored(f"Terrain-aware tracking: ground-relative reference (recenter_motion_xy={self._recenter_motion_xy}, "
-                                f"per_foot_ref={self._per_foot_ref}, ref_velocity_correction={self._ref_velocity_correction}, "
+                                f"per_foot_ref={self._per_foot_ref}, leg_ik_ref={self._leg_ik_ref}, "
+                                f"ref_velocity_correction={self._ref_velocity_correction}, "
                                 f"feet_ground_footprint={self._feet_ground_footprint})", "green"))
 
         # per-foot reference: share of the foot's own ground offset given to each body of that leg
@@ -290,6 +297,15 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             for i, name in enumerate(body_names):
                 if name.startswith(side):
                     self._leg_body_share[leg, i] = 1.0 if 'ankle' in name else 0.5 if 'knee' in name else 0.
+        self._init_leg_kinematics()
+        # swing clearance: a lifted reference foot is raised by how far the highest ground within `radius` of it lies
+        # above the ground its target is relative to (0 on flat ground and when stepping down)
+        self._swing_clearance = bool(ta.get('swing_clearance', False))
+        self._swing_clearance_lift = float(ta.get('swing_clearance_lift', 0.02))
+        radius = float(ta.get('swing_clearance_radius', 0.15))
+        rings = [(0., 0.)] + [(r * np.cos(a), r * np.sin(a)) for r in (radius / 3, 2 * radius / 3, radius)
+                              for a in np.arange(8) * np.pi / 4]
+        self._swing_clearance_offsets = torch.tensor(rings, dtype=torch.float, device=self.device)
         # terrain height under each reference foot, relative to which the feet reward measures clearance
         self.ref_feet_ground_height = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
         r = self._feet_ground_footprint
@@ -322,7 +338,127 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self._height_scan_base_offset = hs.get('base_offset', 0.75)
         self._height_scan_clip = hs.get('clip', 1.0)
 
+        # terrain height lookup: 'min3' (legged_gym: min of 3 height-field neighbours) or 'exact' (raster of the
+        # collision trimesh: planes interpolated, step walls vertical where the trimesh made them vertical)
+        self._height_lookup = ta.get('height_lookup', 'min3')
+        assert self._height_lookup in ('min3', 'exact'), f'height_lookup: {self._height_lookup}'
+        # fine scan under each foot, in the foot's yaw frame (`foot_scan`): ankle_z - base_offset - terrain height
+        fs = ta.get('foot_scan', None) or {}
+        self._foot_scan_points = self._scan_grid(fs.get('x_range', [-0.08, 0.16]), fs.get('y_range', [-0.06, 0.06]),
+                                                 fs.get('resolution', 0.02))
+        self._foot_scan_base_offset = fs.get('base_offset', 0.035)
+        self._foot_scan_clip = fs.get('clip', 0.3)
+        # wider scan for the critic (`privileged_height_scan`), always from the exact lookup and without noise
+        ps = ta.get('privileged_height_scan', None) or {}
+        self._privileged_scan_points = self._scan_grid(ps.get('x_range', [-0.7, 0.7]), ps.get('y_range', [-0.7, 0.7]),
+                                                       ps.get('resolution', 0.1))
+        obs_terms = {term for terms in self.config.obs.obs_dict.values() for term in terms}
+        self._exact_height_map = None
+        if self.config.terrain.mesh_type == 'trimesh' and (self._height_lookup == 'exact' or 'privileged_height_scan' in obs_terms):
+            self._init_exact_height_map(float(ta.get('exact_height_resolution', 0.01)))
+        obs_dims = self.config.obs.obs_dims  # a dict after pre_process_config, a list of one-item dicts before
+        obs_dims = dict(obs_dims) if hasattr(obs_dims, 'items') else {k: v for d in obs_dims for k, v in d.items()}
+        for term, num_points in (('height_scan', self.num_height_scan_points), ('height_scan_noisy', self.num_height_scan_points),
+                                 ('foot_scan', 2 * len(self._foot_scan_points)),
+                                 ('privileged_height_scan', len(self._privileged_scan_points))):
+            assert term not in obs_terms or obs_dims[term] == num_points, f'obs_dims.{term} {obs_dims[term]} != {num_points} points'
+        logger.info(colored(f"Height scan: {self.num_height_scan_points} points, lookup={self._height_lookup}, "
+                            f"foot_scan {len(self._foot_scan_points)} points/foot, "
+                            f"privileged_height_scan {len(self._privileged_scan_points)} points", "green"))
+
+        # realistic perception errors for the policy's scan (`height_scan_noisy` term; with perturb_height_scan also the
+        # `height_scan` term, to evaluate policies trained on the exact scan). Per episode: map height bias, horizontal
+        # map misregistration, latency; per step and point: noise, dropout (the point keeps its previous value).
+        hn = ta.get('height_scan_noise', None) or {}
+        self._scan_point_std = float(hn.get('point_std', 0.0))
+        self._scan_bias_std = float(hn.get('episode_bias_std', 0.0))
+        self._scan_drift_std = float(hn.get('episode_drift_xy_std', 0.0))
+        self._scan_dropout = float(hn.get('dropout', 0.0))
+        self._scan_delay_range = [int(d) for d in hn.get('delay_steps', [0, 0])]
+        self._perturb_height_scan = bool(hn.get('perturb_height_scan', False))
+        self._scan_blind = hn.get('blind', None) or None
+        assert self._scan_blind in (None, 'flat', 'zero'), f'height_scan_noise.blind: {self._scan_blind}'
+        self._scan_noise_enabled = (self._scan_point_std > 0 or self._scan_bias_std > 0 or self._scan_drift_std > 0
+                                    or self._scan_dropout > 0 or self._scan_delay_range[1] > 0 or self._scan_blind is not None)
+        if self._scan_noise_enabled:
+            self._scan_bias = torch.zeros(self.num_envs, 1, dtype=torch.float, device=self.device)
+            self._scan_drift = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device)
+            self._scan_delay = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            # past perturbed scans, newest first; envs flagged in _scan_refill start a new episode with a full buffer
+            self._scan_history = torch.zeros(self._scan_delay_range[1] + 1, self.num_envs, self.num_height_scan_points,
+                                             dtype=torch.float, device=self.device)
+            self._scan_refill = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+            self._perceived_height_scan = torch.zeros(self.num_envs, self.num_height_scan_points, dtype=torch.float, device=self.device)
+            self._sample_height_scan_noise(torch.arange(self.num_envs, device=self.device))
+            logger.info(colored(f"Height-scan noise: point_std={self._scan_point_std}, episode_bias_std={self._scan_bias_std}, "
+                                f"episode_drift_xy_std={self._scan_drift_std}, dropout={self._scan_dropout}, "
+                                f"delay_steps={self._scan_delay_range}, blind={self._scan_blind}, "
+                                f"perturb_height_scan={self._perturb_height_scan}", "green"))
+
+    def _scan_grid(self, x_range, y_range, res):
+        """ [num_points, 2] grid of scan points (x-major, like the `height_scan` grid). """
+        xs = torch.linspace(x_range[0], x_range[1], int(round((x_range[1] - x_range[0]) / res)) + 1, device=self.device)
+        ys = torch.linspace(y_range[0], y_range[1], int(round((y_range[1] - y_range[0]) / res)) + 1, device=self.device)
+        grid_x, grid_y = torch.meshgrid(xs, ys, indexing='ij')
+        return torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
+
+    def _init_exact_height_map(self, res):
+        """ Rasterise the collision trimesh (top surfaces; vertical walls have no area) into a height map with
+        `res` spacing, looked up by nearest neighbour: exact on planes to res/2 * slope and on step walls to res/2. """
+        terrain = self.simulator.terrain
+        border = self.config.terrain.border_size
+        vertices = torch.tensor(terrain.vertices, dtype=torch.float, device=self.device)  # trimesh frame = world + border
+        tris = vertices[torch.tensor(terrain.triangles.astype(np.int64), device=self.device)]  # [T, 3 vertices, 3]
+        e1, e2 = tris[:, 1, :2] - tris[:, 0, :2], tris[:, 2, :2] - tris[:, 0, :2]
+        det = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+        keep = det.abs() > 1e-8
+        tris, e1, e2, det = tris[keep], e1[keep], e2[keep], det[keep]
+        size = (torch.ceil(vertices[:, :2].max(dim=0).values / res) + 1).long()
+        heights = torch.full((int(size[0]) * int(size[1]),), -float('inf'), device=self.device)
+        lo = torch.ceil(tris[..., :2].min(dim=1).values / res - 1e-4).long()
+        hi = torch.floor(tris[..., :2].max(dim=1).values / res + 1e-4).long()
+        extent = (hi - lo + 1).clamp(min=0)
+        order = torch.argsort(extent.max(dim=-1).values)  # chunks of similar bounding-box size
+        for chunk in torch.split(order, 16384):
+            n = int(extent[chunk].max())
+            if n == 0:
+                continue
+            offsets = torch.stack(torch.meshgrid(*[torch.arange(n, device=self.device)] * 2, indexing='ij'), dim=-1).view(-1, 2)
+            idx = lo[chunk, None] + offsets  # [C, n * n, 2]
+            d = idx * res - tris[chunk, None, 0, :2]
+            w1 = (d[..., 0] * e2[chunk, None, 1] - d[..., 1] * e2[chunk, None, 0]) / det[chunk, None]
+            w2 = (e1[chunk, None, 0] * d[..., 1] - e1[chunk, None, 1] * d[..., 0]) / det[chunk, None]
+            w0 = 1 - w1 - w2
+            inside = (w0 > -1e-4) & (w1 > -1e-4) & (w2 > -1e-4) & (idx <= hi[chunk, None]).all(dim=-1) \
+                & (idx < size).all(dim=-1) & (idx >= 0).all(dim=-1)
+            z = w0 * tris[chunk, None, 0, 2] + w1 * tris[chunk, None, 1, 2] + w2 * tris[chunk, None, 2, 2]
+            flat = idx[..., 0] * size[1] + idx[..., 1]
+            heights.scatter_reduce_(0, flat[inside], z[inside], reduce='amax')
+        heights = heights.view(int(size[0]), int(size[1]))
+        missing = torch.isinf(heights)
+        if missing.any():  # not covered by any triangle (should not happen): legacy lookup
+            ij = torch.nonzero(missing).float() * res - border
+            heights[missing] = self._terrain_height_min3(ij)
+        self._exact_height_map, self._exact_height_res = heights, res
+        logger.info(colored(f"Exact terrain height map: {tuple(heights.shape)} at {res} m, "
+                            f"{int(missing.sum())} cells filled by the legacy lookup", "green"))
+
+    def _terrain_height_exact(self, xy):
+        """ Terrain height [m] at world positions xy [..., 2] from the rasterised collision trimesh. """
+        if self._exact_height_map is None:
+            return self._terrain_height_at(xy)
+        border, res = self.config.terrain.border_size, self._exact_height_res
+        px = torch.round((xy[..., 0] + border) / res).long().clamp(0, self._exact_height_map.shape[0] - 1)
+        py = torch.round((xy[..., 1] + border) / res).long().clamp(0, self._exact_height_map.shape[1] - 1)
+        return self._exact_height_map[px, py]
+
     def _terrain_height_at(self, xy):
+        """ Terrain height [m] at world positions xy [..., 2] (terrain_aware.height_lookup: legged_gym or exact). """
+        if getattr(self, '_exact_height_map', None) is not None and self._height_lookup == 'exact':
+            return self._terrain_height_exact(xy)
+        return self._terrain_height_min3(xy)
+
+    def _terrain_height_min3(self, xy):
         """ Terrain height [m] at world positions xy [..., 2] (same lookup as legged_gym). """
         if self.config.terrain.mesh_type not in ['heightfield', 'trimesh']:
             return torch.zeros(xy.shape[:-1], dtype=torch.float, device=self.device)
@@ -372,17 +508,26 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         additionally shifted towards the ground under its own foot (ankle fully, knee half), so both
         reference feet stand on their own ground.
 
+        Leg IK (leg_ik_ref=True): support height between the ground under the lower supporting foot
+        (leg_ik_support_ratio=0) and the per-foot support height (1), every body is shifted by it, and the
+        legs are then re-solved by IK (_leg_ik_deltas) so that each reference foot stands on its own
+        ground with joint angles that agree with the body positions.
+
         Both are continuous in time, need no state, and are exactly 0 on flat ground.
         Returns (support height [N], per-body offsets [N, num_ref_bodies], ground under the ref feet [N, 2]).
         """
         ref_feet = motion_res['rg_pos_t'][:, self.feet_indices]  # [N, 2, 3]
         feet_ground = self._feet_ground_height(ref_feet[..., :2])
         feet_lift = ref_feet[..., 2] - ref_feet[..., 2].min(dim=-1, keepdim=True)[0]
-        if self._per_foot_ref:
+        if self._per_foot_ref or self._leg_ik_ref:
             weights = torch.softmax(-feet_lift / self._support_lift_tau, dim=-1)
         else:
             weights = torch.softmax((feet_ground - feet_lift) / self._support_height_tau, dim=-1)
         support_height = (weights * feet_ground).sum(dim=-1)  # [N]
+        if self._leg_ik_ref:  # move the pelvis towards the lower supporting foot: legs can bend further than stretch
+            low_weights = torch.softmax(-(feet_ground + feet_lift) / self._support_height_tau, dim=-1)
+            low = (low_weights * feet_ground).sum(dim=-1)
+            support_height = low + self._leg_ik_support_ratio * (support_height - low)
 
         body_offsets = support_height[:, None].expand(-1, self._leg_body_share.shape[1])
         feet_offsets = support_height[:, None].expand(-1, 2)
@@ -390,6 +535,14 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             feet_delta = feet_ground - support_height[:, None]  # [N, 2]
             body_offsets = body_offsets + feet_delta @ self._leg_body_share
             feet_offsets = feet_ground
+        elif self._leg_ik_ref:
+            feet_offsets = feet_ground
+        if self._swing_clearance:  # lift a swinging reference foot over higher ground near it (e.g. a riser ahead)
+            near = ref_feet[..., None, :2] + self._swing_clearance_offsets  # [N, 2, P, 2]
+            near_ground = self._terrain_height_at(near).max(dim=-1)[0]
+            swing = (feet_lift / self._swing_clearance_lift).clamp(0., 1.)
+            extra = swing * (near_ground - feet_offsets).clamp(min=0.)  # [N, 2]
+            body_offsets = body_offsets + extra @ self._leg_body_share  # ankle fully, knee half
         return support_height, body_offsets, feet_offsets
 
     def _apply_ground_relative_ref(self, motion_res, prev_motion_res=None):
@@ -398,6 +551,9 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         reference z velocities, so that velocity and position targets stay consistent. """
         support_height, body_offsets, feet_offsets = self._ground_relative_z_offsets(motion_res)
         num_bodies = motion_res['rg_pos'].shape[1]
+        if self._leg_ik_ref:  # before the shift: the IK works relative to the pelvis
+            dq, dp, dquat = self._leg_ik_deltas(motion_res, feet_offsets - support_height[:, None])
+            self._apply_leg_deltas(motion_res, dq, dp, dquat)
 
         motion_res['root_pos'][:, 2] += body_offsets[:, 0]
         motion_res['rg_pos'][..., 2] += body_offsets[:, :num_bodies]
@@ -411,14 +567,144 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             motion_res['body_vel'][..., 2] += body_vel_z[:, :num_bodies]
             if motion_res['body_vel_t'] is not motion_res['body_vel']:
                 motion_res['body_vel_t'][..., 2] += body_vel_z[:, :motion_res['body_vel_t'].shape[1]]
+            if self._leg_ik_ref:  # rate of change of the IK corrections
+                prev_support, _, prev_feet = self._ground_relative_z_offsets(prev_motion_res)
+                prev_dq, prev_dp, _ = self._leg_ik_deltas(prev_motion_res, prev_feet - prev_support[:, None])
+                vmax = self._ref_velocity_correction_max
+                dof_ids, body_ids = self._leg_dof_ids.flatten(), self._leg_body_ids.flatten()
+                motion_res['dof_vel'][:, dof_ids] += ((dq - prev_dq) / self.dt).clamp(-10 * vmax, 10 * vmax).flatten(1)
+                leg_vel = ((dp - prev_dp) / self.dt).clamp(-vmax, vmax).flatten(1, 2)
+                motion_res['body_vel'][:, body_ids] += leg_vel
+                if motion_res['body_vel_t'] is not motion_res['body_vel']:
+                    motion_res['body_vel_t'][:, body_ids] += leg_vel
         motion_res['ref_support_height'] = support_height
         motion_res['ref_feet_ground_height'] = feet_offsets
         return motion_res
 
+    def _init_leg_kinematics(self):
+        """ Leg chains pelvis -> ankle roll link (offsets, fixed rotations, joint axes) from the motion MJCF. """
+        import xml.etree.ElementTree as ET
+        path = Path(self.config.robot.motion.asset.assetRoot) / self.config.robot.motion.asset.assetFileName
+        bodies = {b.attrib['name']: b for b in ET.parse(path).getroot().iter('body')}
+        body_names, dof_names = list(self.config.robot.body_names), list(self.config.robot.dof_names)
+        offsets, rots, axes, body_ids, dof_ids = [], [], [], [], []
+        for side in ['left', 'right']:  # same order as feet_indices
+            for link in ['hip_pitch', 'hip_roll', 'hip_yaw', 'knee', 'ankle_pitch', 'ankle_roll']:
+                body = bodies[f'{side}_{link}_link']
+                offsets.append([float(v) for v in body.attrib.get('pos', '0 0 0').split()])
+                w, x, y, z = [float(v) for v in body.attrib.get('quat', '1 0 0 0').split()]
+                rots.append(sRot.from_quat([x, y, z, w]).as_matrix())
+                axes.append([float(v) for v in body.find('joint').attrib['axis'].split()])
+                body_ids.append(body_names.index(f'{side}_{link}_link'))
+                dof_ids.append(dof_names.index(f'{side}_{link}_joint'))
+        as_tensor = lambda v: torch.tensor(np.array(v), dtype=torch.float, device=self.device)  # noqa: E731
+        self._leg_offsets = as_tensor(offsets).view(2, 6, 3)
+        self._leg_local_rot = as_tensor(rots).view(2, 6, 3, 3)
+        axes = as_tensor(axes).view(2, 6, 3)
+        self._leg_axes_skew = torch.zeros(2, 6, 3, 3, dtype=torch.float, device=self.device)
+        self._leg_axes_skew[..., 0, 1], self._leg_axes_skew[..., 0, 2] = -axes[..., 2], axes[..., 1]
+        self._leg_axes_skew[..., 1, 0], self._leg_axes_skew[..., 1, 2] = axes[..., 2], -axes[..., 0]
+        self._leg_axes_skew[..., 2, 0], self._leg_axes_skew[..., 2, 1] = -axes[..., 1], axes[..., 0]
+        self._leg_body_ids = torch.tensor(body_ids, device=self.device).view(2, 6)
+        self._leg_dof_ids = torch.tensor(dof_ids, device=self.device).view(2, 6)
+        lower = torch.tensor(list(self.config.robot.dof_pos_lower_limit_list), dtype=torch.float, device=self.device)
+        upper = torch.tensor(list(self.config.robot.dof_pos_upper_limit_list), dtype=torch.float, device=self.device)
+        self._leg_dof_lower, self._leg_dof_upper = lower[self._leg_dof_ids], upper[self._leg_dof_ids]
+
+    def _leg_fk(self, q):
+        """ Positions [..., 2, 6, 3] and rotations [..., 2, 6, 3, 3] of the leg links in the pelvis frame for
+        leg joint angles q [..., 2, 6] (same recursion as Humanoid_Batch.forward_kinematics_batch). """
+        K = self._leg_axes_skew
+        s, c = q.sin()[..., None, None], q.cos()[..., None, None]
+        joint_rot = torch.eye(3, device=self.device) + s * K + (1 - c) * (K @ K)  # Rodrigues
+        p = torch.zeros(*q.shape[:-1], 3, dtype=q.dtype, device=self.device)
+        R = torch.eye(3, device=self.device).expand(*q.shape[:-1], 3, 3)
+        positions, rotations = [], []
+        for j in range(6):
+            p = p + (R @ self._leg_offsets[:, j, :, None]).squeeze(-1)
+            R = R @ self._leg_local_rot[:, j] @ joint_rot[..., j, :, :]
+            positions.append(p)
+            rotations.append(R)
+        return torch.stack(positions, dim=-2), torch.stack(rotations, dim=-3)
+
+    def _leg_ik(self, q_ref, feet_shift, rot_weight=0.3, damping=1e-4, max_step=0.2, eps=1e-4):
+        """ Leg joint angles [N, 2, 6] that move each ankle roll link by feet_shift [N, 2, 3] (pelvis frame)
+        from where q_ref puts it and keep its orientation where the joint limits allow (the ankle roll limit
+        often does not, with the legs spread): damped least squares with a finite-difference Jacobian,
+        orientation weighted by rot_weight [m/rad] below position, steps clamped to max_step [rad].
+        Legs whose result ends farther from the target than q_ref keep q_ref. """
+        pos, rot = self._leg_fk(q_ref)
+        target_p, target_R = pos[..., -1, :] + feet_shift, rot[..., -1, :, :]
+        steps = torch.cat([torch.zeros(1, 6, device=self.device), eps * torch.eye(6, device=self.device)])  # [7, 6]
+        weights = torch.tensor([1., 1., 1., rot_weight, rot_weight, rot_weight], device=self.device)
+
+        def pose_error(q):  # weighted [position; orientation] error of the ankle roll link, q [N, (7,) 2, 6] -> [N, (7,) 2, 6]
+            pos, rot = self._leg_fk(q)
+            extra = (1,) * (q.dim() - 3)
+            tp, tR = target_p.view(q.shape[0], *extra, 2, 3), target_R.view(q.shape[0], *extra, 2, 3, 3)
+            R_err = tR @ rot[..., -1, :, :].transpose(-1, -2)
+            w_err = 0.5 * torch.stack([R_err[..., 2, 1] - R_err[..., 1, 2], R_err[..., 0, 2] - R_err[..., 2, 0],
+                                       R_err[..., 1, 0] - R_err[..., 0, 1]], dim=-1)
+            return torch.cat([tp - pos[..., -1, :], w_err], dim=-1) * weights
+
+        q = q_ref.clone()
+        for _ in range(self._leg_ik_iterations):
+            err = pose_error(q[:, None] + steps[:, None])  # q and the 6 perturbed q: [N, 7, 2, 6]
+            J = ((err[:, :1] - err[:, 1:]) / eps).permute(0, 2, 3, 1)  # d(pose)/dq: [N, 2, 6 (pose), 6 (q)]
+            JJt = J @ J.transpose(-1, -2) + damping * torch.eye(6, device=self.device)
+            dq = (J.transpose(-1, -2) @ torch.linalg.solve(JJt, err[:, 0, ..., None])).squeeze(-1)
+            dq = dq * (max_step / dq.abs().amax(dim=-1, keepdim=True).clamp(min=max_step))
+            q = torch.max(torch.min(q + dq, self._leg_dof_upper), self._leg_dof_lower)
+        worse = pose_error(q).norm(dim=-1) > pose_error(q_ref).norm(dim=-1)
+        return torch.where(worse[..., None], q_ref, q)
+
+    def _leg_ik_deltas(self, motion_res, feet_dz):
+        """ IK correction of the reference legs that raises each reference foot by feet_dz [N, 2] relative
+        to the pelvis. Returns the change of the leg joint angles [N, 2, 6], of the leg link positions
+        [N, 2, 6, 3] (world) and the world rotation that maps old to new leg link rotations (xyzw) [N, 2, 6, 4]. """
+        q_ref = motion_res['dof_pos'][:, self._leg_dof_ids]  # [N, 2, 6]
+        pelvis_R = quaternion_to_matrix(xyzw_to_wxyz(motion_res['root_rot']))  # world from pelvis
+        feet_shift = feet_dz[..., None] * pelvis_R[:, None, 2, :]  # world z shift in the pelvis frame
+        q = self._leg_ik(q_ref, feet_shift)
+        pos_ref, rot_ref = self._leg_fk(q_ref)
+        pos, rot = self._leg_fk(q)
+        R0 = pelvis_R[:, None, None]
+        dp = (R0 @ (pos - pos_ref)[..., None]).squeeze(-1)
+        dR = R0 @ rot @ rot_ref.transpose(-1, -2) @ R0.transpose(-1, -2)
+        dquat = wxyz_to_xyzw(matrix_to_quaternion(dR))
+        identity = torch.tensor([0., 0., 0., 1.], device=self.device)
+        dquat = torch.where((feet_dz != 0)[..., None, None], dquat, identity)  # exactly the original reference on flat ground
+        return q - q_ref, dp, dquat
+
+    def _apply_leg_deltas(self, motion_res, dq, dp, dquat):
+        dof_ids, body_ids = self._leg_dof_ids.flatten(), self._leg_body_ids.flatten()
+        motion_res['dof_pos'][:, dof_ids] += dq.flatten(1)
+        motion_res['rg_pos'][:, body_ids] += dp.flatten(1, 2)
+        if motion_res['rg_pos_t'] is not motion_res['rg_pos']:
+            motion_res['rg_pos_t'][:, body_ids] += dp.flatten(1, 2)
+        dquat = dquat.flatten(1, 2)
+        unchanged = (dquat == torch.tensor([0., 0., 0., 1.], device=self.device)).all(dim=-1, keepdim=True)
+        for key in ['rb_rot', 'rg_rot_t']:
+            if key == 'rg_rot_t' and motion_res[key] is motion_res['rb_rot']:
+                continue
+            old = motion_res[key][:, body_ids].contiguous()
+            motion_res[key][:, body_ids] = torch.where(unchanged, old, quat_mul(dquat, old, w_last=True))  # quat_mul rounds
+
+    def _reward_termination(self):
+        # terminal penalty; terminations other than falls (e.g. drifting away from the reference) are scaled by
+        # termination_scales.termination_drift_penalty_scale so that falling is the worst outcome (1 = all alike)
+        terminated = self.reset_buf * ~self.time_out_buf
+        drift_scale = self.config.termination_scales.get('termination_drift_penalty_scale', 1.0)
+        fall = self.reset_buf_terminate_by.get('gravity')
+        if drift_scale == 1.0 or fall is None:
+            return terminated
+        return terminated * torch.where(fall, 1.0, drift_scale)
+
     def _update_terrain_curriculum(self, env_ids):
         """ Terrain curriculum over the difficulty rows: robots that tracked the motion to its end (over at
         least half of the motion) move one row up, robots whose episode ended before half of the remaining
-        motion move one row down, and robots that solve the hardest row go to a random row (legged_gym). """
+        motion move one row down, and robots that solve the hardest row go to a random row (legged_gym), or with
+        terrain.curriculum_graduate_rows = k to a random one of the k hardest rows, so the hardest terrain stays trained. """
         if not self.init_done or self.common_step_counter == 0:
             return
         elapsed = self.last_episode_length_buf[env_ids] * self.dt
@@ -428,22 +714,95 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         move_up = completed & (elapsed >= 0.5 * self.motion_len[env_ids])
         move_down = ~completed & (elapsed < 0.5 * remaining)
         levels = self.terrain_levels[env_ids] + move_up.long() - move_down.long()
-        levels = torch.where(levels >= self.max_terrain_level, torch.randint_like(levels, self.max_terrain_level),
-                             torch.clip(levels, min=0))
+        graduate_rows = self.config.terrain.get('curriculum_graduate_rows', None) or self.max_terrain_level
+        graduated = self.max_terrain_level - graduate_rows + torch.randint_like(levels, graduate_rows)
+        levels = torch.where(levels >= self.max_terrain_level, graduated, torch.clip(levels, min=0))
         self.terrain_levels[env_ids] = levels
         self.env_origins[env_ids] = self.terrain_origins[levels, self.terrain_types[env_ids]]
         self.log_dict["terrain_level"] = self.terrain_levels.float().mean()
+        for name, (start, end) in getattr(self.simulator.terrain, 'sub_terrain_cols', {}).items():
+            of_type = (self.terrain_types >= start) & (self.terrain_types < end)
+            if of_type.any():
+                self.log_dict[f"terrain_level_{name}"] = self.terrain_levels[of_type].float().mean()
 
-    def _get_obs_height_scan(self):
+    def _height_scan(self, xy_offset=None):
+        """ Unclipped scan root_z - base_offset - terrain height; xy_offset [num_envs, 2] shifts the sampled points. """
         root_states = self.simulator.robot_root_states
         heading_rot = calc_heading_quat(root_states[:, 3:7].clone(), w_last=True)
         num_points = self.num_height_scan_points
         points = my_quat_rotate(heading_rot.repeat_interleave(num_points, dim=0),
                                 self._height_scan_points.view(-1, 3)).view(self.num_envs, num_points, 3)
         points_xy = points[..., :2] + root_states[:, None, :2]
+        if xy_offset is not None:
+            points_xy = points_xy + xy_offset[:, None, :]
         heights = self._terrain_height_at(points_xy)
-        return torch.clip(root_states[:, 2:3] - self._height_scan_base_offset - heights,
-                          -self._height_scan_clip, self._height_scan_clip)
+        return root_states[:, 2:3] - self._height_scan_base_offset - heights
+
+    def _get_obs_height_scan(self):
+        if self._scan_noise_enabled and self._perturb_height_scan:
+            return self._perceived_height_scan
+        return torch.clip(self._height_scan(), -self._height_scan_clip, self._height_scan_clip)
+
+    def _get_obs_height_scan_noisy(self):
+        if not self._scan_noise_enabled:
+            return self._get_obs_height_scan()
+        return self._perceived_height_scan
+
+    @staticmethod
+    def _yaw_rotate(points, quat):
+        """ points [P, 2] rotated by the yaw of quaternions quat [..., 4] (xyzw) -> [..., P, 2] """
+        x, y, z, w = quat.unbind(-1)
+        yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        cos, sin = torch.cos(yaw)[..., None], torch.sin(yaw)[..., None]
+        return torch.stack([cos * points[:, 0] - sin * points[:, 1], sin * points[:, 0] + cos * points[:, 1]], dim=-1)
+
+    def _get_obs_foot_scan(self):
+        """ Fine scan under each foot (left then right), in the foot's yaw frame: ankle_z - base_offset - terrain height. """
+        feet_pos = self.simulator._rigid_body_pos[:, self.feet_indices]  # [N, 2, 3]
+        feet_rot = self.simulator._rigid_body_rot[:, self.feet_indices]
+        points = self._yaw_rotate(self._foot_scan_points, feet_rot) + feet_pos[:, :, None, :2]  # [N, 2, P, 2]
+        scan = feet_pos[:, :, None, 2] - self._foot_scan_base_offset - self._terrain_height_at(points)
+        return torch.clip(scan, -self._foot_scan_clip, self._foot_scan_clip).view(self.num_envs, -1)
+
+    def _get_obs_privileged_height_scan(self):
+        """ Critic only: wider scan around the root in its heading frame from the exact lookup, never perturbed. """
+        root_states = self.simulator.robot_root_states
+        points = self._yaw_rotate(self._privileged_scan_points, root_states[:, 3:7]) + root_states[:, None, :2]
+        scan = root_states[:, 2:3] - self._height_scan_base_offset - self._terrain_height_exact(points)
+        return torch.clip(scan, -self._height_scan_clip, self._height_scan_clip)
+
+    def _sample_height_scan_noise(self, env_ids):
+        n = len(env_ids)
+        self._scan_bias[env_ids] = torch.randn(n, 1, device=self.device) * self._scan_bias_std
+        self._scan_drift[env_ids] = torch.randn(n, 2, device=self.device) * self._scan_drift_std
+        self._scan_delay[env_ids] = torch.randint(self._scan_delay_range[0], self._scan_delay_range[1] + 1, (n,), device=self.device)
+        self._scan_refill[env_ids] = True
+
+    def _update_perceived_height_scan(self):
+        """ Once per step, after resets: perturb the scan and push it into the latency buffer. """
+        scan = self._height_scan(self._scan_drift) - self._scan_bias
+        if self._scan_blind == 'flat':  # ground assumed flat at the height under the root: no terrain shape
+            root_states = self.simulator.robot_root_states
+            scan = (root_states[:, 2:3] - self._height_scan_base_offset - self._terrain_height_at(root_states[:, None, :2])
+                    - self._scan_bias).expand_as(scan)
+        elif self._scan_blind == 'zero':  # no terrain information at all (nominal standing height on flat ground)
+            scan = torch.zeros_like(scan)
+        if self._scan_point_std > 0:
+            scan = scan + torch.randn_like(scan) * self._scan_point_std
+        if self._scan_dropout > 0:
+            dropped = (torch.rand_like(scan) < self._scan_dropout) & ~self._scan_refill[:, None]
+            scan = torch.where(dropped, self._scan_history[0], scan)
+        self._scan_history = torch.roll(self._scan_history, 1, dims=0)
+        self._scan_history[0] = scan
+        self._scan_history[:, self._scan_refill] = scan[self._scan_refill]
+        self._scan_refill[:] = False
+        delayed = self._scan_history[self._scan_delay, torch.arange(self.num_envs, device=self.device)]
+        self._perceived_height_scan = torch.clip(delayed, -self._height_scan_clip, self._height_scan_clip)
+
+    def _compute_observations(self):
+        if self._scan_noise_enabled:
+            self._update_perceived_height_scan()
+        super()._compute_observations()
 
     def _height_scan_world_points(self, env_id):
         root_states = self.simulator.robot_root_states
@@ -472,6 +831,8 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
 
         if self.custom_origins and self.config.terrain.curriculum:
             self._update_terrain_curriculum(env_ids)  # before the motion times are resampled
+        if self._scan_noise_enabled:
+            self._sample_height_scan_noise(env_ids)
 
         # env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self._resample_motion_times(env_ids) # need to resample before reset root states

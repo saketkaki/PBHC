@@ -8,7 +8,7 @@
 #   e.g. scripts/record_pilot_videos.sh B=logs/.../model_53500.pt C=logs/.../model_53500.pt E=logs/.../model_53500.pt
 # (a run directory means its latest checkpoint; pass checkpoint files to compare at equal iterations)
 # Known tags get a description in the caption (B naive ref, C ground-relative ref, E height scan, E1/E2/E2pf for
-# rounds 1 and 2 of E). Tags listed in NO_WANDB are recorded but nothing is uploaded to their W&B runs.
+# rounds 1 and 2 of E, E2c for the continuation of E2, E2c2 and E2ik for its plain and leg-IK continuations, F2s1/F2s2 for the fall-penalty runs with the 0.7 m drift cutoff, F3s1/F3s2 for perception v2 from F2s2). Tags listed in NO_WANDB are recorded but nothing is uploaded to their W&B runs.
 # The camera is low and to the side (CAM_OFFSET, relative to the start root) so steps and bumps show, and the
 # height-scan points are drawn on the ground (blue) in every clip to show the terrain shape.
 set -euo pipefail
@@ -24,7 +24,13 @@ A_CKPT=example/pretrained_horse_stance_pose/model_50000.pt
 A_FLAGS=(env.config.terrain_aware.recenter_motion_xy=True env.config.terrain_aware.ground_relative_ref=True)
 declare -A DESCRIPTION=([B]="naive ref" [C]="ground-relative ref" [E]="height scan + ground-relative ref"
                         [E1]="height scan, round 1" [E2]="height scan, gentle fine-tune"
-                        [E2pf]="height scan + per-foot ref, gentle fine-tune")
+                        [E2pf]="height scan + per-foot ref, gentle fine-tune"
+                        [E2c]="height scan, gentle fine-tune continued"
+                        [E2c2]="height scan, E2c continued" [E2ik]="height scan + leg-IK ref, from E2c"
+                        [F2s1]="height scan, fall penalty + 0.7 m cutoff, seed 1"
+                        [F2s2]="height scan, fall penalty + 0.7 m cutoff, seed 2"
+                        [F3s1]="perception v2 (wide + foot scans, exact height), seed 1"
+                        [F3s2]="perception v2 (wide + foot scans, exact height), seed 2")
 read -r -a NO_WANDB <<< "${NO_WANDB:-}"
 mkdir -p "$OUT"
 

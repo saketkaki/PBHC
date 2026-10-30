@@ -25,6 +25,7 @@ env:
       termination_gravity_y : 0.8
       termination_gravity : 0.75
       termination_motion_far_threshold : 1.5
+      termination_drift_penalty_scale : 1.0 # termination penalty of non-fall terminations relative to falls (< 1: falling is worst)
       termination_close_to_dof_pos_limit : 0.98
       termination_close_to_dof_vel_limit : 0.98
       termination_close_to_torque_limit : 0.98
@@ -84,7 +85,16 @@ env:
       recenter_motion_xy: False # place each motion's start xy at the tile centre (where terrain features are); use for all terrain runs
       support_height_tau: 0.02 # [m] softness of the soft-max over the supporting feet
       per_foot_ref: False # also shift each leg towards the ground under its own foot (ankle 1, knee 0.5)
+      swing_clearance: False # raise a lifted reference foot (ankle 1, knee 0.5) by how far the highest ground within
+                             # swing_clearance_radius lies above its own ground, so it does not sweep through a riser
+      swing_clearance_radius: 0.15 # [m] around the ankle; the toe is 0.14 m ahead of it
+      swing_clearance_lift: 0.02 # [m] reference foot lift (above the lower foot) at which the full clearance applies
       support_lift_tau: 0.03 # [m] per_foot_ref only: softness of the stance-foot weighting by reference foot lift
+      leg_ik_ref: False # instead of per_foot_ref: re-solve the reference legs by IK so each foot stands on its own ground
+                        # with joint angles that agree with the body positions (exactly the original reference on flat ground)
+      leg_ik_support_ratio: 0.0 # leg_ik_ref: pelvis height between the lower supporting foot (0) and the per-foot support height (1);
+                                # 0 because legs can bend further than stretch (ratio 1 fails on ~5% of 10 cm steps: knee straight)
+      leg_ik_iterations: 6 # leg_ik_ref: damped least-squares iterations
       ref_velocity_correction: True # add the rate of change of the terrain offsets to the reference z velocities
       ref_velocity_correction_max: 1.0 # [m/s] clamp of that correction (offsets jump when a foot crosses a step edge)
       feet_ground_footprint: 0.04 # [m] half-length of the footprint the ground under a foot is averaged over (0 = point lookup);
@@ -97,6 +107,27 @@ env:
         resolution: 0.1 # 11 x 7 = 77 points with the defaults; must match obs_dims.height_scan
         base_offset: 0.75 # [m] observation = root_z - base_offset - terrain_height
         clip: 1.0
+      height_lookup: min3 # terrain height for the scans and the reference: 'min3' (legged_gym, min of 3 height-field
+                          # neighbours: reads low on slopes, step edges off by up to a cell) or 'exact' (rasterised trimesh)
+      exact_height_resolution: 0.01 # [m] raster spacing of the exact lookup
+      foot_scan: # used by the `foot_scan` observation: grid under each foot in its yaw frame (ankle_roll_link origin)
+        x_range: [-0.08, 0.16] # [m] covers the sole (-0.065 .. 0.14) with margin
+        y_range: [-0.06, 0.06]
+        resolution: 0.02 # 13 x 7 = 91 points per foot with the defaults; obs_dims.foot_scan = 2 x points
+        base_offset: 0.035 # [m] ankle origin height above the sole: observation = ankle_z - base_offset - terrain_height
+        clip: 0.3
+      privileged_height_scan: # used by the critic-only `privileged_height_scan` observation (exact lookup, no noise)
+        x_range: [-0.7, 0.7] # [m] in the robot heading frame
+        y_range: [-0.7, 0.7]
+        resolution: 0.1 # 15 x 15 = 225 points with the defaults; base_offset and clip as height_scan
+      height_scan_noise: # perception errors of the `height_scan_noisy` observation (all 0 = exact scan)
+        point_std: 0.0 # [m] Gaussian noise per point and step
+        episode_bias_std: 0.0 # [m] constant height offset of the whole map per episode
+        episode_drift_xy_std: 0.0 # [m] constant horizontal shift of the sampled points per episode (map misregistration)
+        dropout: 0.0 # probability per point and step that a point is not updated (keeps its previous value)
+        delay_steps: [0, 0] # latency [control steps], sampled uniformly per episode from this range
+        blind: null # ablation: 'flat' = ground assumed flat at the height under the root (no shape), 'zero' = no terrain information
+        perturb_height_scan: False # also perturb the `height_scan` term (to evaluate policies trained on the exact scan)
       debug_draw_height_scan: False # draw the scan points of env 0 in the viewer
 
 

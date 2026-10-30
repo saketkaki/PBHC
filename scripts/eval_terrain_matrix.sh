@@ -12,6 +12,7 @@ set -euo pipefail
 CKPT=$1; shift
 SEEDS=${SEEDS:-"0 1"}
 ONLY=${ONLY:-}  # e.g. ONLY=bumps_d10: run only these terrains
+SUFFIX=${SUFFIX:-}  # appended to the result names, e.g. SUFFIX=__point05 -> step_d10__point05_seed0.json
 EPISODES=${EPISODES:-200}
 
 # name | terrain overrides
@@ -30,7 +31,7 @@ for entry in "${TERRAINS[@]}"; do
     [ -n "$ONLY" ] && [[ " $ONLY " != *" $name "* ]] && continue
     read -r -a ov <<< "$overrides"
     for seed in $SEEDS; do
-        python scripts/terrain_eval.py "$CKPT" --name "$name" --seed "$seed" --episodes "$EPISODES" "${ov[@]}" "$@" \
+        python scripts/terrain_eval.py "$CKPT" --name "$name$SUFFIX" --seed "$seed" --episodes "$EPISODES" "${ov[@]}" "$@" \
             2>&1 | grep -aE "^RESULT|Traceback|Error"
     done
 done

@@ -16,6 +16,7 @@ PERCENT = {'completion_rate', 'fall_rate', 'drift_rate', 'episode_length_ratio'}
 parser = argparse.ArgumentParser()
 parser.add_argument('runs', nargs='+')
 parser.add_argument('--metric', action='append')
+parser.add_argument('--dir', default='terrain_eval_v2')  # terrain_eval: older results (first episodes to finish)
 args = parser.parse_args()
 
 for metric in args.metric or ['completion_rate', 'episode_length_ratio', 'root_rel_body_err']:
@@ -26,7 +27,7 @@ for metric in args.metric or ['completion_rate', 'episode_length_ratio', 'root_r
         label, ckpt = run.split('=', 1) if '=' in run else (run, run)
         ckpt = Path(ckpt)
         values = defaultdict(list)
-        for path in (ckpt.parent / 'metrics' / 'terrain_eval' / ckpt.stem).glob('*_seed*.json'):
+        for path in (ckpt.parent / 'metrics' / args.dir / ckpt.stem).glob('*_seed*.json'):
             result = json.loads(path.read_text())
             values[result['name']].append(result[metric])
         cells = []

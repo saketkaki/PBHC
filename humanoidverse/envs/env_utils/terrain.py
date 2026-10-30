@@ -20,6 +20,9 @@ class Terrain:
 
         self.cfg.num_sub_terrains = cfg.num_rows * cfg.num_cols
         self.env_origins = np.zeros((cfg.num_rows, cfg.num_cols, 3))
+        # step tiles: edge normal angle [rad] and signed edge offset [m] from the tile centre (nan for other tiles)
+        self.step_edges = np.full((cfg.num_rows, cfg.num_cols, 2), np.nan)
+        self.tile_types = np.full((cfg.num_rows, cfg.num_cols), '', dtype=object)  # terrain type of each tile
 
         self.width_per_env_pixels = int(self.env_width / cfg.horizontal_scale)
         self.length_per_env_pixels = int(self.env_length / cfg.horizontal_scale)
@@ -74,6 +77,7 @@ class Terrain:
             while end_col + 0.1 < self.cfg.num_cols * already_taken_porp: end_col += 1
             sub_terrain_dict[terrain_type] = (start_col, end_col)
             print(terrain_type, 'col:',start_col,':', end_col)
+        self.sub_terrain_cols = sub_terrain_dict  # terrain type: (start col, end col), for per-type logging
 
         for terrain_type, col_range in sub_terrain_dict.items():
             print('generating curriculum terrains %s    '%(terrain_type), end='\r')
@@ -83,9 +87,9 @@ class Terrain:
                 for i in range(self.cfg.num_rows):
                     difficulty = i / self.cfg.num_rows
                     # terrain-aware types: rows span difficulty 1/num_rows .. 1 (as in randomized_terrain), so the
-                    # top row is the hardest evaluation setting
+                    # top row is the hardest evaluation setting (curriculum_max_difficulty > 1: harder than it)
                     if terrain_type in ['tilt', 'step', 'bumps']:
-                        difficulty = (i + 1) / self.cfg.num_rows
+                        difficulty = (i + 1) / self.cfg.num_rows * self.cfg.get('curriculum_max_difficulty', 1.0)
                     terrain = self.make_terrain(terrain_type, difficulty)
                     self.add_terrain_to_map(terrain, i, j)
         print('\n generated all curriculum terrains!')
@@ -99,6 +103,7 @@ class Terrain:
 
         terrain_func = getattr(self, terrain_type+'_terrain_func')
         terrain_func(terrain, difficulty)
+        terrain.terrain_type = terrain_type
 
         return terrain
 
@@ -120,6 +125,9 @@ class Terrain:
         y2 = int((self.env_width/2. + 0.5) / terrain.horizontal_scale)
         env_origin_z = np.max(terrain.height_field_raw[x1:x2, y1:y2])*terrain.vertical_scale
         self.env_origins[i, j] = [env_origin_x, env_origin_y, env_origin_z]
+        if hasattr(terrain, 'step_edge'):
+            self.step_edges[i, j] = terrain.step_edge
+        self.tile_types[i, j] = getattr(terrain, 'terrain_type', '')
 
     def gap_terrain_func(self, terrain, difficulty):
         gap_size = 1 * difficulty
@@ -177,6 +185,7 @@ class Terrain:
         ys = (np.arange(terrain.height_field_raw.shape[1]) - terrain.height_field_raw.shape[1] / 2) * terrain.horizontal_scale
         xx, yy = np.meshgrid(xs, ys, indexing='ij')
         phi = np.random.uniform(0, 2 * np.pi)
+        terrain.direction = phi
         return xx * np.cos(phi) + yy * np.sin(phi)
 
     def tilt_terrain_func(self, terrain, difficulty):
@@ -192,6 +201,7 @@ class Terrain:
         edge = np.random.uniform(-0.15, 0.15)
         dist = self._centered_direction(terrain)
         terrain.height_field_raw = (dist > edge) * step_height / terrain.vertical_scale
+        terrain.step_edge = (terrain.direction, edge)
 
     def bumps_terrain_func(self, terrain, difficulty):
         # smooth random bumps around zero height: heights drawn every `bumps_spacing` m, bilinear in between.
