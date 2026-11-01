@@ -17,6 +17,10 @@ usage (from the repo root, env `pbhc` active):
          [key=value ...]   e.g. "terrain.terrain_types=[step]" "terrain.terrain_proportions=[1.0]" terrain.fixed_difficulty=1.0
 The terrain group is replaced by terrain_kungfu (no curriculum) before the overrides. Results go to
 CKPT_DIR/metrics/<--out-dir>/<ckpt name>/<name>_seed<seed>.json.
+Every drift episode records the error one step before it ended (drift_episodes): the body furthest from its
+reference, its horizontal and vertical error, the root's, the heading error, the pelvis tilt from upright, and how long the worst body error took
+to grow from half the --far threshold to the end (slow drift vs sudden loss); on step tiles also how many robot and
+reference feet were on the raised side.
 """
 import argparse
 import json
@@ -31,6 +35,7 @@ parser.add_argument('--num-envs', type=int, default=100)
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--far', type=float, default=0.7)
 parser.add_argument('--device', default='cuda:0')
+parser.add_argument('--start-time', type=float, default=None)  # [s] start every episode at this motion time
 parser.add_argument('--out-dir', default='terrain_eval_v2')  # terrain_eval: older results (first episodes to finish)
 args, overrides = parser.parse_known_args()
 
@@ -59,7 +64,12 @@ pre_process_config(config)
 random.seed(args.seed)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
+if args.start_time is not None:
+    config.env.config.enforce_randomize_motion_start_eval = True
 env = instantiate(config.env, device=args.device)
+if args.start_time is not None:  # through the random-start path, with the sampled time replaced
+    env._motion_lib.sample_time = lambda motion_ids, truncate_time=None: torch.full(
+        motion_ids.shape, args.start_time, dtype=torch.float, device=env.device)
 algo = instantiate(config.algo, env=env, device=args.device, log_dir=None)
 algo.setup()
 algo.load(str(ckpt))
@@ -84,10 +94,17 @@ if has_step:
     straddle_steps = torch.zeros(env.num_envs, device=env.device)
     raised_bearing = torch.zeros(env.num_envs, device=env.device)  # [deg] raised side in the start heading frame, 0 = ahead, 90 = left
     start_feet_high = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    start_time = torch.zeros(env.num_envs, device=env.device)  # [s] motion time at the episode start
     shin_ids = [env.simulator.find_rigid_body_indice(f'{side}_knee_link') for side in ('left', 'right')]
     shin_contact_steps = torch.zeros(env.num_envs, device=env.device)
     need_start = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)  # start configuration not recorded yet
     step_episodes = []
+
+body_names = list(env.config.robot.body_names) + [e.joint_name for e in env.config.robot.motion.extend_config]
+last_err = {k: torch.zeros(env.num_envs, device=env.device) for k in
+            ('body', 'xy', 'z', 'root_xy', 'root_z', 'yaw_deg', 'tilt_deg', 'robot_feet_high', 'ref_feet_high')}
+half_far_step = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)  # first step the error passed far / 2
+drift_episodes = []
 
 counts = {'completed': 0, 'fall': 0, 'drift': 0}
 lengths, ratios = [], []
@@ -114,8 +131,28 @@ with torch.no_grad():
                 bearing = torch.rad2deg(torch.remainder(edge[:, 0] - yaw + torch.pi, 2 * torch.pi) - torch.pi)
                 raised_bearing[started] = bearing[started]
                 start_feet_high[started] = (side > 0).sum(dim=-1)[started]
+                start_time[started] = env.motion_start_times[started]
             shin_force = env.simulator.contact_forces[:, shin_ids].norm(dim=-1)
             shin_contact_steps += (live & (shin_force > 1.).any(dim=-1)).float()
+        live = ~dones  # error of the last step before an episode ends (terminal states are reset already)
+        dif = env.ref_body_pos_extend - env._rigid_body_pos_extend  # [N, B, 3]
+        dist = dif.norm(dim=-1)
+        worst = dist.argmax(dim=-1)
+        worst_dif = dif[torch.arange(env.num_envs, device=env.device), worst]
+        quat_robot, quat_ref = env.simulator.robot_root_states[:, 3:7], env.ref_body_rot_extend[:, 0]
+        yaw = lambda q: torch.atan2(2 * (q[:, 3] * q[:, 2] + q[:, 0] * q[:, 1]), 1 - 2 * (q[:, 1] ** 2 + q[:, 2] ** 2))
+        now = {'body': worst.float(), 'xy': worst_dif[:, :2].norm(dim=-1), 'z': worst_dif[:, 2].abs(),
+               'root_xy': dif[:, 0, :2].norm(dim=-1), 'root_z': dif[:, 0, 2].abs(),
+               'yaw_deg': torch.rad2deg(torch.remainder(yaw(quat_ref) - yaw(quat_robot) + torch.pi, 2 * torch.pi) - torch.pi).abs(),
+               'tilt_deg': torch.rad2deg(torch.acos((-env.projected_gravity[:, 2]).clamp(-1., 1.)))}  # pelvis from upright
+        if has_step:
+            robot_side = ((env.simulator._rigid_body_pos[:, env.feet_indices, :2] - origins[:, None]) * edge_normal[:, None]).sum(dim=-1) - edge[:, 1:]
+            now['robot_feet_high'] = (robot_side > 0).sum(dim=-1).float()
+            now['ref_feet_high'] = (side > 0).sum(dim=-1).float()
+        for k, v in now.items():
+            last_err[k][live] = v[live]
+        passed_half = live & (half_far_step < 0) & (dist.max(dim=-1)[0] > args.far / 2)
+        half_far_step[passed_half] = env.episode_length_buf[passed_half]
         alive = ~dones & counted  # errors of the steps that did not end an episode (terminal states are reset already)
         if alive.any():
             ref, robot = env.ref_body_pos_extend[alive], env._rigid_body_pos_extend[alive]
@@ -134,6 +171,14 @@ with torch.no_grad():
                 outcome = 'drift'
             counts[outcome] += 1
             length = int(env.last_episode_length_buf[i])
+            if outcome == 'drift':
+                episode = {k: float(v[i]) for k, v in last_err.items() if k != 'body'}
+                episode['body'] = body_names[int(last_err['body'][i])]
+                episode['grow_s'] = (length - int(half_far_step[i])) * env.dt if half_far_step[i] >= 0 else 0.
+                episode['length_s'] = length * env.dt
+                if not has_step:
+                    episode.pop('robot_feet_high'); episode.pop('ref_feet_high')
+                drift_episodes.append(episode)
             lengths.append(length)
             ratios.append(min(1., length * env.dt / float(env.motion_len[i])))
             if has_step:
@@ -142,8 +187,13 @@ with torch.no_grad():
                                       'straddle_frac': float(straddle_steps[i]) / max(length, 1),
                                       'raised_bearing_deg': float(raised_bearing[i]),
                                       'start_feet_high': int(start_feet_high[i]),
-                                      'shin_contact_frac': float(shin_contact_steps[i]) / max(length, 1)})
+                                      'start_time_s': float(start_time[i]),
+                                      'shin_contact_frac': float(shin_contact_steps[i]) / max(length, 1),
+                                      'end_time_s': float(start_time[i]) + length * env.dt,
+                                      'robot_feet_high': float(last_err['robot_feet_high'][i]),
+                                      'ref_feet_high': float(last_err['ref_feet_high'][i])})
         episodes_done += (dones & counted).long()
+        half_far_step[dones] = -1
         if has_step:
             min_edge_dist[dones] = float('inf')
             straddle_steps[dones] = 0
@@ -158,6 +208,7 @@ result = {
     'episode_length_ratio': float(np.mean(ratios)),
     **{k: v / max(err_steps, 1) for k, v in err_sum.items()},
 }
+result['drift_episodes'] = drift_episodes
 if has_step:
     result['step_episodes'] = step_episodes
 out = ckpt.parent / 'metrics' / args.out_dir / ckpt.stem / f'{args.name}_seed{args.seed}.json'

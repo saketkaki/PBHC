@@ -110,12 +110,24 @@ env:
       height_lookup: min3 # terrain height for the scans and the reference: 'min3' (legged_gym, min of 3 height-field
                           # neighbours: reads low on slopes, step edges off by up to a cell) or 'exact' (rasterised trimesh)
       exact_height_resolution: 0.01 # [m] raster spacing of the exact lookup
+      ref_height_lookup: null # ground under the reference feet (reference shift, swing clearance): 'min3' or 'exact';
+                              # null = height_lookup
       foot_scan: # used by the `foot_scan` observation: grid under each foot in its yaw frame (ankle_roll_link origin)
         x_range: [-0.08, 0.16] # [m] covers the sole (-0.065 .. 0.14) with margin
         y_range: [-0.06, 0.06]
         resolution: 0.02 # 13 x 7 = 91 points per foot with the defaults; obs_dims.foot_scan = 2 x points
         base_offset: 0.035 # [m] ankle origin height above the sole: observation = ankle_z - base_offset - terrain_height
         clip: 0.3
+      ref_preview: # used by the `ref_preview` observation: reference root and feet (terrain-shifted) relative to the
+                   # robot root in its heading frame, and the reference heading relative to the robot's, at each time
+        times: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5] # [s] ahead of the current reference; obs_dims.ref_preview = 11 x times
+        frame: robot # origin of the positions and heading: 'robot' (robot root) or 'reference' (current reference root:
+                     # needs no robot position estimate)
+      early_start: # training only: robots on these terrain types start the motion early with this probability
+        prob: 0.0
+        max_time: 1.5 # [s] start uniformly in [0, max_time] (default: anywhere in the motion)
+        terrain_types: [step]
+        keep_level_on_failure: False # an early start that fails does not move the robot down the terrain curriculum
       privileged_height_scan: # used by the critic-only `privileged_height_scan` observation (exact lookup, no noise)
         x_range: [-0.7, 0.7] # [m] in the robot heading frame
         y_range: [-0.7, 0.7]

@@ -2,9 +2,12 @@
 columns = difficulty (mean ± std over seeds). With --step-edges, also the step fall rate by how close the reference
 feet come to the step edge, and by whether the edge passes between the feet; and (results of terrain_eval.py with the
 edge-direction diagnostic) by where the raised side is relative to the start heading, by how many reference feet
-start on it, and how often a shin touches something in falls and in other episodes.
+start on it, and how often a shin touches something in falls and in other episodes. With --drift (results of
+terrain_eval.py with the drift breakdown), how drift episodes end: which body is furthest off, whether horizontally or
+vertically, the heading error, the pelvis tilt, how fast the error grew, and on steps whether the robot's feet were on another level
+than the reference's.
 
-usage: python scripts/summarize_difficulty_sweep.py [--metric fall_rate] [--step-edges] LABEL=CKPT [LABEL=CKPT ...]
+usage: python scripts/summarize_difficulty_sweep.py [--metric fall_rate] [--step-edges] [--drift] LABEL=CKPT [LABEL=CKPT ...]
 metrics: completion_rate, fall_rate, drift_rate, episode_length_ratio, root_rel_body_err, global_body_err, joint_err
 """
 import argparse
@@ -24,6 +27,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('runs', nargs='+')
 parser.add_argument('--metric', action='append')
 parser.add_argument('--step-edges', action='store_true')
+parser.add_argument('--drift', action='store_true')
 parser.add_argument('--dir', default='terrain_eval_v2')
 args = parser.parse_args()
 
@@ -104,3 +108,34 @@ if args.step_edges:
             for d, cells in directions.items():
                 print(f'| {d:g} ({LABELS["step"](d)}) | ' + ' | '.join(cells) + ' |')
 
+
+if args.drift:
+    for type_, d in keys:
+        if not any(r.get('drift_episodes') for _, results in runs for r in results.get((type_, d), [])):
+            continue
+        print(f'\n**{type_} {LABELS[type_](d) or ""}: how drift episodes end** (all seeds; medians; error one step before '
+              f'the end)\n')
+        step = type_ == 'step'
+        print('| Model | drift episodes | furthest body | body error xy / z [m] | mostly vertical | root error xy / z [m] | '
+              'heading error | pelvis tilt | half to full threshold | sudden (< 0.5 s)' + (' | feet on another level than the reference'
+                                                                            if step else '') + ' |')
+        print('|---' * (11 if step else 10) + '|')
+        for label, results in runs:
+            episodes = [e for r in results.get((type_, d), []) for e in r.get('drift_episodes', [])]
+            if not episodes:
+                print(f'| {label} | 0 |' + ' – |' * (9 if step else 8))
+                continue
+            med = lambda k: float(np.median([e[k] for e in episodes]))
+            bodies = defaultdict(int)
+            for e in episodes:
+                bodies[e['body'].replace('_link', '')] += 1
+            top = ', '.join(f'{b} {100 * n / len(episodes):.0f}%' for b, n in sorted(bodies.items(), key=lambda x: -x[1])[:2])
+            vertical = np.mean([e['z'] > e['xy'] for e in episodes])
+            sudden = np.mean([e['grow_s'] < 0.5 for e in episodes])
+            cells = [str(len(episodes)), top, f'{med("xy"):.2f} / {med("z"):.2f}', f'{vertical * 100:.0f}%',
+                     f'{med("root_xy"):.2f} / {med("root_z"):.2f}', f'{med("yaw_deg"):.0f}°',
+                     f'{med("tilt_deg"):.0f}°' if 'tilt_deg' in episodes[0] else '–', f'{med("grow_s"):.1f} s',
+                     f'{sudden * 100:.0f}%']
+            if step:
+                cells.append(f'{np.mean([e["robot_feet_high"] != e["ref_feet_high"] for e in episodes]) * 100:.0f}%')
+            print(f'| {label} | ' + ' | '.join(cells) + ' |')

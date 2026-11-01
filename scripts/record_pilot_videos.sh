@@ -8,7 +8,7 @@
 #   e.g. scripts/record_pilot_videos.sh B=logs/.../model_53500.pt C=logs/.../model_53500.pt E=logs/.../model_53500.pt
 # (a run directory means its latest checkpoint; pass checkpoint files to compare at equal iterations)
 # Known tags get a description in the caption (B naive ref, C ground-relative ref, E height scan, E1/E2/E2pf for
-# rounds 1 and 2 of E, E2c for the continuation of E2, E2c2 and E2ik for its plain and leg-IK continuations, F2s1/F2s2 for the fall-penalty runs with the 0.7 m drift cutoff, F3s1/F3s2 for perception v2 from F2s2). Tags listed in NO_WANDB are recorded but nothing is uploaded to their W&B runs.
+# rounds 1 and 2 of E, E2c for the continuation of E2, E2c2 and E2ik for its plain and leg-IK continuations, F2s1/F2s2 for the fall-penalty runs with the 0.7 m drift cutoff, F3s1/F3s2 for perception v2 from F2s2, CTRL/SWING for the control and swing-clearance continuations, CONT/REFLU/PREVIEW for the plain, reference-lookup and reference-preview continuations of F3s2, PREVREF/PREVIEW_s3/PREVIEW_s4/EARLY/PREVLONG/EARLYLONG_s2/EARLYLONG_s3/PREVMORE_s2/PREVMORE_s4 for the preview variants). Tags listed in NO_WANDB are recorded but nothing is uploaded to their W&B runs.
 # The camera is low and to the side (CAM_OFFSET, relative to the start root) so steps and bumps show, and the
 # height-scan points are drawn on the ground (blue) in every clip to show the terrain shape.
 set -euo pipefail
@@ -30,7 +30,20 @@ declare -A DESCRIPTION=([B]="naive ref" [C]="ground-relative ref" [E]="height sc
                         [F2s1]="height scan, fall penalty + 0.7 m cutoff, seed 1"
                         [F2s2]="height scan, fall penalty + 0.7 m cutoff, seed 2"
                         [F3s1]="perception v2 (wide + foot scans, exact height), seed 1"
-                        [F3s2]="perception v2 (wide + foot scans, exact height), seed 2")
+                        [F3s2]="perception v2 (wide + foot scans, exact height), seed 2"
+                        [CTRL]="control: F2s2 continued, old scan + min3 height"
+                        [SWING]="F3s2 + swing clearance"
+                        [CONT]="F3s2 continued unchanged" [REFLU]="F3s2 + min3 reference lookup"
+                        [PREVIEW]="F3s2 + reference preview (robot frame)"
+                        [PREVREF]="F3s2 + reference preview (reference frame)"
+                        [PREVIEW_s3]="F3s2 + reference preview (robot frame), seed 3"
+                        [PREVIEW_s4]="F3s2 + reference preview (robot frame), seed 4"
+                        [EARLY]="F3s2 + reference preview + early starts on steps"
+                        [PREVLONG]="F3s2 + reference preview to 1.0 s"
+                        [EARLYLONG_s2]="F3s2 + preview to 1.0 s + early starts on steps (no demotion), seed 2"
+                        [EARLYLONG_s3]="F3s2 + preview to 1.0 s + early starts on steps (no demotion), seed 3"
+                        [PREVMORE_s2]="F3s2 + reference preview, trained 3,250 more iterations, seed 2"
+                        [PREVMORE_s4]="F3s2 + reference preview, trained 3,250 more iterations, seed 4")
 read -r -a NO_WANDB <<< "${NO_WANDB:-}"
 mkdir -p "$OUT"
 

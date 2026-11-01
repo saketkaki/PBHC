@@ -342,6 +342,9 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         # collision trimesh: planes interpolated, step walls vertical where the trimesh made them vertical)
         self._height_lookup = ta.get('height_lookup', 'min3')
         assert self._height_lookup in ('min3', 'exact'), f'height_lookup: {self._height_lookup}'
+        # lookup of the ground under the reference feet (reference shift, swing clearance); default: height_lookup
+        self._ref_height_lookup = ta.get('ref_height_lookup', None) or self._height_lookup
+        assert self._ref_height_lookup in ('min3', 'exact'), f'ref_height_lookup: {self._ref_height_lookup}'
         # fine scan under each foot, in the foot's yaw frame (`foot_scan`): ankle_z - base_offset - terrain height
         fs = ta.get('foot_scan', None) or {}
         self._foot_scan_points = self._scan_grid(fs.get('x_range', [-0.08, 0.16]), fs.get('y_range', [-0.06, 0.06]),
@@ -354,15 +357,30 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
                                                        ps.get('resolution', 0.1))
         obs_terms = {term for terms in self.config.obs.obs_dict.values() for term in terms}
         self._exact_height_map = None
-        if self.config.terrain.mesh_type == 'trimesh' and (self._height_lookup == 'exact' or 'privileged_height_scan' in obs_terms):
+        if self.config.terrain.mesh_type == 'trimesh' and ('exact' in (self._height_lookup, self._ref_height_lookup)
+                                                           or 'privileged_height_scan' in obs_terms):
             self._init_exact_height_map(float(ta.get('exact_height_resolution', 0.01)))
+        # reference preview (`ref_preview`): reference root and feet now and ahead, relative to the robot
+        rp = ta.get('ref_preview', None) or {}
+        self._ref_preview_times = [float(t) for t in rp.get('times', [0.0, 0.1, 0.2, 0.3, 0.4, 0.5])]
+        es = ta.get('early_start', None) or {}
+        self._early_start_prob = float(es.get('prob', 0.0))
+        self._early_start_max_time = float(es.get('max_time', 1.5))
+        self._early_start_types = list(es.get('terrain_types', ['step']))
+        self._early_start_keep_level = bool(es.get('keep_level_on_failure', False))
+        self._early_started = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._ref_preview_frame = rp.get('frame', 'robot')
+        assert self._ref_preview_frame in ('robot', 'reference'), f'ref_preview.frame: {self._ref_preview_frame}'
+        self._use_ref_preview = 'ref_preview' in obs_terms
         obs_dims = self.config.obs.obs_dims  # a dict after pre_process_config, a list of one-item dicts before
         obs_dims = dict(obs_dims) if hasattr(obs_dims, 'items') else {k: v for d in obs_dims for k, v in d.items()}
         for term, num_points in (('height_scan', self.num_height_scan_points), ('height_scan_noisy', self.num_height_scan_points),
                                  ('foot_scan', 2 * len(self._foot_scan_points)),
-                                 ('privileged_height_scan', len(self._privileged_scan_points))):
+                                 ('privileged_height_scan', len(self._privileged_scan_points)),
+                                 ('ref_preview', 11 * len(self._ref_preview_times))):
             assert term not in obs_terms or obs_dims[term] == num_points, f'obs_dims.{term} {obs_dims[term]} != {num_points} points'
         logger.info(colored(f"Height scan: {self.num_height_scan_points} points, lookup={self._height_lookup}, "
+                            f"reference lookup={self._ref_height_lookup}, "
                             f"foot_scan {len(self._foot_scan_points)} points/foot, "
                             f"privileged_height_scan {len(self._privileged_scan_points)} points", "green"))
 
@@ -452,9 +470,10 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         py = torch.round((xy[..., 1] + border) / res).long().clamp(0, self._exact_height_map.shape[1] - 1)
         return self._exact_height_map[px, py]
 
-    def _terrain_height_at(self, xy):
-        """ Terrain height [m] at world positions xy [..., 2] (terrain_aware.height_lookup: legged_gym or exact). """
-        if getattr(self, '_exact_height_map', None) is not None and self._height_lookup == 'exact':
+    def _terrain_height_at(self, xy, lookup=None):
+        """ Terrain height [m] at world positions xy [..., 2] (lookup, default terrain_aware.height_lookup: legged_gym
+        or exact). """
+        if getattr(self, '_exact_height_map', None) is not None and (lookup or self._height_lookup) == 'exact':
             return self._terrain_height_exact(xy)
         return self._terrain_height_min3(xy)
 
@@ -474,9 +493,9 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         """ Terrain height under feet [..., 2] averaged over a foot-sized footprint, so that it changes
         continuously (over ~2 * footprint) when a foot moves across a step edge instead of jumping. """
         if self._feet_ground_footprint <= 0:
-            return self._terrain_height_at(feet_xy)
+            return self._terrain_height_at(feet_xy, self._ref_height_lookup)
         points = feet_xy[..., None, :] + self._footprint_offsets  # [..., 9, 2]
-        return self._terrain_height_at(points).mean(dim=-1)
+        return self._terrain_height_at(points, self._ref_height_lookup).mean(dim=-1)
 
     def _update_motion_start_xy(self):
         start = self._motion_lib.get_motion_state(self.motion_ids, torch.zeros(self.num_envs, device=self.device))
@@ -539,7 +558,7 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             feet_offsets = feet_ground
         if self._swing_clearance:  # lift a swinging reference foot over higher ground near it (e.g. a riser ahead)
             near = ref_feet[..., None, :2] + self._swing_clearance_offsets  # [N, 2, P, 2]
-            near_ground = self._terrain_height_at(near).max(dim=-1)[0]
+            near_ground = self._terrain_height_at(near, self._ref_height_lookup).max(dim=-1)[0]
             swing = (feet_lift / self._swing_clearance_lift).clamp(0., 1.)
             extra = swing * (near_ground - feet_offsets).clamp(min=0.)  # [N, 2]
             body_offsets = body_offsets + extra @ self._leg_body_share  # ankle fully, knee half
@@ -713,6 +732,8 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         remaining = self.motion_len[env_ids] - self.motion_start_times[env_ids]
         move_up = completed & (elapsed >= 0.5 * self.motion_len[env_ids])
         move_down = ~completed & (elapsed < 0.5 * remaining)
+        if self._early_start_keep_level:  # early starts aim at the hardest part of the motion: failing it is no demotion
+            move_down &= ~self._early_started[env_ids]
         levels = self.terrain_levels[env_ids] + move_up.long() - move_down.long()
         graduate_rows = self.config.terrain.get('curriculum_graduate_rows', None) or self.max_terrain_level
         graduated = self.max_terrain_level - graduate_rows + torch.randint_like(levels, graduate_rows)
@@ -724,6 +745,23 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             of_type = (self.terrain_types >= start) & (self.terrain_types < end)
             if of_type.any():
                 self.log_dict[f"terrain_level_{name}"] = self.terrain_levels[of_type].float().mean()
+
+    def _sample_early_starts(self, env_ids):
+        """ Training: with probability early_start.prob, robots on the early_start.terrain_types start the motion
+        uniformly in [0, early_start.max_time] instead of anywhere in it (the early part holds the hardest move of the
+        horse stance on steps, and uniform starts rarely reach it). """
+        cols = getattr(self.simulator.terrain, 'sub_terrain_cols', {})
+        types = self.terrain_types[env_ids]
+        on_type = torch.zeros_like(types, dtype=torch.bool)
+        for name in self._early_start_types:
+            if name in cols:
+                on_type |= (types >= cols[name][0]) & (types < cols[name][1])
+        early = on_type & (torch.rand(len(env_ids), device=self.device) < self._early_start_prob)
+        max_time = torch.clamp(self.motion_len[env_ids], max=self._early_start_max_time)
+        times = torch.rand(len(env_ids), device=self.device) * max_time
+        self.motion_start_times[env_ids] = torch.where(early, times, self.motion_start_times[env_ids])
+        self._early_started[env_ids] = early
+        self.log_dict['early_start_frac'] = early.float().mean()
 
     def _height_scan(self, xy_offset=None):
         """ Unclipped scan root_z - base_offset - terrain height; xy_offset [num_envs, 2] shifts the sampled points. """
@@ -763,6 +801,43 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         points = self._yaw_rotate(self._foot_scan_points, feet_rot) + feet_pos[:, :, None, :2]  # [N, 2, P, 2]
         scan = feet_pos[:, :, None, 2] - self._foot_scan_base_offset - self._terrain_height_at(points)
         return torch.clip(scan, -self._foot_scan_clip, self._foot_scan_clip).view(self.num_envs, -1)
+
+    def _compute_ref_preview(self, motion_times):
+        """ Reference root and feet (ankle roll links) at motion_times + each preview time, terrain-shifted like the
+        tracked reference: positions relative to an origin in its heading frame, and sin/cos of the reference root
+        heading relative to the origin heading -> [N, T * 11] (per time: root xyz, left foot xyz, right foot xyz, sin, cos).
+        The origin is the robot root (frame 'robot') or the current terrain-shifted reference root (frame 'reference':
+        motion information only, no robot position estimate needed). """
+        N, T = self.num_envs, len(self._ref_preview_times)
+        frame_ref = self._ref_preview_frame == 'reference'
+        times = [0.0] + self._ref_preview_times if frame_ref and 0.0 not in self._ref_preview_times else self._ref_preview_times
+        Tq = len(times)
+        ids = torch.cat([self.feet_indices.new_zeros(1), self.feet_indices])  # root (pelvis), left foot, right foot
+        offset = self._ref_offset()  # one call per time: the motion library takes batches of exactly num_envs
+        states = [self._motion_lib.get_motion_state(self.motion_ids, motion_times + dt, offset=offset) for dt in times]
+        res = {k: torch.cat([state[k] for state in states]) for k in ('rg_pos_t', 'rg_rot_t')}  # time-major [Tq * N, ...]
+        pos = res['rg_pos_t'][:, ids].clone()  # [Tq * N, 3, 3] root (pelvis), left, right
+        if self._ground_relative_ref:
+            _, body_offsets, _ = self._ground_relative_z_offsets(res)
+            pos[..., 2] += body_offsets[:, ids]
+        pos = pos.view(Tq, N, 3, 3)
+        rot = res['rg_rot_t'][:, 0].view(Tq, N, 4)
+        if frame_ref:
+            i0 = times.index(0.0)
+            origin_pos, origin_rot = pos[i0, :, 0].clone(), rot[i0].clone()
+        else:
+            root_states = self.simulator.robot_root_states
+            origin_pos, origin_rot = root_states[:, :3], root_states[:, 3:7].clone()
+        pos, rot = pos[Tq - T:], rot[Tq - T:]  # drop the extra current state of frame 'reference'
+        heading_inv = calc_heading_quat_inv(origin_rot.clone(), w_last=True)  # [N, 4]
+        pos = pos - origin_pos[None, :, None]
+        pos = my_quat_rotate(heading_inv[None, :, None].expand(T, N, 3, 4).reshape(-1, 4), pos.reshape(-1, 3)).view(T, N, 9)
+        yaw = lambda q: torch.atan2(2 * (q[..., 3] * q[..., 2] + q[..., 0] * q[..., 1]), 1 - 2 * (q[..., 1] ** 2 + q[..., 2] ** 2))
+        dyaw = yaw(rot) - yaw(origin_rot)[None]
+        return torch.cat([pos, torch.sin(dyaw)[..., None], torch.cos(dyaw)[..., None]], dim=-1).transpose(0, 1).reshape(N, -1)
+
+    def _get_obs_ref_preview(self):
+        return self._obs_ref_preview
 
     def _get_obs_privileged_height_scan(self):
         """ Critic only: wider scan around the root in its heading frame from the exact lookup, never perturbed. """
@@ -935,6 +1010,9 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             self.motion_start_times[env_ids] = torch.zeros(len(env_ids), dtype=torch.float32, device=self.device)
         else:
             self.motion_start_times[env_ids] = self._motion_lib.sample_time(self.motion_ids[env_ids])
+            self._early_started[env_ids] = False
+            if self._early_start_prob > 0 and not self.is_evaluating:
+                self._sample_early_starts(env_ids)
         self._kick_motion_res_counter = -1
         # self.motion_start_times[env_ids] = self._motion_lib.sample_time(self.motion_ids[env_ids])
         # offset = self.env_origins
@@ -1328,6 +1406,8 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             max_phase = self._ref_motion_phase.max()
             # import ipdb; ipdb.set_trace()
         self._ref_motion_phase = self._ref_motion_phase.unsqueeze(1)
+        if self._use_ref_preview:
+            self._obs_ref_preview = self._compute_ref_preview(motion_times)
         # print(f"ref_motion_phase: {self._ref_motion_phase[0].item():.2f}")
         # print(f"ref_motion_length: {self._ref_motion_length[0].item():.2f}")
         

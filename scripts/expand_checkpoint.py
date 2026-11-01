@@ -4,7 +4,8 @@ The first layer of the actor and of the critic is rebuilt for the new observatio
 observation term present in the old layout are copied to that term's new position, and new terms (e.g.
 `height_scan`) get zero weights. A height scan whose grid changed (env.config.terrain_aware.height_scan, set with
 key=value overrides of the new config) keeps the weights of the points present in both grids; new points get zero
-weights. The expanded network therefore computes exactly the same actions and values
+weights. Likewise a `ref_preview` with other preview times (env.config.terrain_aware.ref_preview.times) keeps the weights
+of the times present in both; new times get zero weights. The expanded network therefore computes exactly the same actions and values
 as the original until training changes the new weights. The Adam moments of the first layers are expanded the
 same way (zero for new terms), so the optimizer state can be loaded too (`algo.config.load_optimizer=True`);
 the iteration counter is kept.
@@ -43,20 +44,28 @@ def scan_grid(config):
     return [(round(x, 4), round(y, 4)) for x in xs for y in ys]
 
 
+def preview_times(config):
+    rp = config.env.config.terrain_aware.get('ref_preview', None) or {}
+    return [round(float(t), 4) for t in rp.get('times', [0.0, 0.1, 0.2, 0.3, 0.4, 0.5])]
+
+
 def expand_first_layer(weight, old_slices, new_slices, new_dim, quiet=False):
     new_weight = torch.zeros(weight.shape[0], new_dim, dtype=weight.dtype)
     for key, (new_start, new_end) in new_slices.items():
         if key in old_slices and old_slices[key][1] - old_slices[key][0] != new_end - new_start:
-            assert key in ('height_scan', 'height_scan_noisy'), f'{key}: size changed'
+            assert key in ('height_scan', 'height_scan_noisy', 'ref_preview'), f'{key}: size changed'
+            # points of the scan grid, or blocks of 11 values per preview time
+            (old_items, new_items, size) = (old_times, new_times, 11) if key == 'ref_preview' else (old_grid, new_grid, 1)
             old_start = old_slices[key][0]
-            old_index = {p: i for i, p in enumerate(old_grid)}
-            assert len(old_index) == old_slices[key][1] - old_start, f'{key}: grid does not match the old config'
-            assert len(new_grid) == new_end - new_start, f'{key}: grid does not match the new config'
-            kept = [(j, old_index[p]) for j, p in enumerate(new_grid) if p in old_index]
+            old_index = {p: i for i, p in enumerate(old_items)}
+            assert size * len(old_index) == old_slices[key][1] - old_start, f'{key}: does not match the old config'
+            assert size * len(new_items) == new_end - new_start, f'{key}: does not match the new config'
+            kept = [(j, old_index[p]) for j, p in enumerate(new_items) if p in old_index]
             for j, i in kept:
-                new_weight[:, new_start + j] = weight[:, old_start + i]
+                new_weight[:, new_start + size * j:new_start + size * (j + 1)] = \
+                    weight[:, old_start + size * i:old_start + size * (i + 1)]
             if not quiet:
-                print(f'  {key}: {len(old_grid)} -> {len(new_grid)} points, {len(kept)} kept, the rest zero weights')
+                print(f'  {key}: {len(old_items)} -> {len(new_items)} points/times, {len(kept)} kept, the rest zero weights')
         elif key in old_slices:
             old_start, old_end = old_slices[key]
             new_weight[:, new_start:new_end] = weight[:, old_start:old_end]
@@ -73,6 +82,7 @@ new_obs.pop('defaults', None)
 new_config['obs'] = new_obs['obs']
 new_config = OmegaConf.merge(new_config, OmegaConf.from_dotlist(sys.argv[4:]))
 old_grid, new_grid = scan_grid(old_config), scan_grid(new_config)
+old_times, new_times = preview_times(old_config), preview_times(new_config)
 old_slices, old_dims = obs_slices(old_config)
 new_slices, new_dims = obs_slices(new_config)
 
