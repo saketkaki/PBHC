@@ -87,9 +87,12 @@ class Terrain:
                 for i in range(self.cfg.num_rows):
                     difficulty = i / self.cfg.num_rows
                     # terrain-aware types: rows span difficulty 1/num_rows .. 1 (as in randomized_terrain), so the
-                    # top row is the hardest evaluation setting (curriculum_max_difficulty > 1: harder than it)
+                    # top row is the hardest evaluation setting (curriculum_max_difficulty > 1: harder than it;
+                    # curriculum_max_difficulty_by_type overrides it per type, e.g. {step: 2.0})
                     if terrain_type in ['tilt', 'step', 'bumps']:
-                        difficulty = (i + 1) / self.cfg.num_rows * self.cfg.get('curriculum_max_difficulty', 1.0)
+                        max_difficulty = (self.cfg.get('curriculum_max_difficulty_by_type', None) or {}).get(
+                            terrain_type, self.cfg.get('curriculum_max_difficulty', 1.0))
+                        difficulty = (i + 1) / self.cfg.num_rows * max_difficulty
                     terrain = self.make_terrain(terrain_type, difficulty)
                     self.add_terrain_to_map(terrain, i, j)
         print('\n generated all curriculum terrains!')

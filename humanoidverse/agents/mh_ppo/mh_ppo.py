@@ -209,7 +209,22 @@ class MHPPO(BaseAlgo):
                 logger.info(f"Actor Learning rate: {self.actor_learning_rate}")
                 logger.info(f"Critic Learning rate: {self.critic_learning_rate}")
             self.current_learning_iteration = loaded_dict["iter"]
+            self._restore_terrain_levels(loaded_dict)
             return loaded_dict["infos"]
+
+    def _restore_terrain_levels(self, loaded_dict):
+        """ Continue the terrain curriculum where the checkpoint's run left it (same envs on the same terrain columns);
+        algo.config.restore_terrain_levels=False starts from the configured initial levels instead. """
+        levels, types = loaded_dict.get('terrain_levels'), loaded_dict.get('terrain_types')
+        if levels is None or not self.config.get('restore_terrain_levels', True) or not hasattr(self.env, 'terrain_levels'):
+            return
+        levels, types = levels.to(self.device), types.to(self.device)
+        if levels.shape != self.env.terrain_levels.shape or not torch.equal(types, self.env.terrain_types):
+            logger.warning("Terrain levels in the checkpoint are for other envs or terrain columns: not restored")
+            return
+        self.env.terrain_levels[:] = torch.clip(levels, 0, self.env.max_terrain_level - 1)
+        self.env.env_origins[:] = self.env.terrain_origins[self.env.terrain_levels, self.env.terrain_types]
+        logger.info(f"Terrain levels restored from the checkpoint (mean {self.env.terrain_levels.float().mean():.2f})")
 
     def save(self, path, infos=None):
         logger.info(f"Saving checkpoint to {path}")
@@ -220,6 +235,8 @@ class MHPPO(BaseAlgo):
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
             'iter': self.current_learning_iteration,
             'infos': infos,
+            **({'terrain_levels': self.env.terrain_levels.cpu(), 'terrain_types': self.env.terrain_types.cpu()}
+               if hasattr(self.env, 'terrain_levels') else {}),
         }, path)
         
     def learn(self):

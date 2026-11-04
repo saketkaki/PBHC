@@ -35,9 +35,13 @@ def obs_slices(config):
     return OmegaConf.to_container(config.env.config.obs.post_compute_config.obs_slices), dict(config.robot.algo_obs_dim_dict)
 
 
+def terrain_aware(config):
+    return config.env.config.get('terrain_aware', None) or {}  # missing in configs older than the terrain options
+
+
 def scan_grid(config):
     """(x, y) of each point of the `height_scan` grid, in the order of the observation (x-major)"""
-    hs = config.env.config.terrain_aware.get('height_scan', None) or {}
+    hs = terrain_aware(config).get('height_scan', None) or {}
     (x0, x1), (y0, y1), res = hs.get('x_range', [-0.5, 0.5]), hs.get('y_range', [-0.3, 0.3]), hs.get('resolution', 0.1)
     xs = np.linspace(x0, x1, int(round((x1 - x0) / res)) + 1)
     ys = np.linspace(y0, y1, int(round((y1 - y0) / res)) + 1)
@@ -45,7 +49,7 @@ def scan_grid(config):
 
 
 def preview_times(config):
-    rp = config.env.config.terrain_aware.get('ref_preview', None) or {}
+    rp = terrain_aware(config).get('ref_preview', None) or {}
     return [round(float(t), 4) for t in rp.get('times', [0.0, 0.1, 0.2, 0.3, 0.4, 0.5])]
 
 

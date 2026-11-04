@@ -724,7 +724,7 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         least half of the motion) move one row up, robots whose episode ended before half of the remaining
         motion move one row down, and robots that solve the hardest row go to a random row (legged_gym), or with
         terrain.curriculum_graduate_rows = k to a random one of the k hardest rows, so the hardest terrain stays trained. """
-        if not self.init_done or self.common_step_counter == 0:
+        if not self.init_done or self.common_step_counter == 0 or self._in_reset_all:
             return
         elapsed = self.last_episode_length_buf[env_ids] * self.dt
         motion_end = self.reset_buf_terminate_by.get('motion_end')
@@ -890,6 +890,17 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
     def _init_domain_rand_buffers(self):
         super()._init_domain_rand_buffers()
         self.ref_episodic_offset = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+
+    _in_reset_all = False
+
+    def reset_all(self):
+        """ As the base class; the reset of every robot (e.g. at the start of learning) is not an episode outcome, so
+        it does not move robots in the terrain curriculum. """
+        self._in_reset_all = True
+        try:
+            return super().reset_all()
+        finally:
+            self._in_reset_all = False
 
     def _reset_tasks_callback(self, env_ids):
         if len(env_ids) == 0:
