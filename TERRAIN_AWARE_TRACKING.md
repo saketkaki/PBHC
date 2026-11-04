@@ -1,6 +1,13 @@
 # Terrain-Aware Motion Tracking for PBHC
 
-Final-project plan: extend PBHC (KungfuBot, NeurIPS 2025) so a humanoid can perform highly-dynamic motions on non-flat ground.
+Final project: extend PBHC (KungfuBot, NeurIPS 2025) so a humanoid can perform highly dynamic motions on non-flat ground.
+
+**Status (2026-11-04):**
+- The Horse-stance pose policy now handles tilts, bumps, held-out rough ground and steps, while matching the released policy on flat ground.
+- Steps are the weakest terrain, and a step up directly ahead is the main remaining failure.
+- A second motion (Horse-stance punch) is training.
+
+Every run, with its settings, results and problems, is in [LOG.md](LOG.md). The original plan from 2026-10-27 is kept in the appendix.
 
 ## 1. Motivation
 
@@ -10,15 +17,368 @@ The PBHC paper states its own limitation (Section 6):
 
 PBHC trains and evaluates only on a flat plane. Its tracking objective also assumes flat ground: reference motions are placed at one fixed height per environment, and the rewards compare body positions in world coordinates. On a slope or a step, the reference floats above the ground on one side and sinks into it on the other, so the policy is rewarded for the wrong behaviour.
 
-**Goal:** make PBHC's motion tracking terrain-aware, with three parts:
+The example motions travel only 0.2–1.0 m, so the task is **performing a motion on uneven footing**, not walking across terrain: the terrain feature has to sit under the robot's feet.
 
-1. **Ground-relative reference adaptation** (core contribution): track the reference motion relative to the local ground, not in world coordinates.
-2. **Height-scan perception**: give the policy a local terrain height map.
-3. **Terrain curriculum**: progress from flat to rough, tilted and stepped ground.
+## 2. Contributions compared with the original PBHC
 
-## 2. What the existing code gives us
+### The original PBHC (as released)
 
-All paths are relative to the repo root.
+- **Reference placement:** the reference motion sits at one fixed height per environment, and rewards compare body positions in world coordinates.
+- **Actor inputs:** proprioception with a short history, plus the motion phase. The actor is blind to the terrain and to where the reference is; only the critic sees the reference body positions.
+- **Training:**
+  - adaptive tracking factor σ, from a running average of the tracking error;
+  - a multi-head critic, one head per reward term;
+  - a drift-termination threshold that shrinks towards 0.3 m;
+  - one policy per motion, trained from scratch on flat ground.
+- **Evaluation:** tracking error on flat ground.
+
+Everything below is off by default. With it off, the code reproduces the original exactly on flat ground (checked tensor by tensor, Section 6.4).
+
+### C1. Terrain suite and curriculum
+
+- **New terrain types:** tilts, single steps through the tile centre, and smooth bumps, alongside legged_gym's rough ground. They are graded by difficulty row, with a fixed-difficulty mode for evaluation that extrapolates past the training range (steps to 17 cm, tilts to 24°, bumps to 8 cm).
+- **Placement:** each motion is recentred on its tile, so the feature is under the feet.
+- **Curriculum:**
+  - Robots move up a row after completing the motion and down after an early failure.
+  - Graduates stay in the hardest rows.
+  - The top row is set per terrain type (steps go to 17 cm, tilt to 12°, bumps to 4 cm).
+  - Each robot's level is saved in the checkpoint and restored when training continues.
+
+### C2. Ground-relative reference
+
+The reference is shifted onto the local ground every frame:
+- The shift is a soft maximum of the ground height under the supporting feet.
+- Ground heights are averaged over each foot's footprint, so the shift changes smoothly at step edges.
+- The reference's vertical velocity is corrected for the changing shift.
+- The feet reward compares heights above the ground under each foot.
+
+This makes the tracking objective correct on terrain. On its own it mostly turns falls into drift terminations (round 1: falls 23–36% → 1–7%), because a blind policy still cannot place its feet.
+
+Three refinements were built and tested but not adopted: per-foot leg shifts, leg inverse kinematics, and lifting a swinging foot over a nearby riser (Section 4).
+
+### C3. Terrain perception
+
+- **Actor:** an 11 × 11 height scan out to ±0.5 m in the heading frame, and a 2 cm scan under each foot that moves with the foot.
+- **Critic only:** an exact 15 × 15 scan.
+- **Exact terrain height:** legged_gym's lookup takes the minimum of three neighbouring height-field cells. It reads 1–3 cm low on tilts and misplaces step edges by up to 10 cm. It was replaced by a lookup in the rasterised trimesh, used for the scans and the reference.
+- **Noise model:** per-point noise, per-episode bias and map shift, dropout and delay, for robustness tests.
+- **Evidence that the policy uses the scan:** with the scan replaced by flat ground, the same weights track 18% of the motion on the 12° tilt instead of 61% (blind-scan ablation).
+
+### C4. Reference preview: the biggest gain
+
+A new actor and critic input gives the terrain-shifted reference pelvis and feet at 0, 0.1, …, 0.5 s ahead, relative to the robot's own root in its heading frame, plus the reference heading relative to the robot's (66 numbers).
+
+- **Gains against the same training continued without it:**
+
+  | Terrain | Without preview | With preview |
+  |---|---|---|
+  | 10 cm steps | 9% | 46% |
+  | Rough | 18% | 52% |
+  | 8 cm bumps | 18% | 35% |
+  | Flat error | 26 mm | 22 mm |
+
+  These held across three training seeds.
+- **Why it works:** the original actor cannot see that it has drifted from the reference, and on terrain that drift is what ends episodes. The bottleneck was this, not terrain perception.
+- **Negative results:**
+  - Measuring the preview relative to the reference's own pose (no localisation needed) gives no gain with one motion, because it repeats the motion phase.
+  - Extending the preview to 1.0 s made steps and tilts worse in all three runs that used it.
+
+### C5. Fine-tuning recipe for terrain
+
+- **Warm starts:** new observation inputs start at zero weight, and the Adam state is expanded to match (`scripts/expand_checkpoint.py`), so a run starts exactly from the released behaviour.
+- **Gentle fine-tuning:**
+  - critic-only warm-up, then a ramped, fixed actor learning rate of 2e-5;
+  - critic learning rate 1e-4;
+  - noise std frozen at the released value, and no entropy bonus.
+
+  The first recipe (3e-4, fresh optimizer, entropy on) took flat-ground completion from 99% to 0% within 100 updates.
+- **Falls cost more than drifting:** a drift termination costs a quarter of a fall.
+- **Fixed drift cutoff:** the training cutoff stays at 0.7 m, the evaluation value. With PBHC's shrinking cutoff (0.3 m) episodes end before any fall can happen, so the fall penalty never applies.
+- **σ frozen:** a single running average is distorted by mixed terrain difficulty.
+
+### C6. Evaluation
+
+- **Difficulty sweep:** 17 settings × 3 seeds × 200 episodes, from the motion start, every env contributing equally. The earlier counting over-weighted early failures and made blind policies look worse than they were.
+- **Outcomes:** completed, fall or drift, plus tracking errors.
+- **Step diagnostics:**
+  - where the raised side is;
+  - distance from the feet to the edge;
+  - which feet start on the step;
+  - when failures happen;
+  - shin contact;
+  - whether the robot's feet end on the same level as the reference's.
+- **Comparison videos** with fixed cameras and scan markers, uploaded to W&B.
+
+## 3. Results
+
+Completion rate (%), from the motion start, 3 evaluation seeds × 200 episodes; multi-seed rows are means over training seeds.
+
+| Model | Flat | Rough (held out) | Tilt 12° | Tilt 18° | Bumps 4 cm | Bumps 8 cm | Step 6.5 cm | Step 10 cm | Step 13.5 cm | Step 17 cm | Flat error |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Released PBHC (zero-shot) | 98.8 | 0.0 | 0.0 | 0.0 | 0.5 | 0.0 | 7.3 | 21.0 | 23.0 | 23.2 | 20.2 mm |
+| Ground-relative reference only (C, round 1) | 64.7 | 23.3 | 1.0 | 0.0 | 32.0 | 4.7 | 14.3 | 18.8 | 13.8 | 17.0 | 45.4 mm |
+| + height scan (E1, round 1) | 91.5 | 21.8 | 28.3 | 2.2 | 33.7 | 2.3 | 27.2 | 11.7 | 5.7 | 3.0 | 45.0 mm |
+| + gentle fine-tuning, continued (E2c) | 96.8 | 21.7 | 56.8 | 8.3 | 54.3 | 5.7 | 26.0 | 3.8 | 0.8 | 0.3 | 31.5 mm |
+| + fall penalty, 0.7 m cutoff (F2, 2 seeds) | 95.3 | 20.2 | 63.6 | 10.5 | 58.4 | 8.2 | 24.6 | 8.9 | 2.8 | 1.7 | 32.2 mm |
+| + perception v2 (F3, 2 seeds) | 97.3 | 18.9 | 82.7 | 31.8 | 71.9 | 15.1 | 34.2 | 9.3 | 4.4 | 1.6 | 28.2 mm |
+| + reference preview (3 seeds) | 99.2 | 51.1 | 85.7 | 36.2 | 88.6 | 35.8 | 54.9 | 38.1 | 23.2 | 13.4 | 22.2 mm |
+| + 3,250 more iterations (2 seeds) | **99.9** | **55.5** | **91.7** | 37.2 | 90.6 | 36.2 | 59.7 | 45.1 | 29.2 | 16.8 | **20.4 mm** |
+| **+ step curriculum to 17 cm (2 seeds, current best)** | 99.6 | 55.0 | 89.6 | **44.8** | **92.7** | **42.3** | **62.3** | **50.7** | **36.2** | **25.6** | 20.6 mm |
+
+Fall rates of the current best: 0% on flat, rough and tilts up to 12°; 0.8% on 15° tilts and 8 cm bumps. On steps it falls 1.6, 6.3, 13.3 and 16.1% at 6.5, 10, 13.5 and 17 cm.
+
+- **Flat error** is the root-relative body position error on flat ground, as PBHC's E_mpbpe. The current best matches the released policy.
+- **The B and C rows** come from the first fine-tuning recipe, which damaged the released policy (Section 4). They show what the reference change does on its own, not a tuned baseline.
+- **Released policy on steps:** its completion rises with step height, which a blind policy shouldn't do. The cause hasn't been checked, so treat that row with care.
+- **Training seeds** differ by up to about 15 points on 10 cm steps, so differences of a few points between rows are not meaningful.
+
+**How far the terrain can go** (current best, at least 50% of motions completed):
+
+| Terrain | Holds | Breaks |
+|---|---|---|
+| Tilt | 15° (72.6%) | 18° (44.8%); 24° fails for every policy (5%) |
+| Bumps | 6 cm (69.9%) | 8 cm (42.3%) |
+| Steps | 10 cm (50.7%) | 11.8 cm (46.7%); 17 cm 25.6% |
+
+**Second motion (Horse-stance punch):**
+- The released punch, zero-shot, completes 78–83% of steps up to 17 cm, because the punch barely moves its feet. It completes 0% on tilt, bumps and rough.
+- Fine-tuning it with the full recipe (`ft18_P_preview_s2`) finishes on 2026-11-04 evening; results go into [LOG.md](LOG.md).
+
+## 4. What works and what does not
+
+| | Change | Evidence (details in LOG.md) |
+|---|---|---|
+| **Works** | Height scan (C3) | Only the scan policies complete motions on tilts; blinding the scan cuts the share of the 12° tilt motion tracked from 61 to 18% |
+| | Ground-relative reference (C2) | Required for a correct objective; on its own it removes falls but not drift |
+| | Gentle fine-tuning (C5) | Fixed the round-1 collapse; flat error 45 → 31 mm, then to 20 mm with later changes |
+| | Fall penalty + 0.7 m training cutoff | Falls at most 7% for F2s1 everywhere, held-out rough 33 → 1% |
+| | Perception v2: wide scan, foot scans, exact lookup | Tilt 12° 64 → 83%, tilt 18° 11 → 32%, bumps better. A control with the same training but old observations got worse on tilt and bumps |
+| | Robot-frame reference preview (C4) | The largest gain on every terrain, across 3 seeds |
+| | Step curriculum to 17 cm | Two-seed mean +6 to +9 points at every step height ≥ 10 cm (seed 4 +8 to +14; seed 2 mainly at 17 cm, +9.5); bumps 8 cm and tilt 18° up 6–8 points |
+| | Fair evaluation | Fixed over-counting of early failures (A on 10 cm steps 13% → 37% episode length) |
+| **Does not work** | Per-foot reference | Fewer falls, but much worse on tilts (57% vs 82% on 6°) |
+| | Leg-IK reference | Swapping it in or out at evaluation changes results by 1–4 points; its run's tilt gain came from training variance |
+| | Swing clearance | No better than the plain continuation; worse on tilt |
+| | min3 lookup for the reference | Worse everywhere |
+| | Fall penalty with the 0.3 m cutoff | Never fired: training had no falls |
+| | Preview in the reference frame | No gain with a single motion |
+| | Preview to 1.0 s | Steps and tilt worse in all 3 runs |
+| | Early starts on step tiles | Even without curriculum demotion, no gain from the motion start |
+| | Shin-contact penalty (idea) | Shin contact is as common in completed episodes as in failed ones; dropped before building |
+| **Mixed** | Training longer | Helps a run whose curriculum is on hard tiles (s2: 10 cm steps 46 → 54%), not one stuck on easy tiles (s4) |
+| | Scan noise | Policies tolerate noise, dropout, map shift and delay; a 5 cm height offset costs 8–15 points |
+
+## 5. Open problems and next steps
+
+**Steps are the weakest terrain.**
+- **Where they fail:** nearly all failures happen in the 1–2.5 s weight shift and big right-foot step of the horse stance. A step up directly ahead is the main failure: at 10 cm the current runs fall 10–25% of the time there, against 1–6% in the other directions. At 17 cm, seed 4 also falls 30% of the time with the raised side on the right.
+- **Starting layout:** about half the evaluation starts straddle the edge, and those complete far less often.
+- **Small steps are ramps:** the trimesh conversion turns height changes under 7.5 cm per 10 cm cell into ramps (`slope_treshold: 0.75`), so the 6.5 cm step and the lowest curriculum rows are not walls.
+
+**Next steps, in order:**
+1. **Foothold scan:** a small height patch around each reference foot 0.3–0.5 s ahead. The big step lands about 50 cm out, at the edge of the body scan, and the foot scans only cover where the feet are now.
+2. **Move reference landing points away from step edges** horizontally (not only in height, which every reference variant so far changed).
+3. **Report start layouts separately** (clean starts vs straddling the edge), and decide whether training should include straddle starts.
+4. **Make small steps real walls** (`slope_treshold` ≈ 0.5), and raise the tilt and bumps ceilings now that those terrains have headroom.
+5. **Preview robustness:** add noise and drift to the robot position estimate the preview uses, since deployment needs localisation.
+6. **More motions:**
+   - the punch result;
+   - the side and roundhouse kicks (long single-leg phases) and Bruce Lee pose (deep crouch, 1 m of travel), which have no released checkpoints;
+   - one terrain-aware policy for several motions, where the reference-frame preview could carry the motion content without localisation.
+
+Keep 2 training seeds per variant: single-seed comparisons on steps cannot detect changes smaller than about 15 points.
+
+**Limitations compared with the paper:**
+- The preview needs an estimate of the robot's position relative to the motion start, and the height scan needs an elevation map. The original policy needs neither.
+- Everything is in simulation, and so far with one motion.
+
+## 6. Implementation reference
+
+Branch `terrain-aware-tracking`. Every option defaults to the original PBHC behaviour, so existing configs and checkpoints behave as before.
+
+### 6.1 Files
+
+| File | Change |
+|---|---|
+| `humanoidverse/envs/env_utils/terrain.py` | Terrain types `tilt`, `step`, `bumps` through the tile centre; row difficulty with a per-type ceiling; `fixed_difficulty` for evaluation |
+| `humanoidverse/config/terrain/terrain_kungfu.yaml` | Terrain group: trimesh, 4 × 4 m tiles, 5 rows × 8 columns; flat / bumps / tilt / step = 0.1 / 0.3 / 0.3 / 0.3 |
+| `humanoidverse/envs/motion_tracking/motion_tracking.py` | All of the following: <br>• height lookups (min3 and exact raster) and motion recentring; <br>• the ground-relative reference (rigid, per-foot, leg IK, swing clearance); <br>• the observations `height_scan`, `height_scan_noisy`, `foot_scan`, `privileged_height_scan` and `ref_preview`, with the scan noise model; <br>• terrain curriculum, early starts, the fall/drift penalty split, and terrain diagnostics in the log; <br>• terrain-consistent trajectory saving |
+| `humanoidverse/agents/mh_ppo/mh_ppo.py` | Critic-only warm-up, actor learning-rate ramp, fixed noise std, configured learning rates over checkpointed ones; terrain levels saved in and restored from checkpoints |
+| `humanoidverse/config/env/motion_tracking.yaml` | The `env.config.terrain_aware` block |
+| `humanoidverse/config/obs/motion_tracking/main_terrain*.yaml` | Observation sets (Section 6.3) |
+| `scripts/expand_checkpoint.py` | Warm start for a larger observation set: new inputs at zero weight, Adam state expanded, scan grid and preview times remapped |
+| `scripts/terrain_eval.py`, `eval_difficulty_sweep.sh`, `summarize_difficulty_sweep.py` | Evaluation (completed / fall / drift, errors, step and drift diagnostics, `--start-time`), the 17-setting sweep and its summary tables |
+| `scripts/eval_terrain_matrix.sh`, `summarize_terrain_eval.py` | The earlier 6–7-terrain evaluation |
+| `scripts/eval_scan_noise.sh`, `summarize_scan_noise.py` | Scan-noise and blind-scan sweeps |
+| `scripts/record_video.py`, `record_pilot_videos.sh` | Real-time clips judged by the evaluation's termination rules, side-by-side comparisons, W&B upload |
+| `scripts/terrain_aware_check.py` | Flat-ground regression, reference placement, scan noise, lookup and swing checks |
+
+### 6.2 Options
+
+`env.config.terrain_aware`:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `ground_relative_ref` | `False` | Shift the reference onto the local terrain; also enables the ground-relative feet reward |
+| `recenter_motion_xy` | `False` | Start each motion at its tile centre. **Use for every terrain run** |
+| `support_height_tau` | `0.02` | Softness [m] of the soft maximum over supporting feet |
+| `per_foot_ref`, `support_lift_tau` | `False`, `0.03` | Also shift each leg towards the ground under its own foot (ankle 1, knee 0.5) |
+| `leg_ik_ref`, `leg_ik_support_ratio`, `leg_ik_iterations` | `False`, `0.0`, `6` | Re-solve the reference legs by IK so each foot stands on its own ground |
+| `swing_clearance`, `swing_clearance_radius`, `swing_clearance_lift` | `False`, `0.15`, `0.02` | Raise a lifted reference foot over higher ground within the radius |
+| `ref_velocity_correction`, `ref_velocity_correction_max` | `True`, `1.0` | Add the rate of change of the terrain offsets to the reference z velocities, clamped [m/s] |
+| `feet_ground_footprint` | `0.04` | Half-length [m] of the footprint the ground under a foot is averaged over |
+| `spawn_clearance` | `0.0` | Extra root height [m] at reset (0.01 on terrain) |
+| `leg_joint_pos_weight` | `1.0` | Weight of hip/knee/ankle joints in the joint-position reward |
+| `height_lookup`, `ref_height_lookup`, `exact_height_resolution` | `min3`, `null`, `0.01` | Terrain height for the scans and for the reference: `min3` (legged_gym) or `exact` (rasterised trimesh). **Use `exact` for both** |
+| `height_scan.*` | x ±0.5, y ±0.3, 0.1 m | Body scan grid in the heading frame (use y ±0.5 with `main_terrain_v2*`) |
+| `foot_scan.*` | 13 × 7 at 0.02 m | Grid under each foot |
+| `privileged_height_scan.*` | 15 × 15 at 0.1 m | Critic-only scan (exact, no noise) |
+| `ref_preview.times`, `ref_preview.frame` | 0–0.5 s, `robot` | Preview times; positions relative to the robot (`robot`) or to the current reference (`reference`) |
+| `early_start.*` | `prob 0` | Start step-tile episodes in `[0, max_time]` with probability `prob`; `keep_level_on_failure` skips demotion |
+| `height_scan_noise.*` | all 0 | Per-point noise, episode bias, xy drift, dropout, delay, `blind` ablations, `perturb_height_scan` |
+| `debug_draw_height_scan` | `False` | Draw env 0's scan points in the viewer |
+
+Other options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `terrain.fixed_difficulty` | `null` | Evaluate a single difficulty (> 1 extrapolates) |
+| `terrain.curriculum_max_difficulty` | `1.0` | Difficulty of the top curriculum row (rows span max/num_rows … max) |
+| `terrain.curriculum_max_difficulty_by_type` | `null` | Per-type override, e.g. `{step: 2.0}` (rows 5.8–17 cm) |
+| `terrain.curriculum_graduate_rows` | `null` | Robots that solve the top row go to one of this many hardest rows |
+| `terrain.tilt_max_deg`, `step_height_range`, `bumps_max_height`, `bumps_spacing` | 12°, [0.03, 0.10] m, 0.04 m, 0.3 m | Terrain scales at difficulty 0 and 1 |
+| `env.config.termination_scales.termination_drift_penalty_scale` | `1.0` | Termination penalty of a drift ending relative to a fall |
+| `algo.config.actor_warmup_iterations` | `0` | Critic-only updates at the start of a run |
+| `algo.config.actor_lr_ramp_iterations` | `0` | Linear actor learning-rate ramp after the warm-up |
+| `algo.config.fix_noise_std` | `False` | Freeze the action noise std at the checkpoint's value |
+| `algo.config.load_optimizer_lr` | `True` | `False` uses the configured learning rates instead of the checkpoint's |
+| `algo.config.restore_terrain_levels` | `True` | Restore the terrain levels saved in the checkpoint |
+
+### 6.3 Observation sets
+
+| Config | Actor adds | Critic adds | Actor / critic inputs |
+|---|---|---|---|
+| `main` (PBHC) | – | – | 380 / 630 |
+| `main_terrain_priv` | – | `height_scan` | 380 / 707 |
+| `main_terrain` | `height_scan` (77) | `height_scan` | 457 / 707 |
+| `main_terrain_noisy` | `height_scan_noisy` (77) | `height_scan` | 457 / 707 |
+| `main_terrain_v2` | `height_scan` (121), `foot_scan` (182) | + `privileged_height_scan` (225) | 683 / 1,158 |
+| `main_terrain_v2_preview` | + `ref_preview` (66) | + `ref_preview` | **749 / 1,224** |
+| `main_terrain_v2_preview_long` | + `ref_preview` (88, to 1.0 s) | + `ref_preview` | 771 / 1,246 |
+
+Terms are concatenated in sorted name order, which `expand_checkpoint.py` accounts for.
+
+### 6.4 Verification
+
+**Flat-ground regression (exact).** `python scripts/terrain_aware_check.py regress example/pretrained_horse_stance_pose/model_50000.pt num_envs=16`: over 60 steps × 16 envs with random actions, every reference tensor, the feet reward and the height scan are **identical (difference 0)** between the original and the terrain-aware code paths. This was re-checked after the per-foot reference, the leg IK and the scan noise were added.
+
+Closed-loop evaluation is not deterministic (three runs of the same code on flat ground gave E_gmpbpe of 33.5, 36.1 and 43.2 mm), so results are reported as means over many episodes and seeds.
+
+**Reference foot clearance on terrain** (`terrain_aware_check.py terrain`, 64 envs × 120 steps; lower reference foot's ankle-link height above the terrain under it; about 0.03–0.05 m on flat ground):
+
+| Terrain | Naive (original offset): mean / floating > 9 cm | Ground-relative: mean / below ground / floating |
+|---|---|---|
+| Tilt | 0.111 m / 66% of frames | 0.035 m / 0.0% / 0.1% |
+| Step | 0.063 m / 23% | 0.037 m / 0.0% / 0.0% |
+| Rough | 0.059 m / 0.1% | 0.034 m / 0.0% / 0.0% |
+
+Step terrain at difficulty 1.0; error = foot clearance above the ground under it minus the clearance authored on flat ground:
+
+| Variant | Mean \|error\| | Feet > 3 cm too high | Lower foot below ground | \|v_z − Δz/Δt\| | Worst offset jump per step |
+|---|---|---|---|---|---|
+| Naive | 0.063 m | 63% | 0% | 0.032 m/s | 0 |
+| Rigid shift, no velocity correction | 0.022 m | 22% | 3.3% | 0.056 m/s | 0.056 m |
+| Rigid shift (default) | 0.022 m | 22% | 3.3% | 0.038 m/s | 0.056 m |
+| Per-foot | 0.004 m | 4.9% | 4.0% | 0.035 m/s | 0.044 m |
+| Leg IK | joint angles and foot positions agree to 0.01 cm | | | | |
+
+**Exact height lookup** (`terrain_aware_check.py lookup`): the share of weight-bearing feet more than 2 cm from the looked-up ground drops from 20% to 5% on the 12° tilt, and from 16% to 3% on bumps.
+
+## 7. How to run
+
+```bash
+conda activate pbhc && cd ~/ws/PBHC
+```
+
+**Fine-tuning recipe of the current best run** (STEP17; continue a preview checkpoint). The tracking σ values are frozen at the ones the pose run had adapted to:
+
+```bash
+SIGMA="rewards.reward_tracking_sigma.teleop_max_joint_pos=0.2952 rewards.reward_tracking_sigma.teleop_upper_body_pos=0.0021 \
+  rewards.reward_tracking_sigma.teleop_lower_body_pos=0.0015 rewards.reward_tracking_sigma.teleop_vr_3point_pos=0.0022 \
+  rewards.reward_tracking_sigma.teleop_feet_pos=0.0013 rewards.reward_tracking_sigma.teleop_body_rot=0.0998 \
+  rewards.reward_tracking_sigma.teleop_body_vel=0.0713 rewards.reward_tracking_sigma.teleop_body_ang_vel=1.9885 \
+  rewards.reward_tracking_sigma.teleop_joint_pos=0.0215 rewards.reward_tracking_sigma.teleop_joint_vel=3.3087"
+```
+
+```bash
+python humanoidverse/train_agent.py +simulator=isaacgym +exp=motion_tracking +terrain=terrain_kungfu \
+  project_name=MotionTracking +opt=wandb +robot=g1/g1_23dof_lock_wrist +domain_rand=main +rewards=motion_tracking/main \
+  robot.motion.motion_file=example/motion_data/Horse-stance_pose.pkl seed=2 +device=cuda:0 headless=True num_envs=1536 \
+  +obs=motion_tracking/main_terrain_v2_preview checkpoint=<checkpoint or warm start> experiment_name=<name> \
+  env.config.terrain_aware.recenter_motion_xy=True env.config.terrain_aware.spawn_clearance=0.01 \
+  env.config.terrain_aware.ground_relative_ref=True "env.config.terrain_aware.height_scan.y_range=[-0.5,0.5]" \
+  env.config.terrain_aware.height_lookup=exact env.config.terrain_aware.ref_height_lookup=exact \
+  algo.config.load_optimizer=True +algo.config.load_optimizer_lr=False algo.config.schedule=fixed \
+  algo.config.actor_learning_rate=2e-5 algo.config.critic_learning_rate=1e-4 algo.config.entropy_coef=0 \
+  +algo.config.fix_noise_std=True +algo.config.actor_lr_ramp_iterations=100 +algo.config.actor_warmup_iterations=100 \
+  terrain.curriculum=True terrain.max_init_terrain_level=1 terrain.curriculum_graduate_rows=2 \
+  "terrain.curriculum_max_difficulty_by_type={step:2.0}" \
+  env.config.termination_curriculum.terminate_when_motion_far_curriculum=False \
+  env.config.termination_scales.termination_motion_far_threshold=0.7 \
+  env.config.termination_scales.termination_drift_penalty_scale=0.25 rewards.adaptive_tracking_sigma.enable=False \
+  algo.config.save_interval=250 algo.config.num_learning_iterations=3250 $SIGMA
+```
+
+**Warm start from a released checkpoint** (new inputs at zero weight, optimizer state expanded):
+
+```bash
+python scripts/expand_checkpoint.py example/pretrained_horse_stance_pose/model_50000.pt \
+  humanoidverse/config/obs/motion_tracking/main_terrain_v2_preview.yaml logs/warmstart/<name>.pt \
+  "env.config.terrain_aware.height_scan.y_range=[-0.5,0.5]"
+```
+
+**Evaluation:**
+- **One setting:**
+
+  ```bash
+  python scripts/terrain_eval.py <run>/model_<N>.pt --name step_d100 --seed 0 --episodes 200 \
+    "terrain.terrain_types=[step]" "terrain.terrain_proportions=[1.0]" terrain.fixed_difficulty=1.0 \
+    env.config.terrain_aware.ground_relative_ref=True
+  ```
+
+  Add `--start-time T` to start every episode at motion time T.
+- **Full sweep:** `scripts/eval_difficulty_sweep.sh`, then `python scripts/summarize_difficulty_sweep.py --step-edges --drift LABEL=CKPT ...`.
+- **The released checkpoint:** it predates these options, so add `+env.config.terrain_aware.recenter_motion_xy=True`.
+
+**Videos.**
+- **Command:** `scripts/record_pilot_videos.sh TAG=CKPT ...` records the released policy and each checkpoint on 17, 13.5, 10 and 6.5 cm steps, 12° and 6° tilts, 4 cm bumps and flat.
+- **Comparisons:** side-by-side `compare_<terrain>.mp4` files are uploaded to each run's W&B page.
+- **Options:** `OUT=`, `NO_WANDB="TAG ..."` and `SECONDS_PER_CLIP=`.
+- **Requirements:** a display. Each clip is one episode, so use the sweep to compare models.
+
+**W&B:** `+opt=wandb` logs to `saketkaki-the-university-of-texas-at-austin/MotionTracking`; the `pbhc` conda env sets `WANDB_ENTITY` and the API key.
+
+**Checkpoint naming:** the final policy is saved under the name of the last periodic save (for example `model_68250.pt` for a run ending at 68,500). Copy it to `model_<final>.pt`.
+
+---
+
+## Appendix: the original plan (2026-10-27)
+
+### How the plan turned out
+
+| Plan step | Outcome |
+|---|---|
+| Step 0: terrain infrastructure | Done. `bumps` was added after the rough tile turned out to be about 1 cm noise in a pit. The exact lookup replaced the min3 helper below |
+| Step 1: motivating experiment | Done. The released policy completes 0% on tilt, bumps and rough |
+| Step 2: ground-relative reference | Done as a soft-max rigid shift (C2). Per-foot and leg-IK variants were built and not adopted. The leg-joint weight ablation (C′) was not run |
+| Step 3: height scan | Done, then widened with foot scans and an exact lookup (C3). Teacher–student distillation was not done |
+| Step 4: terrain curriculum | Done, with graduation rows, per-type ceilings and levels saved in checkpoints |
+| Rows B, C, E | Run in round 1 with the first fine-tuning recipe. Later work continued only E. Row D (privileged critic only) was not run |
+| Not in the plan | The reference preview (C4), the fine-tuning recipe (C5) and the evaluation work (C6) |
+
+### A.1 What the existing code gives us
+
+All paths are relative to the repo root. Line numbers are from the original code.
 
 | Fact | Where | Consequence |
 |---|---|---|
@@ -34,9 +394,9 @@ All paths are relative to the repo root.
 | Observations are discovered by name (`_get_obs_<name>`) and declared in YAML. | `config/obs/motion_tracking/main.yaml` | Adding a height-scan observation is a getter plus config entries. |
 | The motion-tracking experiment uses `mh_ppo` (vectorised critic). Teacher–student/DAgger exists only in `ppo_mimic` (used by `general_tracking`). | `config/exp/motion_tracking.yaml`, `agents/ppo/ppo_mimic.py` | Distillation is not plug-and-play here; treat it as a stretch goal. |
 
-## 3. Implementation plan
+### A.2 Implementation plan
 
-### Step 0: Terrain infrastructure (~1 day)
+#### Step 0: Terrain infrastructure (~1 day)
 
 **Height lookup helper** (in `MotionTracking`, or in `LeggedRobotBase` for reuse), following the legged_gym convention:
 
@@ -67,38 +427,26 @@ Verify it visually by drawing spheres at sampled heights with `self.simulator.dr
 
 **Spawn clearance:** add 1–2 cm to the root height at reset (there is a commented-out line for this at `motion_tracking.py` ~L509).
 
-### Step 1: Motivating experiment (~½ day, no training)
+#### Step 1: Motivating experiment (~½ day, no training)
 
-Evaluate the released checkpoint `example/pretrained_horse_stance_pose/model_50000.pt` zero-shot on each terrain type and difficulty:
+Evaluate the released checkpoint `example/pretrained_horse_stance_pose/model_50000.pt` zero-shot on each terrain type and difficulty. On flat ground this checkpoint reaches a 98.4% episode-length ratio (measured on our setup). The expected drop on slopes and steps is the motivating figure for the report.
 
-```bash
-python humanoidverse/ratio_eps.py +device=cuda:0 \
-  +checkpoint=example/pretrained_horse_stance_pose/model_50000.pt \
-  +opt=record +num_envs=100 +num_episodes=100 +eps_eval_name=terrain_zeroshot \
-  +terrain=terrain_kungfu
-```
-
-On flat ground this checkpoint reaches a 98.4% episode-length ratio (measured on our setup). The expected drop on slopes and steps is the motivating figure for the report.
-
-### Step 2: Ground-relative reference adaptation (core contribution, ~2–3 days)
+#### Step 2: Ground-relative reference adaptation (core contribution, ~2–3 days)
 
 Implement inside `kick_motion_res()` and `kick_motion_res_multiplestep()`:
 
 1. **Remove the fixed origin height.** Pass the origin's x, y as the offset with z = 0.
-2. **Per-frame support height.** Look up terrain heights under the reference feet (`rg_pos_t[:, feet_ids, :2]`). *(Implemented differently from first planned; see Section 8.)* A rigid vertical shift cannot put two feet on ground of different heights, and averaging the two heights left the foot on higher ground up to 3.5 cm *inside* the terrain. The implementation uses a soft maximum over the supporting feet: `h_sup = Σ wᵢ·hᵢ`, `w = softmax((hᵢ − liftᵢ)/τ)`, where `liftᵢ` is how far foot *i* is raised in the reference and τ = 0.02 m. It is continuous in time, needs no state, and is exactly 0 on flat ground.
+2. **Per-frame support height.** Look up terrain heights under the reference feet (`rg_pos_t[:, feet_ids, :2]`). *(Implemented as a soft maximum over the supporting feet instead: averaging the two heights left the foot on higher ground up to 3.5 cm inside the terrain.)*
 3. **Shift the reference.** Add `h_sup` to the z of `root_pos`, `rg_pos` and `rg_pos_t`. Rotations are unchanged; optionally add d(`h_sup`)/dt to the vertical velocities.
 4. **Ground-relative feet reward.** In `_reward_teleop_body_position_feet` (~L1210), compare each foot's height above the terrain beneath it, `foot_z − h(foot_xy)`, with the reference foot's height above flat ground; keep x, y as before.
-   The idea to present in the report: **track the motion in a ground-relative frame instead of the world frame.**
-5. **Leg-joint conflict.** On a slope, ankle and knee angles must deviate from the reference. Add a `teleop_joint_pos_lower_weight` mask in `_reward_teleop_joint_position` (~L1265); ablate 1.0 vs ~0.3.
-6. **Regression test (required).** With `mesh_type: plane` all heights are zero, so the modified code must reproduce PBHC exactly. Run `sample_eps.py` on the pretrained checkpoint before and after the change; the metrics must be identical.
+5. **Leg-joint conflict.** On a slope, ankle and knee angles must deviate from the reference. Add a lower-body weight mask in `_reward_teleop_joint_position` (~L1265); ablate 1.0 vs ~0.3.
+6. **Regression test (required).** With `mesh_type: plane` all heights are zero, so the modified code must reproduce PBHC exactly.
 
-**Evaluation scripts:** `sample_eps.py` / `ratio_eps.py` compute metrics against the reference loaded from file (flat ground; see `root_trans_offset` handling at `motion_tracking.py` ~L872). Save the **adapted** reference together with the robot trajectory so terrain metrics are computed fairly.
+#### Step 3: Height-scan perception (~1–2 days)
 
-### Step 3: Height-scan perception (~1–2 days)
-
-1. **Scan grid:** e.g. 11 × 7 points at 10 cm spacing (1.0 m × 0.6 m), **centred under the feet** (the motions barely travel, so no look-ahead is needed). Precompute in the robot's heading frame and rotate by heading each step (`calc_heading_quat` is already imported).
-2. **Getter:** add `_get_obs_height_scan` to `MotionTracking`, returning `clip(root_z − h(points) − c, −1, 1)` with `c` ≈ 0.6–0.7. Kung-fu squats move root height from ~0.55 to ~0.8 m, so an alternative is heights relative to the lower foot, which is invariant to squatting. Justify the choice in the report.
-3. **Config:** copy `config/obs/motion_tracking/main.yaml` to `main_terrain.yaml`; add `height_scan` to `critic_obs` (and `actor_obs` for the perceptive variant), `obs_dims` (`height_scan: 77`), `obs_scales` (1.0) and `noise_scales` (~0.02–0.05 for the actor).
+1. **Scan grid:** e.g. 11 × 7 points at 10 cm spacing (1.0 m × 0.6 m), centred under the feet. Precompute in the robot's heading frame and rotate by heading each step.
+2. **Getter:** add `_get_obs_height_scan` to `MotionTracking`, returning `clip(root_z − h(points) − c, −1, 1)` with `c` ≈ 0.6–0.7.
+3. **Config:** copy `config/obs/motion_tracking/main.yaml` to `main_terrain.yaml` and add `height_scan` to the critic (and actor for the perceptive variant).
 
 | Variant | Actor sees scan | Critic sees scan |
 |---|---|---|
@@ -106,316 +454,46 @@ Implement inside `kick_motion_res()` and `kick_motion_res_multiplestep()`:
 | Privileged critic | no | yes |
 | Perceptive | yes | yes |
 
-Stretch goal: teacher–student distillation (perceptive teacher → student with noisy/partial scan), which requires porting the DAgger logic from `ppo_mimic` to `mh_ppo`.
+Stretch goal: teacher–student distillation, which requires porting the DAgger logic from `ppo_mimic` to `mh_ppo`.
 
-### Step 4: Terrain curriculum (~1 day)
+#### Step 4: Terrain curriculum (~1 day)
 
-- Set `terrain.curriculum: True`; `humanoidverse/envs/base_task/base_task.py` (~L117–L129) already initialises `terrain_levels`, `terrain_types` and `terrain_origins`.
-- Implement `_update_terrain_curriculum(env_ids)` and call it from `_reset_tasks_callback` (`motion_tracking.py` ~L265) for resetting environments:
-  - level up if the episode reached the motion end (`reset_buf_terminate_by["motion_end"]`);
-  - level down if the episode-length ratio was below ~0.5;
-  - then `env_origins[env_ids] = terrain_origins[levels, types]`.
-- Log the mean terrain level in `log_dict`.
-- **Monitor adaptive σ.** Since σ is one EMA over all environments, easy tiles may pull σ down and over-penalise hard tiles. If that happens, a per-terrain-level σ is a cheap, well-motivated extension.
+- Set `terrain.curriculum: True`; `base_task.py` already initialises `terrain_levels`, `terrain_types` and `terrain_origins`.
+- Implement `_update_terrain_curriculum(env_ids)`: level up after reaching the motion end, down after an early failure, then move the origin.
+- Log the mean terrain level, and monitor adaptive σ.
 
-## 4. Experiments
+### A.3 Experiments as planned
 
 **Motions:** 2–3, e.g. Horse-stance pose (easy), Horse-stance punch (easy), Roundhouse kick (hard).
 **Test terrains:** flat, rough, tilt, step, each at 3 difficulty levels.
 
-| Model (rows) / test terrain (columns) | flat | rough | tilt | step |
-|---|---|---|---|---|
-| A. PBHC as released (pretrained, zero-shot) | | | | |
-| B. PBHC trained on terrain, world-frame reference (naive) | | | | |
-| C. B + ground-relative reference (Step 2) | | | | |
-| C′. C with lower-body joint weight 0.3 (ablation) | | | | |
-| D. C + privileged-critic height scan | | | | |
-| E. C + actor height scan (full method) | | | | |
+| Row | Model |
+|---|---|
+| A | PBHC as released (pretrained, zero-shot) |
+| B | PBHC trained on terrain, world-frame reference (naive) |
+| C | B + ground-relative reference |
+| C′ | C with lower-body joint weight 0.3 (ablation) |
+| D | C + privileged-critic height scan |
+| E | C + actor height scan (full method) |
 
-**Metrics:** PBHC's own (`E_gmpbpe`, `E_mpbpe`, `E_mpjpe`, velocity/acceleration errors), episode-length ratio, plus foot penetration and stumble counts (`_reward_penalty_stumble` already detects stumbling).
-
-**What each comparison shows:**
-- A → B: training on terrain alone is not enough.
-- B → C: effect of the ground-relative reference (core contribution).
-- C → D → E: effect of perception.
-- C vs C′: how strictly the legs should follow reference joint angles on uneven ground.
+**What each comparison shows:** A → B, training on terrain alone; B → C, the ground-relative reference; C → D → E, perception; C vs C′, how strictly the legs should follow the reference joint angles.
 
 **Fairness:** same iteration budget and seed set for every row.
 
-## 5. Budget and schedule
+### A.4 Budget
 
-The paper trains each model for 27 h on an RTX 4090; our RTX 5090 is shared, so plan **fixed-budget runs of ~6–10 h**, 2 seeds where possible, prioritising rows B, C and E. Develop with `num_envs` 128–512 and the viewer on; scale up only for final runs.
+The paper trains each model for 27 h on an RTX 4090. Our RTX 5090 is shared, so the plan was fixed-budget runs of about 6–10 h, with 2 seeds where possible, prioritising rows B, C and E. In practice every comparison became a 3,250-iteration fine-tune (about 1.7 h on a free GPU), and from 2026-10-31 two training seeds per variant.
 
-| Order | Work | Output |
-|---|---|---|
-| 1 | Step 0 + Step 1 | Terrain in sim; zero-shot failure plot (motivation) |
-| 2 | Step 2 + regression test | Ground-relative tracking, verified identical to PBHC on flat ground |
-| 3 | Train row C (and B) | First terrain results |
-| 4 | Step 3; train rows D, E | Perception results |
-| 5 | Step 4 (if time) | Curriculum |
-| 6 | Evaluation, ablations, report | Final tables and figures |
-
-## 6. Risks
+### A.5 Risks
 
 | Risk | Mitigation |
 |---|---|
-| Reference jumps when contact switches feet | EMA-smooth `h_sup`; fall back to the previous value when airborne. |
-| Robot spawns inside the terrain | 1–2 cm spawn clearance; start from flat/low difficulty. |
-| Bugs silently change flat-ground behaviour | Mandatory flat-ground regression test (Step 2.6). |
-| Adaptive σ distorted by mixed difficulty | Log σ per term; per-level σ if needed. |
-| Not enough compute for all rows/seeds | Prioritise B, C, E; fixed budgets; 2–3 motions only. |
-
-## 7. Positioning against prior work
-
-Survey terrain-conditioned humanoid motion imitation from 2025 before claiming novelty (e.g. VideoMimic, which we believe does terrain-aware imitation from video; verify). Frame our contribution as: **adding terrain awareness to PBHC's adaptive motion-tracking framework for highly-dynamic skills, via ground-relative reference adaptation and height-scan perception**, and state clearly how it differs.
-
-## 8. Implementation status (Steps 0–4 done, 2026-10-28)
-
-Branch: `terrain-aware-tracking`. Everything is **off by default**, so existing configs and checkpoints behave exactly as before.
-
-### What was implemented
-
-| File | Change |
-|---|---|
-| `humanoidverse/envs/env_utils/terrain.py` | New terrain types `tilt` (ramp through the tile centre, up to `tilt_max_deg`) and `step` (half the tile raised by `step_height_range`, edge within ±15 cm of the centre). Row-based difficulty for both; optional `fixed_difficulty` for evaluation. |
-| `humanoidverse/config/terrain/terrain_kungfu.yaml` | New terrain group: trimesh, 4×4 m tiles, 5 difficulty rows × 8 columns, types flat/rough/tilt/step. |
-| `humanoidverse/envs/motion_tracking/motion_tracking.py` | `_terrain_height_at` (height lookup); `_ref_offset` + `_apply_ground_relative_ref` (ground-relative reference, applied in `kick_motion_res` and `kick_motion_res_multiplestep`); motion re-centring on the tile; ground-relative feet reward; leg-joint weighting in the joint-position reward; spawn clearance; `height_scan` observation; terrain-consistent trajectory saving for evaluation; terrain diagnostics in the training log; optional viewer drawing of the scan points. |
-| `humanoidverse/config/env/motion_tracking.yaml` | New `env.config.terrain_aware` block (all options, defaults = original PBHC). |
-| `humanoidverse/config/obs/motion_tracking/main_terrain.yaml` | `main.yaml` + 77-point `height_scan` for actor and critic (actor 457, critic 707 dims). |
-| `humanoidverse/config/obs/motion_tracking/main_terrain_priv.yaml` | `main.yaml` + `height_scan` for the critic only (actor 380 = PBHC, critic 707). |
-| `scripts/terrain_aware_check.py` | Deterministic regression check (flat ground) and reference-clearance check (terrain). |
-
-### `env.config.terrain_aware` options
-
-| Option | Default | Meaning |
-|---|---|---|
-| `ground_relative_ref` | `False` | Shift the reference onto the local terrain (Step 2); also enables the ground-relative feet reward. |
-| `recenter_motion_xy` | `False` | Start each motion at its tile centre, where the terrain features are. **Use for every terrain run**, including the naive baseline, so all rows stand on the same features. |
-| `support_height_tau` | `0.02` | Softness [m] of the soft maximum over supporting feet. |
-| `per_foot_ref` | `False` | Row C+: also shift each leg towards the ground under its own foot (ankle 1, knee 0.5, hip and above 0); the support height becomes a lift-weighted mean of the ground under the feet. |
-| `support_lift_tau` | `0.03` | `per_foot_ref` only: softness [m] of the stance-foot weighting by reference foot lift. |
-| `ref_velocity_correction` | `True` | Add the rate of change of the terrain offsets (finite difference over one control step) to the reference z velocities. |
-| `ref_velocity_correction_max` | `1.0` | Clamp [m/s] of that correction: offsets jump when a foot crosses a step edge. |
-| `feet_ground_footprint` | `0.04` | Half-length [m] of the footprint over which the ground under a foot is averaged (reference adaptation and feet reward); `0` = point lookup. |
-| `spawn_clearance` | `0.0` | Extra root height [m] at reset (0.01 recommended on terrain). |
-| `leg_joint_pos_weight` | `1.0` | Weight of hip/knee/ankle joints in the joint-position reward (ablation C′: 0.3). |
-| `height_scan.*` | 11×7 grid, 0.1 m | Scan grid in the heading frame; `obs_dims.height_scan` must equal the number of points. |
-| `debug_draw_height_scan` | `False` | Draw env 0's scan points in the viewer. |
-
-### Verification
-
-**Flat-ground regression (exact).** `python scripts/terrain_aware_check.py regress example/pretrained_horse_stance_pose/model_50000.pt num_envs=16`: over 60 steps × 16 envs with random actions, every reference tensor, the feet reward and the height scan are **identical (difference 0)** between the original and the terrain-aware code paths.
-
-Closed-loop `sample_eps.py` cannot serve as a regression test: three runs of the *same* code on flat ground gave E_gmpbpe of 33.5, 36.1 and 43.2 mm (29.5 mm before any change). Evaluation is not deterministic, so **report means over many episodes and several seeds**.
-
-**Reference foot clearance on terrain** (`terrain_aware_check.py terrain`, 64 envs × 120 steps; lower reference foot's ankle-link height above the terrain under it; ~0.03–0.05 m on flat ground):
-
-| Terrain | Naive (original offset) mean / floating >9 cm | Ground-relative mean / below ground / floating |
-|---|---|---|
-| Tilt | 0.111 m / 66% of frames | 0.035 m / 0.0% / 0.1% |
-| Step | 0.063 m / 23% | 0.037 m / 0.0% / 0.0% |
-| Rough | 0.059 m / 0.1% | 0.034 m / 0.0% / 0.0% |
-
-**Fixes after the viewer check (per-foot reference, velocity correction, footprint smoothing).** The flat-ground regression still gives 19/19 identical with the new defaults, and also with `per_foot_ref=True`. Step terrain at difficulty 1.0, 64 envs × 120 steps; error = foot clearance above the ground under it minus the clearance authored on flat ground:
-
-| Variant | mean \|error\| | feet > 3 cm too high | lower foot below ground | \|v_z − Δz/Δt\| | worst offset jump per step |
-|---|---|---|---|---|---|
-| Naive | 0.063 m | 63% | 0% | 0.032 m/s | 0 |
-| Rigid shift, no velocity correction | 0.022 m | 22% | 3.3% | 0.056 m/s | 0.056 m |
-| Rigid shift (row C) | 0.022 m | 22% | 3.3% | 0.038 m/s | 0.056 m |
-| Per-foot (row C+) | 0.004 m | 4.9% | 4.0% | 0.035 m/s | 0.044 m |
-
-On tilt (12°) per-foot cuts the mean error from 0.039 to 0.005 m and the share of feet more than 3 cm too high from 40% to 0%. The velocity correction brings the velocity–position mismatch back to the level of the motion data itself (naive). Footprint trade-off, rigid shift on step: point lookup (`0`) gives 0% below ground but 0.100 m offset jumps in a single step; `0.04` gives 0.056 m jumps and the ankle target up to ~4 cm below ground at edges in ~3% of frames; `0.08` gives 0.055 m jumps but 10% of frames below ground. Run-to-run variation of these numbers is a few percentage points (zero-action rollouts reset at random times).
-
-**Training smoke tests** (256 and 128 envs, a few minutes each): the full method (`main_terrain`) and the privileged variant (`main_terrain_priv`) both train without errors; the logged reference foot clearance stays at ~0.036 m.
-
-### Step 1 result: the released policy fails on uneven footing
-
-`ratio_eps.py`, `example/pretrained_horse_stance_pose/model_50000.pt` (Horse-stance pose), 100 envs × 100 episodes, motions re-centred. Values are episode-length ratios.
-
-| Terrain | Difficulty | Naive reference | Ground-relative reference |
-|---|---|---|---|
-| Flat (trimesh) | – | 98.9% | 99.4% |
-| Rough | 0.9 | 22.5% | 22.5% |
-| Tilt | 0.5 (6°) | 16.4% | 16.2% |
-| Tilt | 1.0 (12°) | 10.9% | 10.6% |
-| Step | 0.5 (6.5 cm) | 14.0% | 19.0% |
-| Step | 1.0 (10 cm) | 23.5% | 33.6% |
-
-The two reference variants give similar numbers because the policy is blind: only the reference used by the `motion_far` termination changes. So these are genuine falls, not artefacts of the floating reference. Step difficulty 1.0 scoring above 0.5 likely reflects the random edge direction and offset; use more episodes and seeds for final numbers. JSON results: `example/pretrained_horse_stance_pose/metrics/ckpt_50000/zs*_ratio.json` (`zs_` = naive without re-centring, `zsn_` = naive re-centred, `zsg_` = ground-relative).
-
-### How to run
-
-Shared arguments for all training rows (Horse-stance pose shown; swap the motion file for other motions):
-
-```bash
-conda activate pbhc && cd ~/ws/PBHC
-COMMON="+simulator=isaacgym +exp=motion_tracking +terrain=terrain_kungfu project_name=MotionTracking +opt=wandb \
-  +robot=g1/g1_23dof_lock_wrist +domain_rand=main +rewards=motion_tracking/main \
-  robot.motion.motion_file=example/motion_data/Horse-stance_pose.pkl seed=1 +device=cuda:0 headless=True \
-  num_envs=1024 env.config.terrain_aware.recenter_motion_xy=True env.config.terrain_aware.spawn_clearance=0.01"
-GR="env.config.terrain_aware.ground_relative_ref=True"
-```
-
-| Row | Command |
-|---|---|
-| B. PBHC on terrain, naive reference | `python humanoidverse/train_agent.py $COMMON +obs=motion_tracking/main experiment_name=B_naive` |
-| C. + ground-relative reference | `python humanoidverse/train_agent.py $COMMON $GR +obs=motion_tracking/main experiment_name=C_ground_rel` |
-| C+. C with per-foot reference | `... $GR env.config.terrain_aware.per_foot_ref=True +obs=motion_tracking/main experiment_name=Cplus_per_foot` |
-| C′. C with leg weight 0.3 | `... $GR +obs=motion_tracking/main env.config.terrain_aware.leg_joint_pos_weight=0.3 experiment_name=C2_legw03` |
-| D. + privileged-critic scan | `python humanoidverse/train_agent.py $COMMON $GR +obs=motion_tracking/main_terrain_priv experiment_name=D_priv_scan` |
-| E. + actor scan (full method) | `python humanoidverse/train_agent.py $COMMON $GR +obs=motion_tracking/main_terrain experiment_name=E_full` |
-
-`+opt=wandb` logs to W&B: the `pbhc` conda env sets `WANDB_API_KEY` and `WANDB_ENTITY` (`saketkaki-the-university-of-texas-at-austin`) in `etc/conda/activate.d/wandb.sh`, and `config/opt/wandb.yaml` reads the entity from `WANDB_ENTITY`; drop `+opt=wandb` to train without W&B.
-
-`num_envs` depends on free GPU memory: each run at 2048 envs uses ~7.3 GB and runs at ~2.5–2.8 s per iteration (~17–20k steps/s) on the RTX 5090, so a 2 h pilot is ~2,500–2,900 iterations (the released checkpoint has 50,000). Pilots B and C were started on 2026-10-27 with `num_envs=2048 algo.config.save_interval=250` under `timeout --signal=INT 2h`. Evaluate a trained checkpoint on one terrain type and difficulty (checkpoints trained with the flags above already carry them in their `config.yaml`):
-
-```bash
-python humanoidverse/ratio_eps.py +device=cuda:0 +checkpoint=<run>/model_<N>.pt +opt=record \
-  +num_envs=100 +num_episodes=100 +eps_eval_name=tilt_d10 +terrain=terrain_kungfu \
-  "terrain.terrain_types=[tilt]" "terrain.terrain_proportions=[1.0]" terrain.fixed_difficulty=1.0
-```
-
-To evaluate the released checkpoint (which predates these options), add `+env.config.terrain_aware.recenter_motion_xy=True` and, for the ground-relative variant, `+env.config.terrain_aware.ground_relative_ref=True`.
-
-**Videos.** `scripts/record_video.py record CKPT --out clip.mp4 [--seconds 10] [--label ...] [--wandb-run ENTITY/PROJECT/RUN_ID] [overrides]` renders one frame per control step (real-time 50 fps, unlike the viewer's own R-key recorder, which drops frames), uses a fixed camera on the start position, prints when and why each episode ended, and burns the fall count into the video. Terrain and tile assignment are seeded (`--seed`, default 0), so different checkpoints are filmed on the same tile and step edge. `record_video.py stack OUT.mp4 IN1.mp4 IN2.mp4 ...` puts clips side by side. `scripts/record_pilot_videos.sh TAG=RUN_DIR|CKPT ...` (e.g. `B=... C=... E=...`; `SECONDS_PER_CLIP` and `OUT` as environment variables) records A (released) and each given run (a run directory means its latest checkpoint) on step 1.0/0.5, tilt 1.0/0.5, rough 0.9 and flat, attaches each clip to its W&B run (`videos/<terrain>`) and the side-by-side comparisons (A first) to every run (`videos/compare_<terrain>`). Videos need a display (the viewer window opens).
-
-### Pilot results (B and C, 2 h each, 2026-10-27)
-
-Horse-stance pose, 2048 envs, seed 1, trained from scratch for ~3,000 iterations (the released checkpoint has 50,000). W&B: `saketkaki-the-university-of-texas-at-austin/MotionTracking`, runs `2zsv2h25` (B) and `vn3zl3ac` (C); videos under `videos/*`. Episode-length ratio at iteration 3000 (`ratio_eps.py`, 100 envs × 100 episodes; A = released checkpoint zero-shot, ground-relative):
-
-| Terrain | A released | B (naive) | C (ground-relative) |
-|---|---|---|---|
-| Flat | 99.4% | 31.0% | 33.4% |
-| Rough 0.9 | 22.5% | 31.4% | 30.5% |
-| Tilt 6° | 16.2% | 32.7% | 30.1% |
-| Tilt 12° | 10.6% | 30.5% | 24.2% |
-| Step 6.5 cm | 19.0% | 28.3% | 25.0% |
-| Step 10 cm | 33.6% | 22.6% | 22.5% |
-
-**The pilots are too short to compare B and C.** Both score ~30% *even on flat ground*. `ratio_eps.py` starts every episode at the motion start and ends it when any body is more than 0.7 m from its reference (falls are not checked). From the start, the 3,000-iteration policies lose track at ~1.5–2.5 s (median 1.8 s; pelvis xy error ~0.3 m, the head target passes 0.7 m), on every terrain. Training starts episodes at random motion phases, which hides this in the training curves (`end_time_ratio` ~0.82). Separately, the training motion-far threshold curriculum had only reached 0.41 m (it goes down to 0.3 m), and falls during training had dropped to ~0.
-
-**Next:** fine-tune B and C from the released checkpoint (`+checkpoint=example/pretrained_horse_stance_pose/model_50000.pt`; same observation sizes), so that both start from a policy that already tracks the whole motion on flat ground and only terrain adaptation is compared; or train from scratch for much longer (≥ 6–10 h per row).
-
-### Fine-tuning from the released checkpoint (B, C, E; started 2026-10-27 21:56)
-
-The pilots showed that 3,000 iterations from scratch do not learn the motion itself, so rows are now fine-tuned from the released checkpoint (50,000 iterations on flat ground) and only terrain adaptation is compared.
-
-New code:
-
-| Where | What |
-|---|---|
-| `motion_tracking.py` `_update_terrain_curriculum` | Step 4. With `terrain.curriculum=True`: a robot that reaches the motion end (after covering at least half the motion) moves one difficulty row up; one whose episode ends before half the remaining motion moves one row down; solving the top row sends it to a random row. Logged as `terrain_level`. |
-| `mh_ppo.py` `actor_warmup_iterations` | Critic-only updates for the first N iterations of a run (the flat-ground value function adapts to terrain before it drives the actor). The adaptive learning-rate schedule is skipped during the warm-up: with a frozen actor the KL is 0 and would push both learning rates to 1e-2. |
-| `scripts/expand_checkpoint.py` | Warm start for a larger observation set: rebuilds the first actor and critic layer for the new layout (terms are sorted by name, so `height_scan` lands in the middle: actor columns 72–148, critic 229–305) and gives new terms zero weights. Verified: with the same seed, the actor observations of the two layouts agree exactly outside the new columns. |
-| `scripts/terrain_eval.py` | Evaluation from the motion start with three outcomes: completed, fall (gravity termination), drift (any body > 0.7 m from its reference). Reports rates, episode-length ratio, and mean body error relative to the root (like E_mpbpe), global body error and joint error. A falling robot usually crosses 0.7 m before the gravity check, so "drift" includes many falls. |
-| `scripts/eval_terrain_matrix.sh`, `scripts/summarize_terrain_eval.py` | All six test terrains × seeds 0, 1 (200 episodes each), and a mean ± std markdown table. |
-
-Fine-tuning arguments (added to the training command; `+opt=wandb` included):
-
-```bash
-FT="... num_envs=1536 env.config.terrain_aware.recenter_motion_xy=True env.config.terrain_aware.spawn_clearance=0.01 \
-  algo.config.load_optimizer=False algo.config.actor_learning_rate=3e-4 algo.config.critic_learning_rate=3e-4 \
-  +algo.config.actor_warmup_iterations=150 env.config.termination_curriculum.terminate_when_motion_far_initial_threshold=0.7 \
-  terrain.curriculum=True terrain.max_init_terrain_level=1 algo.config.save_interval=250"
-# B: +obs=motion_tracking/main checkpoint=example/pretrained_horse_stance_pose/model_50000.pt
-# C: B + env.config.terrain_aware.ground_relative_ref=True
-# E: +obs=motion_tracking/main_terrain env.config.terrain_aware.ground_relative_ref=True checkpoint=logs/warmstart/main_terrain_from_50000.pt
-#    (made with: python scripts/expand_checkpoint.py example/pretrained_horse_stance_pose/model_50000.pt \
-#                humanoidverse/config/obs/motion_tracking/main_terrain.yaml logs/warmstart/main_terrain_from_50000.pt)
-```
-
-Baseline A (released checkpoint, zero-shot, ground-relative reference; `eval_terrain_matrix.sh`, seeds 0 and 1, 200 episodes each):
-
-| | flat | rough 0.9 | tilt 6° | tilt 12° | step 6.5 cm | step 10 cm |
-|---|---|---|---|---|---|---|
-| Completed | 99.0% | 0% | 0% | 0% | 0% | 0% |
-| Fall (gravity) | 0.8% | 20.7% | 18.2% | 11.2% | 5.5% | 7.0% |
-| Episode-length ratio | 99.5% | 20.2% | 16.1% | 11.2% | 12.3% | 12.8% |
-| Root-relative body error | 20.4 mm | 51 mm | 57 mm | 61 mm | 58 mm | 54 mm |
-
-Runs (all three in parallel, 1536 envs, ~6.7 GB GPU memory each; iteration numbers continue from 50,000). Every row ran to iteration **53,500** (3,500 fine-tuning iterations):
-
-| Row | First part (W&B) | Resumed part (W&B) | Final checkpoint |
-|---|---|---|---|
-| B | `ft_B_naive` = `pdle14pn`, to it. 51,500 | `ft_B_naive_resume` = `8v6l43xv` | `logs/MotionTracking/20261028_091228-ft_B_naive_resume-…/model_53500.pt` |
-| C | `ft_C_ground_rel` = `6k6a8guf`, to it. 51,500 | `ft_C_ground_rel_resume` = `ub9hc8tw` | `logs/MotionTracking/20261028_091228-ft_C_ground_rel_resume-…/model_53500.pt` |
-| E | `ft_E_full` = `zts2025b`, to it. 51,250 | `ft_E_full_resume` = `e60m9jmo` | `logs/MotionTracking/20261028_091228-ft_E_full_resume-…/model_53500.pt` |
-
-**Interruption and resume.** The first runs died together at ~23:10 on 2026-10-27 (exit status 120, logs cut mid-line) because the shared root volume filled up; the runs themselves wrote only a few MB per hour. On 2026-10-28 each was resumed from its last checkpoint with `algo.config.load_optimizer=True` (weights, Adam state and learning rate), `+algo.config.actor_warmup_iterations=0`, `terminate_when_motion_far_initial_threshold=0.3` (where the curriculum had arrived), the last logged adaptive σ values passed as `rewards.reward_tracking_sigma.*` overrides (the error EMA starts at the configured σ, so this continues the adaptation), and `algo.config.num_learning_iterations` set so that all rows end at 53,500. Learning rate and action noise continue smoothly across the restart. The terrain level is not stored in checkpoints and restarted at 0; it was back to ~0.8–1.0 after 50 iterations. Training-log values at the end (random motion phases, curriculum terrain):
-
-| Row | terrain_level | end_time_ratio | motion_far terminations | action noise std |
-|---|---|---|---|---|
-| B | 1.69 | 0.854 | 32% | 0.59 |
-| C | 1.75 | 0.857 | 32% | 0.59 |
-| E | 2.37 | 0.883 | 27% | 0.56 |
-
-Note on checkpoint names: `mh_ppo.learn` saves the final policy as `model_<last save iteration>.pt`, so in each resumed run `model_53250.pt` holds the final weights (the true 53,250 snapshot was overwritten). It was copied to `model_53500.pt`.
-
-#### Results at iteration 53,500
-
-`eval_terrain_matrix.sh CKPT env.config.terrain_aware.ground_relative_ref=True` for all rows (the actor never sees the reference positions, so the ground-relative reference changes only the drift termination and the global error, and all rows are measured against the same reference), seeds 0 and 1, 200 episodes each; mean over seeds (± std where it exceeds 3 points). Results: `<run>/metrics/terrain_eval/model_53500/`.
-
-Episode-length ratio (share of the motion tracked before the episode ends):
-
-| Row | flat | rough 0.9 | tilt 6° | tilt 12° | step 6.5 cm | step 10 cm |
-|---|---|---|---|---|---|---|
-| A released, zero-shot | **99.5%** | 20.2% | 16.1% | 11.2% | 12.3% | 12.8% |
-| B naive reference | 61.1% | 37.4% | 31.7 ± 5.2% | 18.2% | 19.1% | 15.4% |
-| C ground-relative reference | 74.0% | **39.0%** | 36.8% | 17.0% | 18.0% | 15.8% |
-| E + height scan (full) | 95.2% | 38.5% | **81.0%** | **42.0%** | **28.4 ± 8.8%** | **20.1%** |
-
-Completed episodes / falls (gravity termination):
-
-| Row | flat | rough 0.9 | tilt 6° | tilt 12° | step 6.5 cm | step 10 cm |
-|---|---|---|---|---|---|---|
-| A | 99% / 1% | 0% / 21% | 0% / 18% | 0% / 11% | 0% / 6% | 0% / 7% |
-| B | 42% / 14% | 11% / 23% | 7 ± 7% / 32% | 0% / 30% | 0% / 34% | 0% / 36% |
-| C | 62% / 2% | 12% / 7% | 14% / 5% | 0% / 1% | 0% / 3% | 0% / 2% |
-| E | 92% / 2% | 11% / 32% | 69% / 5% | 16% / 15% | 9 ± 9% / 36% | 0% / 24% |
-
-Root-relative body error [mm]:
-
-| Row | flat | rough 0.9 | tilt 6° | tilt 12° | step 6.5 cm | step 10 cm |
-|---|---|---|---|---|---|---|
-| A | **20.4** | 51.0 | 57.3 | 61.4 | 57.5 | **54.3** |
-| B | 49.8 | 57.2 | 58.2 | 67.3 | 65.7 | 65.6 |
-| C | 45.8 | 51.5 | 54.0 | 61.5 | 59.2 | 61.7 |
-| E | 45.1 | 58.6 | **48.3** | **60.0** | 58.1 | 64.9 |
-
-Findings:
-
-- **Perception (E) is what makes terrain tracking work.** E is the only row that completes whole motions on tilts and steps (69% on 6° tilt, 16% on 12°, 9% on 6.5 cm steps) and tracks 2–5× more of the motion than A on tilts; it also keeps flat ground close to A (95% vs. 99.5%).
-- **The ground-relative reference alone (C vs. B) barely changes how much of the motion is tracked, but almost removes falls** (1–7% vs. 23–36%): C's episodes end by drifting from the reference, not by tipping over, and its tracking error is lower than B's on every terrain. Without perception, the policy still cannot place its feet for the terrain.
-- **Rough 0.9 is the same for B, C and E** (~38%, about twice A): the bumps are too small and irregular for the 10 cm scan grid to add much.
-- **The 10 cm step remains unsolved** (≤ 20% of the motion, no completed episode).
-- **All fine-tuned rows lost flat-ground precision** (root-relative error 20 → 45–50 mm; see below), so the terrain gains above are measured from a degraded starting point.
-
-#### Diagnosis: fine-tuning damaged the released policy early
-
-The released weights evaluated with the fine-tuning run's own config (`ft_B_naive/model_50000.pt`, identical to the released actor because of the critic-only warm-up) give 99% completed and 20.6 mm on flat ground, so the evaluation setup is not the cause. Row B on flat ground (seed 0) during fine-tuning:
-
-| Checkpoint | Actor updates | Completed | Root-relative error |
-|---|---|---|---|
-| 50,000 (released weights) | 0 | 99% | 21 mm |
-| 50,250 | 100 | **0%** | 41 mm |
-| 51,500 | 1,350 | 69% | 53 mm |
-| 53,500 (final) | 3,350 | 39% | 50 mm |
-
-The policy collapses within the first 100 actor updates and only partly recovers. Over the first ~1,000 iterations of every row, the action noise std rises from 0.21 to ~0.59 and the action-rate penalty from −0.22 to ~−1.4 (actions become much jerkier). Likely causes: a fresh Adam state (`load_optimizer=False`) whose first steps move every parameter by about the full learning rate; the starting learning rate of 3e-4 (the KL-adaptive schedule cut it to ~5e-5 only afterwards); and the entropy bonus driving the noise up while terrain rewards are low.
-
-Proposed settings for the next round:
-
-- B and C: load the released optimizer state (`load_optimizer=True`; not possible for E, whose first layer changes size).
-- Learning rate 1e-5–3e-5, with a short warm-up ramp.
-- Entropy coefficient 0, and the noise std fixed or capped at ~0.25.
-- Keep some flat terrain in the curriculum.
-- Evaluate on flat ground every 500 iterations to catch forgetting early.
-
-Videos of A, B, C and E at iteration 53,500 on all test terrains: `logs/MotionTracking/videos_ft_it53500/` (side-by-side `compare_<terrain>.mp4`, A | B | C | E), also attached to the resumed W&B runs under `videos/`.
-
-### Not done yet
-
-- Re-run B, C and E with the gentler fine-tuning settings above.
-- Rows C′, C+ and D.
-- Teacher–student distillation (stretch goal).
+| Reference jumps when contact switches feet | Smooth the support height. *(Done with the soft maximum, footprint averaging and the velocity correction.)* |
+| Robot spawns inside the terrain | 1–2 cm spawn clearance; start from flat or low difficulty. |
+| Bugs silently change flat-ground behaviour | Mandatory flat-ground regression test. |
+| Adaptive σ distorted by mixed difficulty | Log σ per term. *(σ frozen from Phase 1 on.)* |
+| Not enough compute for all rows and seeds | Prioritise B, C, E; fixed budgets; 2–3 motions only. |
+
+### A.6 Positioning against prior work
+
+Survey terrain-conditioned humanoid motion imitation from 2025 before claiming novelty (for example VideoMimic, which we believe does terrain-aware imitation from video; verify). Frame the contribution as **adding terrain awareness to PBHC's adaptive motion-tracking framework for highly dynamic skills, via ground-relative reference adaptation, height-scan perception and a robot-relative reference preview**, and state clearly how it differs.
