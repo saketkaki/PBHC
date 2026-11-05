@@ -176,12 +176,15 @@ Apply it to a fresh checkout with `git apply torch-2.4.1-sm120.patch`.
 conda activate pbhc
 cd pytorch
 SP=$(python -c "import site;print(site.getsitepackages()[0])")
-export CUDA_HOME=/usr/local/cuda-12.9 PATH=/usr/local/cuda-12.9/bin:$PATH \
+export CUDA_HOME=$CONDA_PREFIX \
   TORCH_CUDA_ARCH_LIST="12.0" USE_CUDA=1 USE_CUDNN=1 \
   CUDNN_INCLUDE_DIR=$SP/nvidia/cudnn/include CUDNN_LIBRARY=$SP/nvidia/cudnn/lib \
   USE_NCCL=0 USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=0 USE_CUSPARSELT=0 USE_FBGEMM=0 \
   BUILD_TEST=0 USE_ROCM=0 USE_XPU=0 USE_MPI=0 USE_DISTRIBUTED=1 \
-  CMAKE_PREFIX_PATH=$CONDA_PREFIX MAX_JOBS=20 PYTORCH_BUILD_VERSION=2.4.1 PYTORCH_BUILD_NUMBER=1
+  CMAKE_PREFIX_PATH=$CONDA_PREFIX MAX_JOBS=20 PYTORCH_BUILD_VERSION=2.4.1 PYTORCH_BUILD_NUMBER=1 \
+  T=$CONDA_PREFIX/targets/x86_64-linux
+export CUDA_HOME=$CONDA_PREFIX CUDA_INC_PATH=$T \
+  CPATH=$T/include:$CONDA_PREFIX/nsight-compute-2025.2.1/host/target-linux-x64/nvtx/include
 python setup.py bdist_wheel        # -> dist/torch-2.4.1-cp38-cp38-linux_x86_64.whl
 ```
 
@@ -302,3 +305,46 @@ The fastest route is to copy the saved wheel and skip the build:
 5. Run the checks in Section 3.
 
 To rebuild from scratch instead, follow 2.5–2.11 and apply the saved patch to a fresh `v2.4.1` checkout.
+
+## 8. RTX 5070 Ti on Debian 13 (CUDA 12.9 inside the conda env)
+
+A second setup, on a different machine. The 5070 Ti is also `sm_120`, so the same patched torch 2.4.1 build applies; only the toolchain differs.
+
+**Machine:** Debian 13, RTX 5070 Ti (16 GB), driver 610.43 (CUDA 13.3), 16 cores, 60 GB RAM. The only system toolkit is CUDA 13.3 in `/usr/local`; there is **no** `/usr/local/cuda-12.9`.
+
+**Differences from Sections 2 and 6:**
+
+- **CUDA 12.9 comes from conda, inside `pbhc`** (`cuda-toolkit 12.9.1` from the `nvidia/label/cuda-12.9.1` channel), along with conda's compilers (`gcc_linux-64`/`gxx_linux-64` 14.3) instead of Debian's GCC 14.2. So `CUDA_HOME=$CONDA_PREFIX` everywhere, both in the build (2.9) and in the activation hook. The system CUDA 13.3 is not used.
+- **NVTX3 headers are a separate package.** The conda toolkit does not include them, so the nvToolsExt patch (2.7) fails without:
+  ```bash
+  conda install -n pbhc -c nvidia/label/cuda-12.9.1 "cuda-nvtx-dev=12.9.*"
+  ```
+- **Problem: `Python.h:44: fatal error: crypt.h: No such file or directory`.** Python 3.8's `Python.h` includes `<crypt.h>`, which conda's GCC sysroot lacks. It broke the torch build (at `torch_python`) and later `gymtorch`'s JIT build. Fix: `conda install -n pbhc libxcrypt`, which puts `crypt.h` in `$CONDA_PREFIX/include`. torch's extension builder ignores conda's `CPPFLAGS`, so the activation hook also adds that directory to `CPATH`.
+- **The activation hooks** are `$CONDA_PREFIX/etc/conda/{activate,deactivate}.d/pbhc_env.sh`:
+  ```bash
+  # activate.d/pbhc_env.sh
+  export _PBHC_OLD_LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
+  export _PBHC_OLD_CUDA_HOME="${CUDA_HOME}"
+  export _PBHC_OLD_CPATH="${CPATH}"
+  export CUDA_HOME="${CONDA_PREFIX}"
+  _PBHC_CUDNN="${CONDA_PREFIX}/lib/python3.8/site-packages/nvidia/cudnn/lib"
+  export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${_PBHC_CUDNN}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  unset _PBHC_CUDNN
+  export CPATH="${CONDA_PREFIX}/include${CPATH:+:${CPATH}}"
+  ```
+  The deactivate script restores the three saved variables, in the same way as 2.3.
+- **Build:** `MAX_JOBS=12`, with the rest of the 2.9 exports unchanged. cuDNN was found on the first try because the `libcudnn.so` symlink (2.10) already existed.
+- **Headless runs:** `eval_agent.py`, `sample_eps.py` and `ratio_eps.py` take `+headless=True` (with `+`); `train_agent.py` is headless by default.
+
+**Verification (same checks as Section 3):**
+
+| Test | Result |
+|---|---|
+| torch | `2.4.1`, CUDA `12.9`, cuDNN `91002`, `['sm_120']`, RTX 5070 Ti; matmul, `Conv1d` fwd/bwd, MLP + Adam, distributions, tensorboard pass |
+| Isaac Gym GPU PhysX, GPU pipeline + `gymtorch` | Pass (64 balls settle at z ≈ 0.102 m, state read as CUDA tensors) |
+| PBHC training (README command, 128 envs, 3 min) | 325 iterations; mean episode length 11.5 → 60.7 |
+| `eval_agent.py` re-exported ONNX vs. shipped ONNX | Max abs diff **0** on 64 random inputs |
+| `sample_eps.py` (1 env, 1 episode) | E_gmpbpe **29.0 mm**, E_mpbpe **19.8 mm**, E_mpjpe **503 ×10⁻³ rad** |
+| `ratio_eps.py` (100 envs, 100 episodes) | Episode-length ratio **98.95%** (345.4 frames) |
+
+The wheel, patch and build logs are saved in `~/miniconda3/envs/pbhc/share/pbhc-wheels/`, as in 2.11.

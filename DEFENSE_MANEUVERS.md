@@ -1,0 +1,1 @@
+This codebase augments the policy conditioning by having it respond to attacks made by an offensive Unitree G1. More to come :P
