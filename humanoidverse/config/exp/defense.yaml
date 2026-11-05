@@ -1,0 +1,22 @@
+# @package _global_
+
+defaults:
+  - /algo: mh_ppo
+  - /env: defense
+
+algo:
+  config:
+    belief_loss_coef: 1.0 # supervised loss of the actor's belief head (attack class, phase, time to impact)
+    module_dict:
+      actor:
+        attack_encoder: # embeds the attacker_keypoints history; see agents/modules/attack_modules.py
+          type: Conv1D # Conv1D or MLP
+          channels: [64, 64]
+          kernel_sizes: [3, 3]
+          strides: [1, 2]
+          hidden_dims: [256, 128] # MLP only
+          latent_dim: 32
+          activation: ELU
+          condition_on_belief: True # the policy also sees the belief (class and phase probabilities, time to impact)
+
+experiment_name: TEST_Defense

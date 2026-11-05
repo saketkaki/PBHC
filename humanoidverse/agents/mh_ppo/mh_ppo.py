@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from humanoidverse.agents.modules.ppo_modules import *
+from humanoidverse.agents.modules.attack_modules import AttackAwareActor
 from humanoidverse.agents.modules.data_utils import RolloutStorage
 from humanoidverse.envs.base_task.base_task import BaseTask
 from humanoidverse.agents.base_algo.base_algo import BaseAlgo
@@ -86,6 +87,8 @@ class MHPPO(BaseAlgo):
         self.fix_noise_std = self.config.get('fix_noise_std', False)
         # with load_optimizer: False keeps the configured learning rates instead of the checkpoint's
         self.load_optimizer_lr = self.config.get('load_optimizer_lr', True)
+        # defense: weight of the actor's supervised belief loss (attack class, phase, time to impact)
+        self.belief_loss_coef = self.config.get('belief_loss_coef', 0.0)
         self._learn_iteration = 0
 
         # Algorithm related Config
@@ -127,7 +130,20 @@ class MHPPO(BaseAlgo):
             "obs_dim_dict": self.algo_obs_dim_dict,
             "module_config_dict": self.config.module_dict.critic,
         }
-        if not 'phase_embed' in self.config or self.config.phase_embed.type == "Original":
+        if 'attack_encoder' in self.config.module_dict.actor:
+            # defense: actor conditioned on an embedding of the attacker's motion, with a supervised belief head
+            obs_slices = self.env.config.obs.post_compute_config["obs_slices"]
+            self.actor = AttackAwareActor(
+                **actor_kwargs,
+                actor_obs_slices=obs_slices["actor_obs"],
+                critic_obs_slices=obs_slices["critic_obs"],
+                attack_info=self.env.attack_obs_info,
+            ).to(self.device)
+
+            self.critic = PPOCritic(
+                **critic_kwargs
+            ).to(self.device)
+        elif not 'phase_embed' in self.config or self.config.phase_embed.type == "Original":
             self.actor = PPOActor(
                 **actor_kwargs
             ).to(self.device)
@@ -552,7 +568,13 @@ class MHPPO(BaseAlgo):
         
         
         actor_loss = surrogate_loss - self.entropy_coef * entropy_loss + l2c2_policy_loss
-        
+
+        if self.belief_loss_coef > 0 and hasattr(self.actor, 'belief_loss'):
+            belief_loss, belief_info = self.actor.belief_loss(policy_state_dict['actor_obs'], policy_state_dict['critic_obs'])
+            actor_loss = actor_loss + self.belief_loss_coef * belief_loss
+            for key, value in belief_info.items():
+                loss_dict[key] = loss_dict.get(key, 0) + value
+
         critic_loss = self.value_loss_coef * value_loss + l2c2_value_loss
 
         self.actor_optimizer.zero_grad()
