@@ -52,6 +52,7 @@ def check_bank():
     name = bank.body_names.index
     hand = torch.tensor([e['pos'] for e in config.robot.motion.extend_config if e['joint_name'] in ('left_hand_link', 'right_hand_link')])
     outcomes = defaultdict(lambda: np.zeros(4))
+    gaps = defaultdict(list)  # before the onset: closest attacker body to a defender body or hand, and striker to forearm
     for i in range(bank.num_clips):
         yaw = float(bank.def_root_yaw[i]) - g_yaw
         R = torch.tensor([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]], dtype=torch.float32)
@@ -62,11 +63,18 @@ def check_bank():
         elbows = [name('left_elbow_link'), name('right_elbow_link')]
         elbow = pos[elbows][None]
         hands = (elbow[0] + torch.stack([mat[e] @ h for e, h in zip(elbows, hand)]))[None]
+        # the attacker in the env: back by the standoff in guard, stepping in for the strike
+        back = dc.get('standoff', 0.0) * bank.standoff_weight(torch.full((bank.max_frames,), i), torch.arange(bank.max_frames) * bank.dt)
+        striker = bank.striker_pos[i] - back[:, None] * torch.tensor([1.0, 0.0, 0.0])
+        onset = int(bank.onset_frame[i])
+        attacker = bank.body_pos[i, :onset + 1] - back[:onset + 1, None, None] * torch.tensor([1.0, 0.0, 0.0])
+        gaps[bank.attack_names[i]].append(min(float(torch.cdist(attacker.reshape(-1, 3), torch.cat([pos, hands[0]])).min()),
+                                              float(point_segment_distance(striker[onset][None], elbow[0], hands[0]).min())))
         status = 0
         for f in range(1, int(bank.length[i])):
             if f < bank.onset_frame[i] or f - 1 > bank.recovered_frame[i]:
                 continue
-            p0, p1 = bank.striker_pos[i, f - 1][None], bank.striker_pos[i, f][None]
+            p0, p1 = striker[f - 1][None], striker[f][None]
             if sweep_segment_distance(p0, p1, elbow, hands)[0] < dc.block_radius:
                 status = 2
             elif point_segment_distance(target, p0[0], p1[0]) < dc.hit_radius:
@@ -76,12 +84,13 @@ def check_bank():
             if status:
                 break
         outcomes[bank.attack_names[i]][status] += 1
-    print(f'\nperfect static guard (hit_radius {dc.hit_radius}, block_radius {dc.block_radius}): share of clips')
-    print(f"{'attack':15s} {'hit':>6s} {'block':>6s} {'evade':>6s}")
+    print(f"\nperfect static guard (hit_radius {dc.hit_radius}, block_radius {dc.block_radius}, standoff {dc.get('standoff', 0.0)}): "
+          'share of clips, and the smallest gap between the guards before the onset [m]')
+    print(f"{'attack':15s} {'hit':>6s} {'block':>6s} {'evade':>6s} {'gap':>6s}")
     total = np.zeros(4)
     for attack, n in outcomes.items():
         total += n
-        print(f'{attack:15s} {n[1] / n.sum():6.2f} {n[2] / n.sum():6.2f} {n[3] / n.sum():6.2f}')
+        print(f'{attack:15s} {n[1] / n.sum():6.2f} {n[2] / n.sum():6.2f} {n[3] / n.sum():6.2f} {min(gaps[attack]):6.3f}')
     print(f"{'all':15s} {total[1] / total.sum():6.2f} {total[2] / total.sum():6.2f} {total[3] / total.sum():6.2f}")
 
 

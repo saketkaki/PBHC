@@ -30,6 +30,7 @@ it sees of the attacker, in the same spirit as the terrain-aware work ([TERRAIN_
 - Clips play back to back.
 - Each clip is placed so that its canonical defender lands on the real defender's root and heading at the clip start, then stays fixed. Moving the target away therefore works, while drifting away between attacks does not.
 - The pose eases from one clip into the next over 0.25 s, inside the clip's opening guard.
+- **Standoff** (`standoff`, 0.25 m): in the clips the two guards are only 1.5–8 cm apart, so a jab's fist is already within `block_radius` of the defender's forearm at its onset and is "blocked" on its first frame. The attacker therefore stands 0.25 m farther back in guard. It steps in during the strike (smoothstep from the onset to the impact frame), so the striker lands exactly where the clip aimed it, then steps back out by the recovered frame. The ghost's feet slide during the step.
 
 **Outcomes (`envs/defense/defense.py`).** Each attack resolves once, between its onset and recovered frames:
 
@@ -39,14 +40,18 @@ it sees of the attacker, in the same spirit as the terrain-aware work ([TERRAIN_
 | **hit** | The path passes within `hit_radius` (8 cm) of the target point, `target_link` + `target_local_offset` on the defender |
 | **evaded** | Neither, by the recovered frame |
 
-**Do-nothing baseline.** This is a canonical defender holding its guard perfectly, scored by the same rules (`scripts/defense_check.py bank`):
+**Do-nothing baseline.** This is a canonical defender holding its guard perfectly, scored by the same rules (`scripts/defense_check.py bank`). "Gap" is the smallest distance between the two guards before the onset: any attacker body to any defender body or hand, and the striker to a forearm.
 
 | | jab | cross | lead hook | rear hook | lead upper | rear upper | body shot | calf kick | all |
 |---|---|---|---|---|---|---|---|---|---|
-| hit | 5 % | 100 % | 8 % | 100 % | 10 % | 0 % | 0 % | 100 % | 40 % |
-| blocked | 95 % | 0 % | 92 % | 0 % | 90 % | 100 % | 100 % | 0 % | 60 % |
+| hit, standoff 0 | 5 % | 100 % | 8 % | 100 % | 10 % | 0 % | 0 % | 100 % | 40 % |
+| blocked, standoff 0 | 95 % | 0 % | 92 % | 0 % | 90 % | 100 % | 100 % | 0 % | 60 % |
+| gap, standoff 0 | 1.5 cm | 3.6 cm | 3.2 cm | 6.3 cm | 4.7 cm | 7.8 cm | 5.7 cm | 1.3 cm | |
+| hit, standoff 0.25 m | 0 % | 100 % | 38 % | 100 % | 97 % | 0 % | 0 % | 100 % | 54 % |
+| blocked, standoff 0.25 m | 100 % | 0 % | 62 % | 0 % | 3 % | 100 % | 100 % | 0 % | 46 % |
+| gap, standoff 0.25 m | 15.7 cm | 11.7 cm | 9.8 cm | 9.6 cm | 11.0 cm | 9.4 cm | 12.0 cm | 21.7 cm | |
 
-The generator aimed each strike at the canonical defender without regard to its guard. Five classes therefore pass within 1.5–6 cm of the guard forearms, and a held guard "blocks" them. That is realistic (a high guard does stop a jab), but the cross, rear hook and calf kick are where active defense is needed. With `block_radius=0` every attack must be evaded.
+No attack is evaded by a static guard either way, so the step-in keeps every strike on target. With the standoff, a held guard blocks only strikes whose path crosses a forearm mid-flight (the jab, rear uppercut and body shot). It no longer blocks strikes that start against the forearm. At 0.2 m, 8 of the 480 clips (hooks and uppercuts, whose guards overlap sideways) still start within `block_radius`. With `block_radius=0` every attack must be evaded.
 
 ## 3. Policy: attack embedding and belief
 
@@ -107,12 +112,15 @@ Other reward settings:
 | `keypoints` | 10 bodies | Attacker bodies in `attacker_keypoints` |
 | `keypoint_history.length`, `.stride` | 10, 2 | Frames, and control steps between them (covers 0.36 s) |
 | `placement_noise.yaw_deg`, `.range` | 0, 0 | Per-clip randomisation of the attacker's angle and distance |
+| `standoff` | 0.25 m | The attacker stands this much farther back in guard and steps in during the strike; 0 = the clips' spacing (checkpoints before this option) |
 | `blend_time` | 0.25 s | Pose blending between clips |
 | `hit_radius`, `block_radius` | 0.08, 0.07 m | Outcome rules; `block_radius=0` disables blocks |
 | `threat_lead_time`, `tracking_relax` | 0.1 s, 0.5 | Tracking relaxation during attacks |
 | `proximity_sigma`, `tti_clip` | 0.1 m, 1 s | Shaping reward width; time-to-impact clip |
 | `terminate_on_hit` | `False` | End the episode on a hit |
-| `debug_draw` | `True` | Draw env 0's striker and target in the viewer (and the attacker skeleton without `attacker_actor`) |
+| `debug_draw` | `True` | Draw env 0's striker, target, aim point and outcome markers in the viewer (and the attacker skeleton without `attacker_actor`) |
+| `outcome_marker_time` | 1 s | How long the viewer shows where the last attack ended |
+| `blind_actor` | `none` | Evaluation only: `freeze` holds the actor's `attacker_keypoints` at the last guard frame before each strike, `zero` zeroes them. The critic and scoring are unchanged |
 | `attacker_actor` | `auto` | Show the attacker as a G1: on with a viewer, off headless (training and evals) |
 
 `algo.config.belief_loss_coef` (1.0) and `algo.config.module_dict.actor.attack_encoder` (`type: Conv1D|MLP`, `latent_dim`, `condition_on_belief`) are set in `config/exp/defense.yaml`.
@@ -144,16 +152,42 @@ python humanoidverse/train_agent.py +simulator=isaacgym +exp=defense +terrain=te
 - Reports hit, block and evade rates per attack class, attacks interrupted by a fall or drift, survival, guard tracking error and the belief head's accuracy by attack phase.
 - Takes `key=value` overrides for harder settings.
 - Writes JSON to `<run>/metrics/defense_eval/`.
+- `--blind freeze` hides the attacker from the actor: its keypoints are held at the last pre-strike guard frame, so the policy sees an attacker that never strikes. `--blind zero` feeds zeros instead, which the policy has never seen. Either way the scoring is unchanged. The flag sets the env option `blind_actor`, which also works in the viewer.
 
 ```bash
 python scripts/defense_eval.py logs/Defense/<run>/model_20000.pt                       # 256 episodes, ~25 s
 python scripts/defense_eval.py logs/Defense/<run>/model_20000.pt --name no_block env.config.defense.block_radius=0
+python scripts/defense_eval.py logs/Defense/<run>/model_20000.pt --name blind_freeze --blind freeze
 ```
 
-**Viewer:** `python humanoidverse/eval_agent.py +checkpoint=logs/Defense/<run>/model_20000.pt`, or `scripts/record_video.py record` for a video.
+**Original PBHC baseline.** This is the unmodified PBHC tracker, trained only to hold the guard: the motion-tracking env, observations, rewards and actor, with no attacker and no defense rewards. The README command is changed in two ways: 20 s episodes that do not end with the 2 s clip, as in the defense env, and the same 4096 envs and 20000 iterations as the defense run. `ref_motion_phase` stays in its observations; it keeps growing past 1 because the clip is held, the same in training and in the eval. `--env-from` scores it in a defense run's env: attacks, standoff and terminations.
+
+```bash
+python humanoidverse/train_agent.py +simulator=isaacgym +exp=motion_tracking +terrain=terrain_locomotion_plane \
+  project_name=Defense +opt=wandb num_envs=4096 +obs=motion_tracking/main +robot=g1/g1_23dof_lock_wrist +domain_rand=main \
+  +rewards=motion_tracking/main robot.motion.motion_file=g1_attack_dataset/PBHC_attacks/motion_data/attacks/defender_guard.pkl \
+  env.config.termination.terminate_when_motion_end=False env.config.max_episode_length_s=20 \
+  experiment_name=pbhc_guard_tracker seed=1 +device=cuda:0 headless=True algo.config.num_learning_iterations=20000
+python scripts/defense_eval.py logs/Defense/<tracker run>/model_<last>.pt --env-from logs/Defense/<defense run>
+```
+
+**Viewer:** `python humanoidverse/eval_agent.py +checkpoint=logs/Defense/<run>/model_20000.pt`, or `scripts/record_video.py record` for a video. Add `+env.config.defense.blind_actor=freeze` (`env.config.defense.blind_actor=freeze` for `record_video.py`) to watch the blinded policy. A purple stick figure then shows the attacker as the actor sees it.
 - The attacker is drawn as a red G1: one actor per body (24) carrying that link's meshes, with no joints, collision shapes or gravity, posed every step from the clip's forward kinematics.
 - It cannot touch the defender and does not change the physics (eval results with and without it agree).
 - Its link offsets match the simulated G1 exactly, also while blending between clips.
+
+**Outcome markers (env 0).** Because the attacker passes through the defender, the viewer shows what was scored:
+
+| Marker | Meaning |
+|---|---|
+| Striker sphere and trail | Orange while the attack is live, then the outcome colour: red hit, blue blocked, green evaded |
+| Green sphere | The target on the defender's body |
+| Yellow sphere | Where the attack is aimed (the striker at the clip's impact frame), shown from the threat window until it resolves |
+| Large sphere in the outcome colour, held for `outcome_marker_time` | Where the attack ended: the contact point on the blocking forearm, the hit point, or the closest approach of an evaded attack |
+| White line | From that point to the target (at the same moment), i.e. how far from the target the attack was stopped or missed |
+| Thick blue line | The forearm that blocked |
+
+The console prints one line per attack in env 0, e.g. `cross: BLOCKED by the left forearm, 14 cm from its target`.
 
 ## 8. Open problems and next steps
 

@@ -3,11 +3,14 @@ import torch.nn.functional as F
 from loguru import logger
 
 from humanoidverse.envs.motion_tracking.motion_tracking import LeggedRobotMotionTracking
-from humanoidverse.envs.defense.attack_bank import ATTACKS, NUM_PHASES, AttackBank, point_segment_distance, sweep_segment_distance
+from humanoidverse.envs.defense.attack_bank import ATTACKS, NUM_PHASES, AttackBank, closest_point_on_segment, sweep_segment_closest
 from humanoidverse.envs.env_utils.visualization import Point
 from isaac_utils.rotations import calc_heading_quat_inv, my_quat_rotate, quat_conjugate, quat_mul
 
 PENDING, HIT, BLOCKED, EVADED = 0, 1, 2, 3
+BLIND_SKELETON = [('pelvis', 'head_link'), ('left_elbow_link', 'left_hand_link'), ('right_elbow_link', 'right_hand_link'),
+                  ('pelvis', 'left_knee_link'), ('left_knee_link', 'left_ankle_roll_link'),
+                  ('pelvis', 'right_knee_link'), ('right_knee_link', 'right_ankle_roll_link')]  # keypoint pairs, for the viewer
 
 
 def _heading_yaw(quat):  # xyzw
@@ -32,7 +35,8 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
 
     Observations: attacker_keypoints (the attacker's keypoints relative to the defender root in its heading frame, over
     a short history; actor and critic) and attack_privileged (attack class, phase, time to impact, striker to target,
-    resolved; critic only, and the targets of the actor's belief head).
+    resolved; critic only, and the targets of the actor's belief head). blind_actor (freeze / zero) hides the attacker from
+    the actor's attacker_keypoints only, to test how much a trained policy relies on seeing it.
     """
 
     def __init__(self, config, device):
@@ -71,7 +75,15 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._outcome_log_decay = dc.outcome_log_decay
         self._yaw_noise = torch.pi / 180 * dc.placement_noise.yaw_deg
         self._range_noise = dc.placement_noise.range
+        self._standoff = dc.get('standoff', 0.0)
         self._defense_debug_draw = dc.debug_draw
+        self._blind_actor = dc.get('blind_actor', 'none')
+        assert self._blind_actor in ('none', 'freeze', 'zero'), f"blind_actor must be none, freeze or zero, not {self._blind_actor}"
+        if self._blind_actor != 'none':
+            self._actor_kp_slice = slice(*self.config.obs.post_compute_config.obs_slices.actor_obs.attacker_keypoints)
+            self._blind_kp = torch.zeros(N, self._actor_kp_slice.stop - self._actor_kp_slice.start, device=self.device)
+            logger.info(f"blind_actor={self._blind_actor}: the actor's attacker_keypoints are "
+                        + ("held from the last guard frame before each strike" if self._blind_actor == 'freeze' else "zeros"))
 
         body = self.simulator._body_list.index
         self._clip_target_body = torch.tensor([body(link) for link in bank.target_link], dtype=torch.long, device=self.device)
@@ -95,6 +107,19 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._attack_threat = torch.zeros(N, device=self.device)
         self._kp_buffer = torch.zeros(N, (self._kp_hist_len - 1) * self._kp_hist_stride + 1, K, 3, device=self.device)
         self._outcome_counts = torch.zeros(bank.num_classes, 3, device=self.device)
+        # for the viewer: where each attack is aimed, its closest approach to the target so far, and where the last
+        # resolved attack ended (contact on the forearm, hit point, or closest approach), with the target at that moment
+        self._aim_pos = torch.zeros(N, 3, device=self.device)
+        self._closest_dist = torch.full((N,), float('inf'), device=self.device)
+        self._closest_point = torch.zeros(N, 3, device=self.device)
+        self._closest_target = torch.zeros(N, 3, device=self.device)  # the target at the closest approach
+        self._outcome_status = torch.zeros(N, dtype=torch.long, device=self.device)
+        self._outcome_point = torch.zeros(N, 3, device=self.device)
+        self._outcome_target = torch.zeros(N, 3, device=self.device)
+        self._outcome_arm = torch.zeros(N, 2, 3, device=self.device)  # elbow and hand of the blocking forearm
+        self._outcome_age = torch.full((N,), float('inf'), device=self.device)  # [s] since the last outcome
+        self._outcome_hold = dc.get('outcome_marker_time', 1.0)
+        self._striker_trail = []  # env 0, for the viewer
         if self._attacker_actor:  # the robot's bodies in the attack bank, their rotations and the blend between clips
             names = list(self.config.robot.body_names)
             self._actor_body_ids = torch.tensor([bank.body_names.index(n) for n in names], device=self.device)
@@ -132,6 +157,9 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         bank = self._attack_bank
         ids, t = self._attack_ids[env_ids], self._attack_t[env_ids]
         anchor, yaw, shift = self._attack_anchor[env_ids], self._attack_anchor_yaw[env_ids], self._attack_shift[env_ids]
+        if self._standoff > 0:  # back by the standoff in guard, stepping in for the strike
+            shift = shift.clone()
+            shift[:, 0] -= self._standoff * bank.standoff_weight(ids, t)
         bodies = bank.to_world(bank.bodies(ids, t) + shift[:, None], ids, anchor, yaw)
         striker = bank.to_world(bank.striker(ids, t) + shift, ids, anchor, yaw)
         if blend and self._blend_time > 0:
@@ -152,6 +180,11 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._attack_anchor_yaw[env_ids] = _heading_yaw(root[:, 3:7]) + (torch.rand(n, device=self.device) * 2 - 1) * self._yaw_noise
         self._attack_shift[env_ids, 0] = -(torch.rand(n, device=self.device) * 2 - 1) * self._range_noise
         self._attack_status[env_ids] = PENDING
+        self._closest_dist[env_ids] = float('inf')
+        ids = self._attack_ids[env_ids]
+        bank = self._attack_bank
+        self._aim_pos[env_ids] = bank.to_world(bank.striker_pos[ids, bank.impact_frame[ids]] + self._attack_shift[env_ids], ids,
+                                               self._attack_anchor[env_ids], self._attack_anchor_yaw[env_ids])
         bodies, striker = self._attacker_world(env_ids, blend=False)
         self._attack_blend[env_ids] = old_bodies - bodies if blend else 0.0
         self._attacker_body_pos[env_ids] = bodies
@@ -214,14 +247,19 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
 
         onset, recovered = bank.onset_frame[ids], bank.recovered_frame[ids]
         check = (self._attack_status == PENDING) & (frame >= onset) & (frame_prev <= recovered)
-        d_target = point_segment_distance(self._target_pos, striker_prev, self._striker_pos)
-        d_block = sweep_segment_distance(striker_prev, self._striker_pos, elbow, hand)
+        path_point = closest_point_on_segment(self._target_pos, striker_prev, self._striker_pos)  # nearest the target
+        d_target = (path_point - self._target_pos).norm(dim=-1)
+        d_block, block_arm, block_point = sweep_segment_closest(striker_prev, self._striker_pos, elbow, hand)
         blocked = check & (d_block < self._block_radius)
         hit = check & ~blocked & (d_target < self._hit_radius)
+        closer = check & (d_target < self._closest_dist)
+        self._closest_dist[closer], self._closest_point[closer] = d_target[closer], path_point[closer]
+        self._closest_target[closer] = self._target_pos[closer]
         evaded = check & ~blocked & ~hit & (frame >= recovered) & (frame_prev < recovered)
         event = torch.zeros_like(self._attack_status)
         event[hit], event[blocked], event[evaded] = HIT, BLOCKED, EVADED
         self._defense_event[:] = event
+        self._record_outcomes(event, block_point, block_arm, elbow, hand, path_point)
         self._attack_status[:] = torch.where(event > 0, event, self._attack_status)
         self._strike_active[:] = check.float()
         self._striker_target_dist[:] = (self._striker_pos - self._target_pos).norm(dim=-1)
@@ -234,6 +272,29 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
             self._update_attacker_actors()
         self._kp_buffer[:, 1:] = self._kp_buffer[:, :-1].clone()
         self._kp_buffer[:, 0] = self._local_keypoints(all_ids)
+
+    def _record_outcomes(self, event, block_point, block_arm, elbow, hand, path_point):
+        """ Where the attacks resolved this step ended, for the viewer: blocked at the closest point on the forearm, hit
+        at the point of the striker's path nearest the target, evaded at the closest approach of the whole attack (with
+        the target where it was then). """
+        self._outcome_age += self.dt
+        resolved = event > 0
+        if not resolved.any():
+            return
+        point = torch.where((event == BLOCKED)[:, None], block_point, torch.where((event == HIT)[:, None], path_point, self._closest_point))
+        n = torch.arange(self.num_envs, device=self.device)
+        self._outcome_status[resolved] = event[resolved]
+        self._outcome_point[resolved] = point[resolved]
+        self._outcome_target[resolved] = torch.where((event == EVADED)[:, None], self._closest_target, self._target_pos)[resolved]
+        self._outcome_arm[resolved] = torch.stack([elbow[n, block_arm], hand[n, block_arm]], dim=1)[resolved]
+        self._outcome_age[resolved] = 0.0
+        if self.viewer is not None and resolved[0]:
+            bank, i = self._attack_bank, int(self._attack_ids[0])
+            miss = float((self._outcome_point[0] - self._outcome_target[0]).norm()) * 100
+            how = {HIT: f'HIT on the {bank.target_link[i]}',
+                   BLOCKED: f"BLOCKED by the {('left', 'right')[int(block_arm[0])]} forearm, {miss:.0f} cm from its target",
+                   EVADED: f'EVADED, closest approach {miss:.0f} cm from its target'}[int(event[0])]
+            logger.info(f'{bank.attack_names[i]}: {how}')
 
     def _local_keypoints(self, env_ids):
         """ Attacker keypoints relative to the defender root, in its heading frame [n, K, 3]. """
@@ -267,6 +328,7 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         super()._reset_robot_states_callback(env_ids, target_states)
         self._start_attacks(env_ids, blend=False)
         self._defense_event[env_ids] = 0
+        self._outcome_age[env_ids] = float('inf')
         self._kp_buffer[env_ids] = self._local_keypoints(env_ids)[:, None]
 
     def _update_reset_buf(self):
@@ -278,6 +340,19 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
     ###########################################################################
     #### Observations
     ###########################################################################
+    def _post_config_observation_callback(self):
+        super()._post_config_observation_callback()
+        if self._blind_actor == 'none':
+            return
+        kp = self.obs_buf_dict['actor_obs'][:, self._actor_kp_slice]  # a view: written in place
+        if self._blind_actor == 'freeze':  # hold what the actor saw while the attacker stood in guard before the strike
+            bank, ids = self._attack_bank, self._attack_ids
+            guard = bank.frame(ids, self._attack_t) < bank.onset_frame[ids] - self._threat_lead_frames
+            self._blind_kp[guard] = kp[guard]
+        else:
+            self._blind_kp[:] = 0.0
+        kp[:] = self._blind_kp
+
     def _get_obs_attacker_keypoints(self):
         return self._kp_buffer[:, ::self._kp_hist_stride].reshape(self.num_envs, -1)
 
@@ -316,12 +391,46 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         super()._draw_debug_vis()
         if not self._defense_debug_draw:
             return
+        """ Env 0: the striker (orange while pending, then the outcome colour: red hit, blue blocked, green evaded) and
+        its trail, the target on the defender (green), where the attack is aimed (yellow, until it resolves), and for
+        outcome_marker_time after each outcome where it ended (outcome colour) with a white line to the target. """
         env_id = 0
-        color = {PENDING: (1.0, 0.5, 0.0), HIT: (1.0, 0.0, 0.0), BLOCKED: (0.1, 0.3, 1.0), EVADED: (0.0, 0.8, 0.2)}[int(self._attack_status[env_id])]
+        colors = {PENDING: (1.0, 0.5, 0.0), HIT: (1.0, 0.0, 0.0), BLOCKED: (0.1, 0.3, 1.0), EVADED: (0.0, 0.8, 0.2)}
+        color = colors[int(self._attack_status[env_id])]
+        draw_line = lambda a, b, c: self.simulator.draw_line(Point(a), Point(b), Point(c), env_id)
         if not self._attacker_actor:
             bodies = self._attacker_body_pos[env_id].cpu()
             for child, parent in enumerate(self._attack_bank.body_parents):
                 if parent >= 0:
-                    self.simulator.draw_line(Point(bodies[parent]), Point(bodies[child]), Point(color), env_id)
+                    draw_line(bodies[parent], bodies[child], color)
+        self._striker_trail = (self._striker_trail + [self._striker_pos[env_id].cpu()])[-15:]
+        for a, b in zip(self._striker_trail[:-1], self._striker_trail[1:]):
+            draw_line(a, b, color)
         self.simulator.draw_sphere(self._striker_pos[env_id], 0.04, color, env_id)
         self.simulator.draw_sphere(self._target_pos[env_id], 0.03, (0.0, 1.0, 0.0), env_id)
+        if self._attack_status[env_id] == PENDING and self._attack_threat[env_id] > 0:
+            self.simulator.draw_sphere(self._aim_pos[env_id], 0.05, (1.0, 0.85, 0.0), env_id)
+        if self._outcome_age[env_id] < self._outcome_hold:
+            outcome = colors[int(self._outcome_status[env_id])]
+            point, target = self._outcome_point[env_id].cpu(), self._outcome_target[env_id].cpu()
+            for radius in (0.025, 0.05, 0.07):
+                self.simulator.draw_sphere(point, radius, outcome, env_id)
+            self.simulator.draw_sphere(target, 0.03, (0.0, 1.0, 0.0), env_id)
+            draw_line(point, target, (1.0, 1.0, 1.0))
+            if self._outcome_status[env_id] == BLOCKED:  # the blocking forearm, drawn thick
+                elbow, hand = self._outcome_arm[env_id].cpu()
+                for dz in (-0.006, 0.0, 0.006):
+                    offset = torch.tensor([0.0, 0.0, dz])
+                    draw_line(elbow + offset, hand + offset, outcome)
+        if self._blind_actor == 'freeze':  # the attacker as the blinded actor sees it (newest frame), relative to the defender
+            names = list(self.config.defense.keypoints)
+            K = len(names)
+            root = self.simulator.robot_root_states[env_id:env_id + 1]
+            heading = quat_conjugate(calc_heading_quat_inv(root[:, 3:7].clone(), w_last=True), w_last=True)
+            local = self._blind_kp[env_id, :3 * K].view(K, 3) / self.config.obs.obs_scales.attacker_keypoints
+            seen = (root[:, :3] + my_quat_rotate(heading.expand(K, 4), local)).cpu()
+            for i in range(K):
+                self.simulator.draw_sphere(seen[i], 0.03, (0.7, 0.3, 1.0), env_id)
+            for a, b in BLIND_SKELETON:
+                if a in names and b in names:
+                    draw_line(seen[names.index(a)], seen[names.index(b)], (0.7, 0.3, 1.0))

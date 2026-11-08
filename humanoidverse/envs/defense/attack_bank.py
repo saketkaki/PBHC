@@ -35,18 +35,32 @@ def load_joblib_compat(path):
     return joblib.load(path)
 
 
-def point_segment_distance(p, a, b):
-    """ Distance from points p to segments a-b, all [..., 3] (broadcast). """
+def closest_point_on_segment(p, a, b):
+    """ Point of the segments a-b closest to the points p, all [..., 3] (broadcast). """
     ab = b - a
     t = ((p - a) * ab).sum(-1) / (ab * ab).sum(-1).clamp(min=1e-9)
-    return (p - (a + t.clamp(0.0, 1.0)[..., None] * ab)).norm(dim=-1)
+    return a + t.clamp(0.0, 1.0)[..., None] * ab
+
+
+def point_segment_distance(p, a, b):
+    """ Distance from points p to segments a-b, all [..., 3] (broadcast). """
+    return (p - closest_point_on_segment(p, a, b)).norm(dim=-1)
+
+
+def sweep_segment_closest(p0, p1, a, b, samples=5):
+    """ Closest approach of the swept path p0 -> p1 [N, 3] to the segments a-b [N, S, 3], sampling the sweep: distance
+    [N], the segment index [N] and the point on that segment [N, 3]. """
+    s = torch.linspace(0.0, 1.0, samples, device=p0.device)
+    path = p0[:, None] + s[None, :, None] * (p1 - p0)[:, None]  # [N, samples, 3]
+    q = closest_point_on_segment(path[:, :, None], a[:, None], b[:, None])  # [N, samples, S, 3]
+    dist, i = (path[:, :, None] - q).norm(dim=-1).flatten(1).min(dim=1)
+    n, S = torch.arange(len(p0), device=p0.device), a.shape[1]
+    return dist, i % S, q[n, i // S, i % S]
 
 
 def sweep_segment_distance(p0, p1, a, b, samples=5):
     """ Smallest distance between the swept path p0 -> p1 [N, 3] and the segments a-b [N, S, 3], sampling the sweep. """
-    s = torch.linspace(0.0, 1.0, samples, device=p0.device)
-    path = p0[:, None] + s[None, :, None] * (p1 - p0)[:, None]  # [N, samples, 3]
-    return point_segment_distance(path[:, :, None], a[:, None], b[:, None]).flatten(1).min(dim=1).values
+    return sweep_segment_closest(p0, p1, a, b, samples)[0]
 
 
 class AttackBank:
@@ -166,6 +180,16 @@ class AttackBank:
 
     def striker(self, ids, t):
         return self._lerp(self.striker_pos, ids, t)
+
+    def standoff_weight(self, ids, t):
+        """ Share [n] of the standoff applied at time t: 1 in guard, easing to 0 at the impact frame (the attacker steps
+        in during the strike, so the striker lands where the clip aimed it) and back to 1 by the recovered frame. """
+        f = self.frame(ids, t)
+        onset, impact, recovered = self.onset_frame[ids].float(), self.impact_frame[ids].float(), self.recovered_frame[ids].float()
+        step_in = ((impact - f) / (impact - onset).clamp(min=1.0)).clamp(0.0, 1.0)
+        step_out = ((f - impact) / (recovered - impact).clamp(min=1.0)).clamp(0.0, 1.0)
+        s = torch.where(f <= impact, step_in, step_out)
+        return s * s * (3.0 - 2.0 * s)  # smoothstep: no jump in the attacker's velocity at the onset or recovery
 
     def phase_at(self, ids, t):
         return self.phase[ids, self.frame(ids, t).round().long()]

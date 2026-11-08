@@ -28,6 +28,7 @@ env:
       placement_noise: # per clip, around the defender's root and heading at the clip start
         yaw_deg: 0.0
         range: 0.0 # [m] the attacker stands up to this much closer or farther
+      standoff: 0.25 # [m] the attacker stands this much farther back in guard and steps in during the strike (onset to impact), so the guards don't touch before an attack
       blend_time: 0.25 # [s] ease the attacker's pose from the end of one clip into the next (clips start with >= 0.35 s of guard)
       hit_radius: 0.08 # [m] striker path to the target point (fist radius ~4 cm)
       block_radius: 0.07 # [m] striker path to a defender forearm axis (elbow to hand); 0 disables blocks
@@ -37,5 +38,7 @@ env:
       tti_clip: 1.0 # [s] time to impact in attack_privileged
       terminate_on_hit: False
       outcome_log_decay: 0.999 # per step, for the logged hit / block / evade rates
-      debug_draw: True # striker and target of env 0 in the viewer (and the attacker skeleton without attacker_actor)
+      debug_draw: True # env 0 in the viewer: striker, target, aim point, outcome markers (and the attacker skeleton without attacker_actor)
+      outcome_marker_time: 1.0 # [s] how long the viewer shows where the last attack ended
+      blind_actor: none # none, or for evaluation: freeze (the actor sees the attacker held in its guard before each strike) or zero
       attacker_actor: auto # draw the attacker as a G1 (visual-only actors, no collision); auto = only with a viewer

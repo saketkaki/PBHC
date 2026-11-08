@@ -10,11 +10,19 @@ getting hit does not look better (check fall_rate and interrupted together).
 Belief head (actor's encoder on the observed keypoints, against the privileged labels), over all steps of all episodes:
   class accuracy per attack phase (0 guard, 1 strike, 2 retract, 3 guard), phase accuracy, time-to-impact MAE during
   the strike phase.
+--blind sets env.config.defense.blind_actor, hiding the attacker from the actor (an unconditioned test of a conditioned policy; the critic, rewards and scoring
+are unchanged, and the belief metrics are computed on what the actor sees):
+  freeze  the attacker_keypoints the actor sees are held from the last step at which the attacker stood in guard (more
+          than threat_lead_time before an onset), so it sees an attacker that never strikes
+  zero    the attacker_keypoints are zeros (out of distribution: no attacker at all, rather than an idle one)
 
 usage (from the repo root, env `pbhc` active):
   python scripts/defense_eval.py CKPT [--name default] [--episodes 256] [--num-envs 256] [--seed 0] [--episode-s 20]
-         [key=value ...]   e.g. env.config.defense.block_radius=0 env.config.defense.placement_noise.yaw_deg=30
+         [--blind {none,freeze,zero}] [--env-from RUN] [key=value ...]   e.g. env.config.defense.block_radius=0 env.config.defense.placement_noise.yaw_deg=30
                                 "env.config.defense.attacks=[cross,rear_hook]"
+--env-from RUN (a defense run's directory, checkpoint or config.yaml) evaluates a checkpoint trained without the defense
+env, e.g. a plain PBHC guard tracker: the env (attacks, standoff, terminations) comes from RUN, the policy's observations,
+robot and algorithm from CKPT's own config. The policy just doesn't see the attacker unless its observations include it.
 Results go to CKPT_DIR/metrics/defense_eval/<ckpt name>/<name>_seed<seed>.json.
 """
 import argparse
@@ -30,6 +38,8 @@ parser.add_argument('--num-envs', type=int, default=256)
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--episode-s', type=float, default=20.0)
 parser.add_argument('--device', default='cuda:0')
+parser.add_argument('--blind', choices=['none', 'freeze', 'zero'], default='none')
+parser.add_argument('--env-from', default=None)
 args, overrides = parser.parse_known_args()
 
 import numpy as np  # noqa: E402
@@ -46,9 +56,16 @@ ckpt = Path(args.ckpt)
 config = OmegaConf.load(ckpt.parent / 'config.yaml')
 if config.get('eval_overrides') is not None:
     config = OmegaConf.merge(config, config.eval_overrides)
+if args.env_from is not None:
+    src = Path(args.env_from)
+    src = src / 'config.yaml' if src.is_dir() else src if src.suffix == '.yaml' else src.parent / 'config.yaml'
+    env_config = OmegaConf.load(src)
+    if env_config.get('eval_overrides') is not None:
+        env_config = OmegaConf.merge(env_config, env_config.eval_overrides)
+    config.env = env_config.env  # its obs, rewards and robot interpolate to CKPT's
 config = OmegaConf.merge(config, OmegaConf.from_dotlist(
     ['headless=True', f'num_envs={args.num_envs}', f'env.config.max_episode_length_s={args.episode_s}',
-     'env.config.defense.debug_draw=False'] + overrides))
+     'env.config.defense.debug_draw=False', f'env.config.defense.blind_actor={args.blind}'] + overrides))
 pre_process_config(config)
 
 random.seed(args.seed)
@@ -140,7 +157,7 @@ for c in range(C):
 tot = outcomes.sum(dim=0).tolist()
 resolved = max(sum(tot[:3]), 1)
 result = {
-    'checkpoint': str(ckpt), 'name': args.name, 'seed': args.seed, 'overrides': overrides,
+    'checkpoint': str(ckpt), 'name': args.name, 'seed': args.seed, 'blind': args.blind, 'env_from': args.env_from, 'overrides': overrides,
     'episodes': n_ep, 'episode_s': args.episode_s,
     'survival_rate': episode_counts['survived'] / n_ep, 'fall_rate': episode_counts['fall'] / n_ep,
     'drift_rate': episode_counts['drift'] / n_ep, 'mean_episode_s': float(np.mean(lengths)),
@@ -160,7 +177,7 @@ out = ckpt.parent / 'metrics' / 'defense_eval' / ckpt.stem / f'{args.name}_seed{
 out.parent.mkdir(parents=True, exist_ok=True)
 out.write_text(json.dumps(result, indent=1))
 
-print(f"\nRESULT {args.name} seed {args.seed}: {n_ep} episodes | survived {result['survival_rate']:.1%} | "
+print(f"\nRESULT {args.name} seed {args.seed}{'' if args.blind == 'none' else f' (blind: {args.blind})'}: {n_ep} episodes | survived {result['survival_rate']:.1%} | "
       f"fall {result['fall_rate']:.1%} | drift {result['drift_rate']:.1%} | mean length {result['mean_episode_s']:.1f} s | "
       f"guard body err {result['guard_body_err_mm']:.1f} mm")
 print(f"{'attack':15s} {'n':>5s} {'hit':>6s} {'block':>6s} {'evade':>6s} {'interr':>7s}")
