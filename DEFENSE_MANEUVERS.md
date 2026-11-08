@@ -171,7 +171,7 @@ python humanoidverse/train_agent.py +simulator=isaacgym +exp=motion_tracking +te
 python scripts/defense_eval.py logs/Defense/<tracker run>/model_<last>.pt --env-from logs/Defense/<defense run>
 ```
 
-**Viewer:** `python humanoidverse/eval_agent.py +checkpoint=logs/Defense/<run>/model_20000.pt`, or `scripts/record_video.py record` for a video. Add `+env.config.defense.blind_actor=freeze` (`env.config.defense.blind_actor=freeze` for `record_video.py`) to watch the blinded policy. A purple stick figure then shows the attacker as the actor sees it.
+**Viewer:** `python humanoidverse/eval_agent.py +checkpoint=logs/Defense/<run>/model_20000.pt`, or `scripts/record_video.py record` for a video. Add `+env.config.defense.blind_actor=freeze` (`env.config.defense.blind_actor=freeze` for `record_video.py`) to watch the blinded policy. A purple stick figure then shows the attacker as the actor sees it. For a policy trained without the defense env, such as the PBHC baseline, add `+env_from=logs/Defense/<defense run>` so the viewer uses that run's env and attacker.
 - The attacker is drawn as a red G1: one actor per body (24) carrying that link's meshes, with no joints, collision shapes or gravity, posed every step from the clip's forward kinematics.
 - It cannot touch the defender and does not change the physics (eval results with and without it agree).
 - Its link offsets match the simulated G1 exactly, also while blending between clips.

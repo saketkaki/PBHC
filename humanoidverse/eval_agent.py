@@ -88,6 +88,18 @@ def main(override_config: OmegaConf):
                     train_config, train_config.eval_overrides
                 )
 
+            # +env_from=RUN (a run's directory, checkpoint or config.yaml): use that run's env, e.g. the defense env with
+            # its attacker for a policy trained without it; the policy's obs, robot and algo stay the checkpoint's
+            env_from = override_config.get("env_from", None)
+            if env_from is not None:
+                env_path = Path(env_from)
+                env_path = env_path / "config.yaml" if env_path.is_dir() else env_path if env_path.suffix == ".yaml" else env_path.parent / "config.yaml"
+                logger.info(f"Using the env of {env_path}")
+                env_config = OmegaConf.load(env_path)
+                if env_config.get("eval_overrides") is not None:
+                    env_config = OmegaConf.merge(env_config, env_config.eval_overrides)
+                train_config.env = env_config.env
+
             config = OmegaConf.merge(train_config, override_config)
         else:
             config = override_config
