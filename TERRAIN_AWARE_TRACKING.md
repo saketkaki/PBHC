@@ -126,11 +126,12 @@ Completion rate (%), from the motion start, 3 evaluation seeds × 200 episodes; 
 | + step curriculum to 17 cm (2 seeds) | 99.6 | 55.0 | 89.6 | 44.8 | 92.7 | 42.3 | 62.3 | 50.7 | 36.2 | 25.6 | 20.6 mm |
 | + tilt curriculum to 21°, bumps to 8 cm (2 seeds, 1,000 iterations) | 99.7 | 71.6 | **96.2** | 73.3 | **95.9** | **67.6** | 70.2 | 58.1 | 44.8 | 32.7 | 22.0 mm |
 | + varied layouts: 24 terrain columns, placement jitter (seed 2, 1,000 iterations) | 98.8 | 75.3 | 94.0 | 80.3 | 95.3 | 67.5 | 74.5 | 60.3 | 53.5 | 43.0 | 22.9 mm |
-| **+ curriculum level from early starts only (seed 2, 1,000 iterations, current best recipe)** | 99.7 | **80.5** | **98.3** | **85.8** | **96.7** | **82.0** | **79.7** | **64.5** | **56.5** | **49.8** | 23.1 mm |
+| + curriculum level from early starts only (seed 2, 1,000 iterations) | 99.7 | 80.5 | **98.3** | 85.8 | 96.7 | 82.0 | 79.7 | 64.5 | 56.5 | 49.8 | 23.1 mm |
+| **+ 1,500 more iterations of the same recipe (seed 2, current best)** | 99.7 | **83.5** | 98.0 | **90.7** | **98.2** | **82.5** | **81.7** | **69.0** | **66.0** | **55.2** | 21.5 mm |
 
-Fall rates of the current best: 0% on flat, rough, bumps up to 8 cm and tilts up to 18°. On steps it falls 0.2, 0.8, 1.5 and 3.5% at 6.5, 10, 13.5 and 17 cm. The last two rows are one training seed (seed 2); the two-seed row above them reads 99.7 / 64.2 / 96.3 / 71.7 / 96.0 / 65.3 / 68.0 / 59.8 / 48.0 / 35.3 for that seed. A further 1,500 iterations of the same recipe (`ft33`, quick eval only) read 69.0% on 10 cm steps, 55.2% on 17 cm steps, 90.7% on 18° tilt, 82.5% on 8 cm bumps and 21.5 mm flat error.
+Fall rates of the current best: 0% on flat, rough, bumps up to 6 cm and tilts up to 18°; 0.3% on 8 cm bumps. On steps it falls 0.0, 0.7, 0.7 and 0.8% at 6.5, 10, 13.5 and 17 cm. The last three rows are one training seed (seed 2); the two-seed row above them reads 99.7 / 64.2 / 96.3 / 71.7 / 96.0 / 65.3 / 68.0 / 59.8 / 48.0 / 35.3 for that seed.
 
-- **Flat error** is the root-relative body position error on flat ground, as PBHC's E_mpbpe. The last three rows are 2–3 mm worse than the released policy; the rows before them match it.
+- **Flat error** is the root-relative body position error on flat ground, as PBHC's E_mpbpe. The three rows before the last are 2–3 mm worse than the released policy, and the last row 1.3 mm worse; the rows before them match it.
 - **The B and C rows** come from the first fine-tuning recipe, which damaged the released policy (Section 4). They show what the reference change does on its own, not a tuned baseline.
 - **Released policy on steps:** its completion rises with step height, which a blind policy shouldn't do. The cause hasn't been checked, so treat that row with care.
 - **Training seeds** differ by up to about 15 points on 10 cm steps, so differences of a few points between rows are not meaningful.
@@ -139,18 +140,21 @@ Fall rates of the current best: 0% on flat, rough, bumps up to 8 cm and tilts up
 
 | Terrain | Holds | Breaks |
 |---|---|---|
-| Tilt | 18° (85.8%) | 24° (43.3%) |
-| Bumps | 8 cm (82.0%), the hardest tested | – |
-| Steps | 13.5 cm (56.5%) | 17 cm (49.8%; 55.2% after 1,500 more iterations) |
+| Tilt | 18° (90.7%) | 24° (42.5%) |
+| Bumps | 8 cm (82.5%), the hardest tested | – |
+| Steps | 17 cm (55.2%), the hardest tested | – |
 
-**Second motion (Horse-stance punch).** Completion rate (%) / falls (%), one training seed. Both checkpoints are evaluated with the motion recentred on its tile; the last column has only the quick eval (5 settings):
+**Second motion (Horse-stance punch).** Completion rate (%) / falls (%), one training seed. All three are evaluated with the motion recentred on its tile (full sweeps):
 
 | Terrain | Released punch | First recipe (`ft18`, 6,500 it) | Current best (`ft32`, 18,250 it in total) |
 |---|---|---|---|
-| Flat | 99.2 / 0.0 | 99.3 / 0.0 | 100.0 / 0.0 |
+| Flat | 99.2 / 0.2 | 99.3 / 0.0 | 100.0 / 0.0 |
+| Rough (held out) | 0.0 / 22.3 | 34.5 / 0.5 | **92.0** / 0.0 |
+| Tilt 12° | 0.0 / 1.7 | 77.8 / 1.7 | **97.7** / 0.0 |
 | Tilt 18° | 0.0 / 5.2 | 12.8 / 4.5 | **88.8** / 0.0 |
 | Bumps 8 cm | 0.0 / 9.2 | 37.2 / 1.3 | **90.3** / 0.0 |
 | Steps 10 cm | 18.8 / 14.7 | 9.8 / 6.2 | **69.2** / 0.3 |
+| Steps 13.5 cm | 19.5 / 13.3 | 7.3 / 12.8 | **61.5** / 0.5 |
 | Steps 17 cm | 20.3 / 11.5 | 5.8 / 15.3 | **53.8** / 0.8 |
 | Flat error | **17.3 mm** | 25.4 mm | 25.2 mm |
 
@@ -160,6 +164,43 @@ What the punch needed beyond the pose recipe (details in LOG.md, 2026-11-10):
 - **Varied layouts.** A step tile has one edge, and a run had 2–3 step tiles per level, each always met at the same place. `terrain.num_cols=24` and `placement_jitter=0.15` took 10 cm steps from 24 to 46% in 750 iterations.
 - **A trap with this motion:** the motion file starts 1.17 m from the origin. Without `recenter_motion_xy` the robot stands away from the step edge, and the released punch then seems to complete about 80% of steps.
 - **Open:** flat error is 8 mm worse than the released punch.
+
+**Third motion (Hooks punch, no released checkpoint).** Warm-started from the punch terrain policy (`ft32`) and trained with normal PPO settings (adaptive learning rate, adaptive σ from the defaults, fresh terrain levels). Quick evals, one seed, after 1,500 iterations (`ft34`, about 40 minutes) and after 7,500 (`ft37`):
+
+| Terrain | 1,500 it: completed / falls | Body error | 7,500 it: completed / falls | Body error |
+|---|---|---|---|---|
+| Flat | 99.2 / 0.0 | 64.4 mm | 100.0 / 0.0 | 37.8 mm |
+| Tilt 18° | 92.8 / 0.0 | 75.3 mm | 98.5 / 0.2 | 51.3 mm |
+| Bumps 8 cm | 88.3 / 0.0 | 71.3 mm | 97.0 / 0.0 | 43.0 mm |
+| Steps 10 cm | 72.2 / 0.0 | 75.8 mm | 80.0 / 0.2 | 49.8 mm |
+| Steps 17 cm | 61.7 / 0.0 | 83.0 mm | 65.7 / 0.7 | 60.7 mm |
+
+- **A terrain policy of one motion is a good start for another:** the new motion completes on every terrain without falls after 1,500 iterations.
+- **Tracking tightens slowly with more training:** 64 → 41 → 38 mm on flat ground at 1,500, 4,500 and 7,500 iterations, against 22–25 mm for the other two motions. Completion on steps (80% at 10 cm) is now above the pose and the punch.
+
+**Fourth motion (Side kick, no released checkpoint).** The foot goes 1.3 m high, so the recipe above failed in two ways before it worked (`ft36`, `ft38`, `ft39`):
+
+| Training drift cutoff | Result at the 0.7 m evaluation cutoff |
+|---|---|
+| Fixed 0.7 m | 0% on every terrain: a robot that cannot yet kick is cut off at the kick every time, so it never learns it |
+| Fixed 1.5 m | 0%: the robot stays upright through the kick but leaves the foot about 0.5 m below the reference |
+| Curriculum 1.5 → 0.7 m (PBHC's scheme, 0.7 m floor) | Flat 97.2%, tilt 18° 82.8%, bumps 8 cm 87.5%, steps 10 cm 53.5%, steps 17 cm 40.5%; falls ≤ 1.2%; flat error 58.6 mm |
+
+- **A new motion with large limb travel needs the cutoff curriculum,** not the fixed 0.7 m cutoff used for the stances.
+- **The kick was only partly performed at that point:** on flat ground 9.5% completed at a 0.5 m cutoff, with the kicking ankle the furthest body. Completion at 0.7 m overstates a kick.
+- **Tightening the training cutoff further raises the kick, at a cost on terrain:**
+
+| Training cutoff ends at | Flat | Flat at 0.5 m / 0.35 m cutoff | Flat error | Tilt 18° | Bumps 8 cm | Steps 10 cm | Steps 17 cm | Falls on steps |
+|---|---|---|---|---|---|---|---|---|
+| 0.7 m (`ft39`) | 97.2 | 9.5 / 0.0 | 58.6 mm | 82.8 | 87.5 | 53.5 | 40.5 | 1.0–1.2% |
+| 0.5 m (`ft42`) | 97.7 | 97.0 / – | 48.8 mm | 90.3 | 89.8 | 54.8 | 39.8 | 6.3–7.7% |
+| 0.35 m (`ft43`) | 99.2 | 99.5 / 98.5 | 40.0 mm | 84.8 | 85.3 | 51.3 | 34.8 | 13.2–14.0% |
+
+- **No single best side-kick policy:** `ft42` falls less on terrain, `ft43` performs the kick most accurately. The tighter cutoff holds the training terrain levels down, so the policy practises less hard terrain.
+
+**Fifth motion (Roundhouse kick, no released checkpoint).** Warm-started from the side kick policy with the cutoff curriculum 1.5 → 0.7 m, 3,000 iterations (`ft41`, quick eval, one seed): flat 100.0%, tilt 18° 90.3%, bumps 8 cm 95.8%, steps 10 cm 66.7%, steps 17 cm 47.3%, falls ≤ 0.3%. It is loosely tracked (flat error 75.4 mm, 0% at a 0.5 m cutoff). Tightening the cutoff to 0.4 m in one run (`ft44`) failed: the robot was cut off at the kick every time and completion fell to 0%, so the cutoff has to tighten no faster than the kick improves.
+
+Work on these motions stopped on 2026-11-11 (the Charleston dance and the Bruce Lee pose were not started); the next goal is the defense maneuvers on terrain ([DEFENSE_MANEUVERS.md](DEFENSE_MANEUVERS.md)).
 
 ## 4. What works and what does not
 
@@ -207,14 +248,14 @@ What the punch needed beyond the pose recipe (details in LOG.md, 2026-11-10):
 4. **Make small steps real walls** (`slope_treshold` ≈ 0.5). (The tilt and bump ceilings were raised on 2026-11-10.)
 5. **Preview robustness:** add noise and drift to the robot position estimate the preview uses, since deployment needs localisation.
 6. **More motions:**
-   - the motions without a released checkpoint, starting with the Hooks punch (feet barely move), then the side and roundhouse kicks (long single-leg phases), the Charleston dance (20 s) and the Bruce Lee pose (deep crouch, 1 m of travel);
+   - the remaining motions without a released checkpoint: the Charleston dance (20 s) and the Bruce Lee pose (deep crouch, 1 m of travel); for the kicks, a cutoff schedule that keeps terrain robustness while tightening;
    - one terrain-aware policy for several motions, where the reference-frame preview could carry the motion content without localisation.
 
 Seeds: with the old terrain (2–3 step layouts per level) training seeds differed by up to about 15 points on steps. Since 2026-11-10 changes are tested on seed 2 only; confirm the final recipe on a second seed before quoting small differences.
 
 **Limitations compared with the paper:**
 - The preview needs an estimate of the robot's position relative to the motion start, and the height scan needs an elevation map. The original policy needs neither.
-- Everything is in simulation. The punch is the only second motion so far, and the current best pose and punch are one training seed each.
+- Everything is in simulation. The current best pose and punch, the Hooks punch and both kicks are one training seed each.
 
 ## 6. Implementation reference
 

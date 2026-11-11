@@ -56,6 +56,7 @@ The 17 settings are flat, rough 0.9 (held out, never trained on) and five diffic
 | PUNCH17, PUNCH_EARLY, PUNCH_EARLYLR, PUNCH_SWING | `ft20_P_step17_s2`, `ft21_P_early_s2`, `ft22_P_earlylr_s2`, `ft23_P_swing_s2` + `ft24_P_swing_long_s2` / `ft24_P_swing_lr_s2` | Punch: 17 cm step curriculum; + early starts; + higher learning rate; + swing clearance and support-lift gain |
 | PUNCH_HONEST, PUNCH_DIVERSE | `ft25_P_honest_s2`, `ft26_P_diverse_s2` | Punch: + only early starts move the level; + 24 terrain columns and placement jitter (continued as `ft27`, `ft29`, `ft30`, `ft32_P_diverse*_s2`; `ft32` is the current best punch) |
 | DIVERSE_s2, HONEST_s2 | `ft28_E_diverse_s2`, `ft31_E_honest_s2` + `ft33_E_honest2_s2` | Pose: HARD + 24 terrain columns and placement jitter; + early starts that alone move the level (current best pose, the `terrain_tracking` preset) |
+| HOOKS | `ft34_H_warm_s2`, `ft35_H_warm2_s2` | Hooks punch (no released checkpoint), warm-started from the punch terrain policy `ft32` |
 
 ### Lineage
 
@@ -77,6 +78,7 @@ released punch model_33000 → PUNCH_s2 ─────────────�
                            PUNCH_EARLY 41,750 → PUNCH_EARLYLR
         PUNCH_SWING → PUNCH_HONEST → 44,750 → PUNCH_DIVERSE → 46,250
             → ft27 → ft29 → ft30 → 50,000 → ft32 → 51,250 (kept)
+                └── Hooks punch: ft34 → 52,500 → ft35
 ```
 
 ### Checkpoint naming quirk
@@ -1070,7 +1072,9 @@ Quick evals (completion / falls):
 - **One training seed.**
 - **Steps:** a third of 10 cm episodes still lose the motion in the opening step.
 
-**Verdict:** the recipe is the current best for the pose and is now the preset `humanoidverse/config/exp/terrain_tracking.yaml` (composed and compared with the ft31 config: identical apart from checkpoint and name). ft33 is the best pose checkpoint by the quick eval; its full sweep is pending.
+**Full sweep of ft33** (`model_72250.pt`, completion / falls): flat 99.7 / 0.0; rough 83.5 / 0.0; tilt 6°, 12°, 15°, 18°, 24°: 99.2 / 0.0, 98.0 / 0.0, 94.7 / 0.0, 90.7 / 0.0, 42.5 / 5.0; bumps 2, 4, 5, 6, 8 cm: 99.8 / 0.0, 98.2 / 0.0, 94.8 / 0.0, 92.3 / 0.0, 82.5 / 0.3; steps 6.5, 10, 11.8, 13.5, 17 cm: 81.7 / 0.0, 69.0 / 0.7, 66.3 / 0.8, 66.0 / 0.7, 55.2 / 0.8; flat error 21.5 mm. Against ft31, steps are 2–9.5 points higher (13.5 cm +9.5), tilt 18° +5, rough +3; tilt 24° is level.
+
+**Verdict:** the recipe is the current best for the pose and is now the preset `humanoidverse/config/exp/terrain_tracking.yaml` (composed and compared with the ft31 config: identical apart from checkpoint and name). ft33 is the best pose checkpoint. Videos: `logs/MotionTracking/videos_honest_it72250/` (released pose against ft33, 10 terrains, on W&B `mois3a8e`).
 
 ### PUNCH_DIVERSE continued, rounds 4 and 5 (`ft30_P_diverse4_s2`, `ft32_P_diverse5_s2`)
 
@@ -1097,4 +1101,234 @@ Quick evals (completion / falls):
 - **Flat error 25 mm** against 17.3 mm for the released punch; it has not improved in any round.
 - **One training seed.**
 
+**Full sweeps** (completion / falls):
+
+| Terrain | PUNCH_s2 (ft18) | ft30 (50,000) | ft32 (51,250) |
+|---|---|---|---|
+| Flat | 99.3 / 0.0 | 99.2 / 0.0 | 100.0 / 0.0 |
+| Rough | 34.5 / 0.5 | 88.3 / 0.2 | **92.0** / 0.0 |
+| Tilt 6° | 97.3 / 0.2 | 98.8 / 0.0 | 99.7 / 0.0 |
+| Tilt 12° | 77.8 / 1.7 | 97.2 / 0.0 | 97.7 / 0.0 |
+| Tilt 15° | 39.7 / 3.2 | 94.0 / 0.2 | 96.8 / 0.0 |
+| Tilt 18° | 12.8 / 4.5 | 85.3 / 0.3 | **88.8** / 0.0 |
+| Tilt 24° | 0.7 / 6.0 | 36.0 / 4.7 | **42.7** / 5.0 |
+| Bumps 2 cm | 97.5 / 0.2 | 99.3 / 0.0 | 99.2 / 0.0 |
+| Bumps 4 cm | 89.2 / 0.5 | 99.0 / 0.0 | 98.5 / 0.0 |
+| Bumps 5 cm | 80.5 / 0.7 | 96.3 / 0.0 | 98.3 / 0.0 |
+| Bumps 6 cm | 63.7 / 0.5 | 95.0 / 0.0 | 96.3 / 0.0 |
+| Bumps 8 cm | 37.2 / 1.3 | 86.7 / 0.2 | **90.3** / 0.0 |
+| Step 6.5 cm | 24.8 / 4.3 | 76.7 / 0.0 | **80.7** / 0.0 |
+| Step 10 cm | 9.8 / 6.2 | 66.8 / 0.8 | 69.2 / 0.3 |
+| Step 11.8 cm | 9.0 / 6.8 | 62.0 / 0.5 | 63.7 / 0.5 |
+| Step 13.5 cm | 7.3 / 12.8 | 55.5 / 0.5 | **61.5** / 0.5 |
+| Step 17 cm | 5.8 / 15.3 | 48.5 / 1.0 | **53.8** / 0.8 |
+| Flat error | 25.4 mm | 24.4 mm | 25.2 mm |
+
+Videos: `logs/MotionTracking/videos_punchbest_it51250/` (released punch, recentred, against ft32, 10 terrains, on W&B `511nkndo`).
+
 **Verdict:** ft32 is the current best punch checkpoint. The punch and the pose are now level (10 cm steps 69%, 17 cm steps 54–55%, tilt 18° 89–91%, bumps 8 cm 83–90%). Next: the motions without a released checkpoint, Hooks punch first.
+
+### HOOKS: first motion without a released checkpoint (`ft34_H_warm_s2`)
+
+- **W&B:** `88j78nrz`.
+- **Motion:** `Hooks_punch.pkl`, 5.8 s. The feet slide apart to about 0.6 m during the first second and back during 5.0–5.8 s, lifting at most 5 cm; the pelvis drops from 0.80 to 0.67 m.
+- **Start:** the punch terrain policy `ft32` `model_51250.pt` (same robot and observations, a similar stance), not a from-scratch run.
+- **Settings:** the `terrain_tracking` preset with the punch's reference options (`swing_clearance=True`, `support_lift_gain=4`) and `early_start.max_time=1.2`, but with real learning in place of the gentle fine-tune: `schedule=adaptive` from actor 1e-4 / critic 1e-3, a fresh optimizer, `entropy_coef=0.005`, free noise std, adaptive tracking σ restarted from the PBHC defaults, terrain levels restarted at 0–1 (`algo.config.restore_terrain_levels=False`). The 100-iteration actor warm-up is kept.
+- **Iterations:** 1,500 (saved counter 51,000 → 52,500).
+- **Training:** levels fell to 0.1–0.2 during the warm-up, then climbed fast: step 2.4, tilt 3.2, bumps 3.5 at 250 iterations; step 3.36, tilt 3.64, bumps 3.62 at the end. Drift terminations 82 → 13%, falls 0.2%. Noise std rose from 0.185 to 0.30. The adaptive σ were still tightening (upper body 0.015 → 0.0095, feet 0.010 → 0.0027).
+
+Quick eval (`model_52500.pt`, completion / falls / root-relative body error):
+
+| Terrain | HOOKS (52,500) |
+|---|---|
+| Flat | 99.2 / 0.0 / 64.4 mm |
+| Tilt 18° | 92.8 / 0.0 / 75.3 mm |
+| Bumps 8 cm | 88.3 / 0.0 / 71.3 mm |
+| Step 10 cm | 72.2 / 0.0 / 75.8 mm |
+| Step 17 cm | 61.7 / 0.0 / 83.0 mm |
+
+- **The warm start works:** a new motion completes on every terrain, with no falls, after 1,500 iterations (about 40 minutes).
+- **Tracking is loose:** 64 mm on flat ground, against 22–25 mm for the pose and the punch. With the 0.7 m drift cutoff a motion that barely travels can complete while tracked poorly, so completion alone overstates this policy.
+
+**Problems:** no flat-ground baseline exists for this motion (no released checkpoint), so the error can only be compared with the other motions. One seed.
+
+**Verdict:** keep; continued as `ft35_H_warm2_s2` (W&B `bvxw1dsi`): 3,000 more iterations from `model_52500.pt`, optimizer state, learning rates, terrain levels and σ values resumed, no warm-up.
+
+## 2026-11-11
+
+### HOOKS continued (`ft35_H_warm2_s2`)
+
+- **W&B:** `bvxw1dsi`.
+- **Iterations:** ft34 52,500 → 55,250 by the saved counter (3,000), same settings, state resumed.
+- **Training:** step level 3.3 → 3.56, tilt 3.67, bumps 3.66; drift terminations 17 → 6%, falls 0.3%. Noise std peaked at 0.313 and fell to 0.26. Adaptive σ still tightening at the end (upper body 0.0095 → 0.0042, feet 0.0027 → 0.0019).
+
+Quick evals (completion / falls / root-relative body error):
+
+| Terrain | ft34 (52,500) | ft35 mid (53,750) | ft35 (55,250) |
+|---|---|---|---|
+| Flat | 99.2 / 0.0 / 64.4 mm | 99.5 / 0.0 / 50.0 mm | 99.8 / 0.0 / **41.1 mm** |
+| Tilt 18° | 92.8 / 0.0 / 75.3 mm | 95.5 / 0.0 / 64.5 mm | 96.3 / 0.0 / 57.4 mm |
+| Bumps 8 cm | 88.3 / 0.0 / 71.3 mm | 93.3 / 0.0 / 57.0 mm | 92.8 / 0.3 / 48.7 mm |
+| Step 10 cm | 72.2 / 0.0 / 75.8 mm | 75.3 / 0.2 / 62.8 mm | 76.3 / 0.7 / 55.3 mm |
+| Step 17 cm | 61.7 / 0.0 / 83.0 mm | 62.2 / 0.2 / 72.9 mm | 60.7 / 0.8 / 65.9 mm |
+
+- **Flat error 64 → 41 mm** in 3,000 iterations, about 0.6–1 mm per 100 iterations and not yet flat. Completion is level or up.
+
+**Problems:** still nearly twice the error of the pose and punch (22–25 mm).
+
+**Verdict:** keep; continued as `ft37_H_warm3_s2` (W&B `6343p3vc`, 3,000 more iterations).
+
+### SIDEKICK: first try, as the Hooks punch (`ft36_K_side_s2`)
+
+- **W&B:** `05g1nafr`.
+- **Motion:** `Side_kick.pkl`, 6.0 s; the kick is at about 1.5–3.5 s, with the foot up to 1.3 m high and the root moving 0.45 m.
+- **Settings:** as HOOKS ft34 (warm start from the punch `ft32`), without swing clearance and support-lift gain, `early_start.max_time=1.5`. 1,500 iterations.
+- **Result: failed.** Terrain levels went to 0 and stayed there; 76% of training episodes ended by drift and 4% by falls. Quick eval: 0% completed on every setting, flat included, with episodes ending at 37% of the motion (about 2.2 s, the kick). The upper-body σ tightened to 0.0013 on the standing part before the kick.
+- **Cause (likely):** the fixed 0.7 m drift cutoff. A robot that does not yet kick has its foot more than 0.7 m from the reference foot (1.3 m up), so every attempt is cut off at the kick and there is no gradual path to learning it. PBHC's own from-scratch training starts this cutoff at 1.5 m.
+
+**Verdict:** drop these settings for kicks. Retry as `ft38_K_side_far15_s2` (W&B `2xoeimi5`): from `ft36`, 2,000 iterations, drift cutoff fixed at 1.5 m in training (evaluation stays at 0.7 m), σ restarted from the defaults.
+
+### SIDEKICK retry: drift cutoff fixed at 1.5 m (`ft38_K_side_far15_s2`)
+
+- **W&B:** `2xoeimi5`. From `ft36` `model_52500.pt`, settings as `ft36` with `termination_motion_far_threshold=1.5` in training. Stopped at 1,150 of 2,000 iterations.
+- **Training:** episodes now get through the kick: step level 0 → 2.57, tilt 3.6; drift terminations 40 → 5%, falls 48 → 16%. The feet σ never tightened (0.0099, the default).
+- **Quick eval at 1,000 iterations** (`model_53250.pt`, cutoff 0.7 m): 0% completed on every setting, 0–0.7% falls. All 200 flat episodes of eval seed 0 ended by drift at a median 2.04 s, and in 199 the furthest body was the right ankle, 0.52 m below the reference: the robot stays upright through the kick but does not raise the kicking foot.
+
+**Verdict:** confirms the cause of the `ft36` failure (the cutoff, not balance), but a loose fixed cutoff lets the robot skip the kick. Stopped. Next: `ft39_K_side_farcur_s2` (W&B `ltf7jaxr`), from `model_53250.pt`, 2,500 iterations, with PBHC's own cutoff curriculum from 1.5 m down to 0.7 m (`terminate_when_motion_far_curriculum=True`, `initial_threshold=1.5`, `threshold_min=0.7`; about 1,300 iterations to reach 0.7 m at the default rate), state and σ resumed.
+
+### HOOKS continued again (`ft37_H_warm3_s2`)
+
+- **W&B:** `6343p3vc`. From ft35 `model_55250.pt`, 3,000 iterations (saved counter 55,000 → 58,000), state and σ resumed, with `swing_clearance=True`, `support_lift_gain=4` and `early_start.max_time=1.2` added.
+- **Training:** levels unchanged (step 3.56 → 3.57, tilt 3.67, bumps 3.65); drift terminations 3.5–5.8%, falls 0.2%. σ still tightening (upper body 0.0042 → 0.0032, feet 0.0019 → 0.0015). Noise std 0.26 → 0.25.
+
+Quick eval (`model_58000.pt`, completion / falls / root-relative body error):
+
+| Terrain | ft35 (55,250) | ft37 (58,000) |
+|---|---|---|
+| Flat | 99.8 / 0.0 / 41.1 mm | 100.0 / 0.0 / **37.8 mm** |
+| Tilt 18° | 96.3 / 0.0 / 57.4 mm | 98.5 / 0.2 / 51.3 mm |
+| Bumps 8 cm | 92.8 / 0.3 / 48.7 mm | 97.0 / 0.0 / 43.0 mm |
+| Step 10 cm | 76.3 / 0.7 / 55.3 mm | **80.0** / 0.2 / 49.8 mm |
+| Step 17 cm | 60.7 / 0.8 / 65.9 mm | **65.7** / 0.7 / 60.7 mm |
+
+- **Completion up on every terrain;** steps are now above the pose and the punch (69% at 10 cm).
+- **Error falls slowly:** 41 → 38 mm on flat ground in 3,000 iterations (64 → 41 in the 3,000 before).
+
+**Problems:** flat error still about 1.5× the pose and punch (22–25 mm), and the gain per iteration is shrinking. The three added settings were not tested separately. One seed.
+
+**Verdict:** keep as the Hooks punch best. Paused here to work on the kicks.
+
+### SIDEKICK third try: cutoff curriculum 1.5 → 0.7 m (`ft39_K_side_farcur_s2`)
+
+- **W&B:** `ltf7jaxr`. From ft38 `model_53250.pt`, 2,500 iterations (53,250 → 55,750), state and σ resumed, `terminate_when_motion_far_curriculum=True`, `initial_threshold=1.5`, `threshold_min=0.7`.
+- **Training:** the cutoff reached 0.7 m after about 1,350 iterations and stayed there. Levels dropped while it tightened (step 2.8 → 1.4, tilt 3.5 → 2.4) and recovered (step 2.64, tilt 3.38 at the end). Drift terminations 22%, falls 4.7% at the end. Feet σ never tightened (0.0098); upper body 0.0048.
+
+Quick eval (`model_55750.pt`, cutoff 0.7 m, completion / falls / root-relative body error):
+
+| Terrain | ft38 (53,250) | ft39 (55,750) |
+|---|---|---|
+| Flat | 0 | 97.2 / 0.0 / 58.6 mm |
+| Tilt 18° | 0 | 82.8 / 0.5 / 69.0 mm |
+| Bumps 8 cm | 0 | 87.5 / 0.2 / 61.7 mm |
+| Step 10 cm | 0 | 53.5 / 1.0 / 65.8 mm |
+| Step 17 cm | 0 | 40.5 / 1.2 / 72.0 mm |
+
+- **The cutoff curriculum works:** from 0% to 97% on flat ground at the 0.7 m cutoff.
+- **The kick is only partly performed.** Flat ground, eval seed 0, tighter cutoffs: 9.5% complete at 0.5 m and 0% at 0.35 m. At 0.5 m the episodes end at a median 2.0 s (the kick) and the furthest body is the right (kicking) ankle in 104 of 181, the left ankle in 42. So at the kick some body is typically 0.5–0.7 m from the reference: the robot raises the leg just enough to stay inside the cutoff.
+
+**Problems:** completion at 0.7 m overstates this policy; a 1.3 m kick allows a large shortfall inside 0.7 m. One seed.
+
+**Verdict:** keep as a starting point. `ft40_K_side_cont_s2` (W&B `0hib2pas`, same settings with the cutoff fixed at 0.7 m) was started and stopped after 8 minutes, before the tighter-cutoff check, in favour of:
+
+- `ft42_K_side_far05_s2`: from ft39 `model_55750.pt`, 2,500 iterations, cutoff curriculum continued from 0.7 m down to 0.5 m in training (evaluation stays at 0.7 m, plus a flat check at 0.5 m).
+- `ft41_R_round_s2` (W&B `fn0ifq01`): Roundhouse kick, warm-started from the side kick ft39 `model_55750.pt`, 3,000 iterations, settings as ft34 plus `early_start.max_time=1.5` and the cutoff curriculum 1.5 → 0.7 m.
+
+### SIDEKICK: training cutoff tightened to 0.5 m (`ft42_K_side_far05_s2`)
+
+- **W&B:** `gbi1b9fs`. From ft39 `model_55750.pt`, 2,500 iterations (saved counter 55,500 → 58,000), cutoff curriculum `initial_threshold=0.7`, `threshold_min=0.5`, state and σ resumed.
+- **Training:** the cutoff reached 0.5 m after about 600 iterations. Step level 2.63 → 1.10 → 1.81, tilt 3.40 → 2.66 → 3.33. Drift terminations 25%, falls 4.8% at the end. Feet σ started to tighten (0.0097 → 0.0082).
+
+Quick eval (`model_58000.pt`, cutoff 0.7 m, completion / falls / root-relative body error):
+
+| Terrain | ft39 (55,750) | ft42 (58,000) |
+|---|---|---|
+| Flat | 97.2 / 0.0 / 58.6 mm | 97.7 / 0.0 / **48.8 mm** |
+| Flat, cutoff 0.5 m (seed 0) | 9.5 | **97.0** |
+| Tilt 18° | 82.8 / 0.5 / 69.0 mm | 90.3 / 0.7 / 60.4 mm |
+| Bumps 8 cm | 87.5 / 0.2 / 61.7 mm | 89.8 / 2.5 / 52.7 mm |
+| Step 10 cm | 53.5 / 1.0 / 65.8 mm | 54.8 / **6.3** / 59.1 mm |
+| Step 17 cm | 40.5 / 1.2 / 72.0 mm | 39.8 / **7.7** / 66.4 mm |
+
+- **The kick is higher:** 97% of flat episodes now stay within 0.5 m of the reference (9.5% before), and body error fell about 10 mm on every terrain.
+- **Falls on steps rose** from about 1% to 6–8%; completion on steps is unchanged.
+
+**Problems:** more falls on steps and bumps. The training step level is lower than before (1.8 against 2.6). One seed.
+
+**Verdict:** keep; tightening the cutoff is what raises the kick. Continued as `ft43_K_side_far035_s2` (W&B `4ckpey5t`): 2,500 iterations, cutoff 0.5 → 0.35 m.
+
+### ROUNDHOUSE first try (`ft41_R_round_s2`)
+
+- **W&B:** `fn0ifq01`. `Roundhouse_kick.pkl` (5.3 s), warm-started from the side kick ft39 `model_55750.pt`, 3,000 iterations (55,500 → 58,500), settings as ft34 plus `early_start.max_time=1.5` and the cutoff curriculum 1.5 → 0.7 m.
+- **Training:** cutoff at 0.7 m after about 1,500 iterations. Step level 2.45, tilt 3.38 at the end; drift terminations 23%, falls 0.7%. Feet σ never tightened (0.0099); upper body 0.0107.
+
+Quick eval (`model_58500.pt`, completion / falls / root-relative body error):
+
+| Terrain | ROUNDHOUSE (58,500) |
+|---|---|
+| Flat | 100.0 / 0.0 / 75.4 mm |
+| Flat, cutoff 0.5 m (seed 0) | 0.0 |
+| Tilt 18° | 90.3 / 0.3 / 86.3 mm |
+| Bumps 8 cm | 95.8 / 0.0 / 80.7 mm |
+| Step 10 cm | 66.7 / 0.0 / 83.0 mm |
+| Step 17 cm | 47.3 / 0.3 / 86.3 mm |
+
+- **Completes on every terrain with almost no falls** on the first try with the cutoff curriculum.
+- **Loosely tracked, as the side kick was at this stage:** 75 mm flat error and 0% at a 0.5 m cutoff.
+
+**Problems:** completion at 0.7 m overstates it. One seed.
+
+**Verdict:** keep; continued as `ft44_R_round_far04_s2` (W&B `b0yd4gb4`): 2,500 iterations, cutoff 0.7 → 0.4 m.
+
+### SIDEKICK: training cutoff tightened to 0.35 m (`ft43_K_side_far035_s2`)
+
+- **W&B:** `4ckpey5t`. From ft42 `model_58000.pt`, 2,500 iterations (saved counter 57,750 → 60,250), cutoff curriculum 0.5 → 0.35 m, state and σ resumed.
+- **Training:** cutoff at 0.35 m after about 700 iterations. Step level 1.75 → 0.78 → 1.29, tilt 3.28 → 2.20 → 2.86. Drift terminations 32%, falls 4.4% at the end. σ tightened (feet 0.0081 → 0.0040, upper body 0.0044 → 0.0024).
+
+Quick eval (`model_60250.pt`, cutoff 0.7 m, completion / falls / root-relative body error):
+
+| Terrain | ft39 (cutoff → 0.7) | ft42 (→ 0.5) | ft43 (→ 0.35) |
+|---|---|---|---|
+| Flat | 97.2 / 0.0 / 58.6 mm | 97.7 / 0.0 / 48.8 mm | **99.2** / 0.2 / **40.0 mm** |
+| Flat, cutoff 0.5 m (seed 0) | 9.5 | 97.0 | 99.5 |
+| Flat, cutoff 0.35 m (seed 0) | 0.0 | – | **98.5** |
+| Tilt 18° | 82.8 / 0.5 / 69.0 mm | 90.3 / 0.7 / 60.4 mm | 84.8 / 4.5 / 51.6 mm |
+| Bumps 8 cm | 87.5 / 0.2 / 61.7 mm | 89.8 / 2.5 / 52.7 mm | 85.3 / 5.5 / 44.6 mm |
+| Step 10 cm | 53.5 / 1.0 / 65.8 mm | 54.8 / 6.3 / 59.1 mm | 51.3 / **13.2** / 52.6 mm |
+| Step 17 cm | 40.5 / 1.2 / 72.0 mm | 39.8 / 7.7 / 66.4 mm | 34.8 / **14.0** / 59.7 mm |
+
+- **Flat ground: the kick is now tracked within 0.35 m in 98.5% of episodes,** and body error fell to 40 mm.
+- **Terrain got worse:** falls rose on every terrain (steps 13–14%, tilt and bumps about 5%) and completion fell 3–6 points. The tighter cutoff holds the training terrain levels down (step 1.3 against 2.6 for ft39), so the policy practises less hard terrain.
+
+**Problems:** a trade between kick accuracy and terrain robustness that this schedule does not resolve. One seed.
+
+**Verdict:** two candidates, no single best: `ft42` for terrain (fewer falls), `ft43` for the kick itself. Side kick work stopped here at the user's request (2026-11-11). Untested idea: tighten the cutoff only on flat and easy rows, or let the terrain levels recover with longer training at 0.35 m.
+
+### ROUNDHOUSE: training cutoff tightened to 0.4 m (`ft44_R_round_far04_s2`)
+
+- **W&B:** `b0yd4gb4`. From ft41 `model_58500.pt`, 2,500 iterations (58,250 → 60,750), cutoff curriculum 0.7 → 0.4 m, state and σ resumed.
+- **Result: failed.** As the cutoff passed about 0.5 m the terrain levels fell to 0 (step 2.52 → 0, tilt 3.41 → 0) and never recovered; 77% of training episodes ended by drift. Quick eval of `model_60750.pt`: 0% completed on every setting, flat included, with episodes ending at about 35% of the motion (the kick). The σ collapsed onto the part before the kick (feet 0.0098 → 0.0012), as in the first side-kick try (ft36).
+- **Cause (likely):** the cutoff tightened faster than the robot learned to raise the leg. The side kick went 0.7 → 0.5 → 0.35 in two runs with 0% → 97% at 0.5 m in between; the roundhouse started from 0% at 0.5 m and was pushed to 0.4 m in about 800 iterations.
+
+**Verdict:** drop this run. The Roundhouse kick best stays `ft41` `model_58500.pt` (completes on every terrain, loosely tracked: 75 mm). Roundhouse work stopped here at the user's request. If resumed: tighten in smaller steps (0.7 → 0.55 first) or slow the curriculum rate.
+
+### New-motion work stopped (2026-11-11)
+
+The user redirected the work to the defense maneuvers on terrain. State of the motions without a released checkpoint:
+
+| Motion | Best checkpoint | Flat | Step 10 cm | Flat error | Note |
+|---|---|---|---|---|---|
+| Hooks punch | ft37 `model_58000.pt` | 100.0 | 80.0 | 37.8 mm | completes everywhere, falls < 1% |
+| Side kick | ft42 `model_58000.pt` (terrain) / ft43 `model_60250.pt` (kick) | 97.7 / 99.2 | 54.8 / 51.3 | 48.8 / 40.0 mm | needs the cutoff curriculum; falls on steps 6% / 13% |
+| Roundhouse kick | ft41 `model_58500.pt` | 100.0 | 66.7 | 75.4 mm | kick only loosely tracked |
+| Charleston dance, Bruce Lee pose | – | – | – | – | not started |
+

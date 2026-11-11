@@ -571,18 +571,16 @@ Percent of attempts that complete the whole motion, starting from the beginning.
 |---|---|---|---|---|---|---|---|---|
 | Original PBHC | 98.8 | 0 | 0 | 0 | 0.5 | 0 | 21.0 | 23.2 |
 | Ours, early November | 99.6 | 55.0 | 89.6 | 44.8 | 92.7 | 42.3 | 50.7 | 25.6 |
-| Ours, current best (10 November) | 99.7 | 80.5 | 98.3 | 85.8 | 96.7 | 82.0 | 64.5 | 49.8 |
+| Ours, current best (10 November) | 99.7 | 83.5 | 98.0 | 90.7 | 98.2 | 82.5 | 69.0 | 55.2 |
 
-What changed between the last two rows: slope and bump maximums raised in the curriculum, 24 columns with placement jitter, and the level counted from early starts only (all in Part 3).
+What changed between the last two rows: slope and bump maximums raised in the curriculum, 24 columns with placement jitter, and the level counted from early starts only (all in Part 3), over about 3,750 more training iterations.
 
-- **Flat ground:** just as good as the original. Precision is slightly lower: about 23 mm average body-position error, against 20 mm for the released policy.
-- **Slopes:** from failing every time to completing 98% at 12°, 86% at 18° and 43% at 24°.
-- **Bumps:** from failing every time to completing 97% at 4 cm and 82% at 8 cm.
-- **Rough ground it has never seen:** from 0% to 80%.
-- **Steps:** better, but still the weakest. About two in three attempts complete at 10 cm and half at 17 cm.
-- **Falls are now rare:** none on flat, rough, bumps and slopes up to 18°; 1% on 10 cm steps, 3.5% on 17 cm steps, 5% on the 24° slope. When an attempt fails, the robot has usually lost the ghost, not fallen over.
-
-The same recipe trained 1,500 more iterations reads higher again on a shorter test (5 settings): 69% on 10 cm steps, 55% on 17 cm steps, 91% on the 18° slope, and 21.5 mm error on flat ground. Its full test is running.
+- **Flat ground:** just as good as the original. Precision is slightly lower: 21.5 mm average body-position error, against 20 mm for the released policy.
+- **Slopes:** from failing every time to completing 98% at 12°, 91% at 18° and 43% at 24°.
+- **Bumps:** from failing every time to completing 98% at 4 cm and 83% at 8 cm.
+- **Rough ground it has never seen:** from 0% to 84%.
+- **Steps:** better, but still the weakest. About two in three attempts complete at 10 cm and at 13.5 cm, and a little over half at 17 cm.
+- **Falls are now rare:** none on flat, rough and slopes up to 18°; under 1% on bumps and on every step height; 5% on the 24° slope. When an attempt fails, the robot has usually lost the ghost, not fallen over.
 
 One oddity: the original PBHC scores higher on 17 cm steps than on 6.5 cm steps, which a blind robot shouldn't do. We haven't found out why, so treat its step numbers with care.
 
@@ -592,32 +590,64 @@ To show the approach isn't specific to one motion, we applied it to the **Horse-
 
 | Ground | Released punch | Ours (10 November) |
 |---|---|---|
-| Flat | 99.2 / 0.2 | 99.2 / 0 |
-| Rough (never trained on) | 0 / 22.3 | 88.3 / 0.2 |
-| 12° slope | 0 / 1.7 | 97.2 / 0 |
-| 18° slope | 0 / 5.2 | 85.3 / 0.3 |
-| 8 cm bumps | 0 / 9.2 | 86.7 / 0.2 |
-| 10 cm step | 18.8 / 14.7 | 66.8 / 0.8 |
-| 17 cm step | 20.3 / 11.5 | 48.5 / 1.0 |
+| Flat | 99.2 / 0.2 | 100 / 0 |
+| Rough (never trained on) | 0 / 22.3 | 92.0 / 0 |
+| 12° slope | 0 / 1.7 | 97.7 / 0 |
+| 18° slope | 0 / 5.2 | 88.8 / 0 |
+| 8 cm bumps | 0 / 9.2 | 90.3 / 0 |
+| 10 cm step | 18.8 / 14.7 | 69.2 / 0.3 |
+| 17 cm step | 20.3 / 11.5 | 53.8 / 0.8 |
 
 - **The punch is now level with the pose** on every kind of ground, with falls at or below 1%.
 - **The pose recipe alone was not enough.** With it, the punch completed only 10% of 10 cm steps. It needed the ghost changes for a low foot lift (Part 4) and the two curriculum changes (Part 3). Those curriculum changes then turned out to help the pose too.
-- **It is less precise on flat ground** than the released punch: 24 mm average body-position error against 17 mm. We haven't fixed that.
+- **It is less precise on flat ground** than the released punch: 25 mm average body-position error against 17 mm. We haven't fixed that.
 - **A measuring trap:** the punch's motion file starts 1.17 m away from the origin. Unless the motion is re-centred on its tile, the robot stands away from the step edge and the released punch seems to complete about 80% of steps. An earlier version of this file reported that number; the correct one is about 20%.
-- A further 1,500 iterations read 69% on 10 cm steps, 54% on 17 cm steps, 89% on the 18° slope and 90% on 8 cm bumps on the shorter test.
 
 ### Motions with no released policy
 
-PBHC ships five more motions without a trained policy: the Hooks punch, side kick, roundhouse kick, Charleston dance and Bruce Lee pose. We have just started on the first (Hooks punch), using the punch's terrain policy as the starting point. There are no results yet.
+PBHC ships five more motions without a trained policy: the Hooks punch, side kick, roundhouse kick, Charleston dance and Bruce Lee pose. We trained three of them: the Hooks punch, the side kick and the roundhouse kick. First, the **Hooks punch**. There is no trained policy to start from, so we started from our punch terrain policy (a similar stance) and trained with normal settings, not the gentle ones, because the robot has to learn a new motion.
+
+After 1,500 iterations (about 40 minutes), on a shorter test of 5 settings: it completes 99% on flat ground, 72% on 10 cm steps, 62% on 17 cm steps, 93% on the 18° slope and 88% on 8 cm bumps, and it never fell.
+
+**But it didn't copy the motion closely.** Its average body-position error on flat ground was 64 mm, against 22–25 mm for the pose and the punch. The Hooks punch barely travels, so a robot can stay within 0.7 m of the ghost and "complete" the motion while following it loosely.
+
+**More training helps, slowly.** After 7,500 iterations in total the error is 38 mm on flat ground, and it completes 100% on flat ground, 80% on 10 cm steps, 66% on 17 cm steps, 98.5% on the 18° slope and 97% on 8 cm bumps. That is better on steps than the pose and the punch, but still less precise.
+
+### The side kick, and why the 0.7 m rule had to change
+
+The second new motion is the **side kick**: the robot stands on one leg and raises the other foot to 1.3 m. It took three tries.
+
+1. **Same settings as the Hooks punch: 0% completed, even on flat ground.** Training ends an attempt when any body part is more than 0.7 m from the ghost. A robot that can't kick yet has its foot on the floor while the ghost's foot is 1.3 m up, so every attempt was ended at the kick. The robot never got to practise it.
+2. **Loosen the rule to 1.5 m: still 0% when tested with the 0.7 m rule.** Now the robot got through the kick in training, but only by standing still. Its foot stayed about half a metre below the ghost's. Nothing forced it to raise the leg.
+3. **Start at 1.5 m and tighten gradually to 0.7 m: 97% on flat ground.** This is how the original PBHC trains from scratch. The robot first learns to stay up, then has to raise the leg higher and higher to keep finishing. On terrain it completes 83% on the 18° slope, 88% on 8 cm bumps, 54% on 10 cm steps and 41% on 17 cm steps, with about 1% falls.
+
+**The kick was still too low.** When we tested with a stricter 0.5 m rule, only about 10% of flat-ground attempts finished, and the part that was furthest off was usually the kicking foot. The robot lifted the leg just enough to pass the 0.7 m rule.
+
+**So we kept tightening the rule in training,** first to 0.5 m and then to 0.35 m.
+
+- **At 0.5 m:** 97% of flat-ground attempts pass the stricter 0.5 m test, and the average body error fell from 59 mm to 49 mm. On steps the robot now falls in 6–8% of attempts (about 1% before), while completing about as often (55% on 10 cm steps).
+- **At 0.35 m:** 98.5% of flat-ground attempts pass even a 0.35 m test, and the error is 40 mm. But terrain got worse: 13–14% falls on steps, about 5% on the slope and bumps, and a few points fewer completed.
+
+So there is a trade-off we have not solved: the stricter the rule, the better the kick and the worse the terrain handling. The likely reason is that a strict rule ends many attempts on hard terrain, the curriculum then keeps the robot on easier terrain, and it practises hard terrain less.
+
+### The roundhouse kick
+
+The third new motion started from the side kick policy with the same gradually tightening rule (down to 0.7 m). On the first try it completes 100% on flat ground, 90% on the 18° slope, 96% on 8 cm bumps, 67% on 10 cm steps and 47% on 17 cm steps, and almost never falls. Like the side kick at the same stage it is loosely tracked (75 mm error, and nothing passes the 0.5 m test).
+
+We then tightened its rule from 0.7 m to 0.4 m in a single run, and that **failed**: the rule tightened faster than the robot learned to raise its leg, every attempt was ended at the kick again, and completion went to 0%. The first-try policy is the one we keep. The lesson is that the rule has to tighten no faster than the kick improves.
+
+Work on these extra motions stopped here. The Charleston dance and the Bruce Lee pose were not started, because the next goal is defending against attacks on terrain.
 
 ---
 
 ## Part 11: What still doesn't work, and why
 
-- **Steps.** About a third of attempts on 10 cm steps and half on 17 cm steps still fail. The robot rarely falls now; it loses the ghost during the big sideways step 1–2.5 seconds in (and, for the punch, the step back at the end). The foot lands about 50 cm out, right at the edge of the body scan, and the foot scans only cover where the feet are now, not where they are going. The weakest cases are a raised part on the robot's left and starts with one foot already on the upper level.
+- **Steps.** About a third of attempts on 10 cm steps and a little under half on 17 cm steps still fail. The robot rarely falls now; it loses the ghost during the big sideways step 1–2.5 seconds in (and, for the punch, the step back at the end). The foot lands about 50 cm out, right at the edge of the body scan, and the foot scans only cover where the feet are now, not where they are going. The weakest cases are a raised part on the robot's left and starts with one foot already on the upper level.
 - **Starts that straddle the edge.** About half the test attempts start with one foot already on the step. Those complete far less often. A real robot would probably not start a kung-fu move standing across a step edge, so these should be reported separately.
 - **The small steps are ramps.** Steps below about 7.5 cm are slopes, not walls (Part 3).
-- **The punch is less precise on flat ground** than its released policy (24 mm against 17 mm).
+- **The punch is less precise on flat ground** than its released policy (25 mm against 17 mm).
+- **The Hooks punch isn't tracked closely yet** (38 mm error, against 22–25 mm), although it completes the motion.
+- **The kicks trade accuracy against terrain.** The side kick is either accurate (40 mm error) with 13–14% falls on steps, or less accurate (49 mm) with 6–8% falls. The roundhouse kick is only loosely tracked (75 mm).
 - **The newest results are one training seed.**
 - **A real robot would need to know where it is.** Both the ground map and the preview depend on that, and we haven't tested how much an imperfect estimate hurts the preview.
 - **Simulation only.** Nothing has run on a real robot.
@@ -628,7 +658,7 @@ PBHC ships five more motions without a trained policy: the Hooks punch, side kic
 3. Reporting clean starts and edge-straddling starts separately.
 4. Turning the small ramps into real steps.
 5. Testing the preview with an imperfect position estimate.
-6. More motions, which has started: the Hooks punch first, then the kicks (long time on one leg), the Charleston dance (20 seconds long) and the Bruce Lee pose (very deep crouch), and eventually one policy for several motions.
+6. More motions: the Hooks punch and the two kicks are trained (above); the Charleston dance (20 seconds long) and the Bruce Lee pose (very deep crouch) are not, and eventually one policy should cover several motions.
 7. Confirming the final recipe on a second training seed.
 
 ---
