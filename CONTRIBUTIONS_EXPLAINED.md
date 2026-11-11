@@ -102,7 +102,7 @@ That limitation is what this project attacks.
 
 - **Checkpoint:** a saved copy of the neural networks at some iteration, so training can continue later or the policy can be tested. The released pose checkpoint is from iteration 50,000.
 - **Training from scratch** starts with a random network. **Fine-tuning** starts from an existing trained network and continues training it on a new situation. We fine-tune, because learning the motion itself from scratch takes far longer than we can afford (our 2-hour from-scratch pilots couldn't even do the motion on flat ground).
-- **Training seed:** the random number that decides all the random choices in a run. Two runs that differ only in seed can end up noticeably different. That's why we run important experiments with **two seeds**.
+- **Training seed:** the random number that decides all the random choices in a run. Two runs that differ only in seed can end up noticeably different. That's why the main comparisons up to early November were run with **two or three seeds**. The latest runs (Parts 10 and 11) use one seed, to try more ideas in the same time; the final recipe still needs confirming on a second seed.
 - **Curriculum:** starting with easy tasks and making them harder as the robot improves, like school grades.
 
 ---
@@ -161,7 +161,7 @@ The existing terrain types in robot-locomotion code (pyramids of stairs, for exa
 
 ### The curriculum
 
-The 1,536 robots in training are spread over a grid of tiles: 5 rows of difficulty, from easy to hard, and 8 columns of terrain types (10% flat, 30% bumps, 30% tilt, 30% step).
+The 1,536 robots in training are spread over a grid of tiles: 5 rows of difficulty, from easy to hard, and 24 columns of terrain types (10% flat, 30% bumps, 30% tilt, 30% step). It was 8 columns at first; "Not enough variety" below explains the change.
 
 - A robot that **completes the motion** moves **up one row** (harder ground).
 - A robot whose attempt **ends early** moves **down one row**.
@@ -171,8 +171,29 @@ So every robot trains near the edge of what it can do. The average row ("terrain
 
 ### Two fixes made along the way
 
-- **Training never reached the test difficulties.** At first the rows only went up to difficulty 0.8, so training never saw the 10 cm step it was tested on. Later we found the same problem one level up: steps topped out at 10 cm in training while tests go to 17 cm. Each terrain type now has its own maximum, and steps go up to 17 cm. This alone improved tall steps clearly (Part 10).
+- **Training never reached the test difficulties.** At first the rows only went up to difficulty 0.8, so training never saw the 10 cm step it was tested on. Later we found the same problem one level up: steps topped out at 10 cm in training while tests go to 17 cm. Each terrain type now has its own maximum: steps go up to 17 cm, slopes to 21° and bumps to 8 cm. Raising the step maximum improved tall steps, and raising the slope and bump maximums improved every terrain, steps included (18° slope from 45% to 73% completed, 8 cm bumps from 42% to 68%, two-seed averages).
 - **The robots' rows are now saved with the checkpoint.** Before, every time a training run was continued, all robots restarted at the easiest rows and spent much of the run climbing back. A bug also moved every robot down one row at the start of every run. Both are fixed.
+
+### Not enough variety: the robot had memorised about ten steps
+
+This was found late (10 November) and turned out to matter a lot for steps.
+
+- Each step tile has **one edge**, in one random direction, a random distance (up to 15 cm) from the tile centre.
+- With 8 columns there were only **2 or 3 step tiles per difficulty row**, so about ten step layouts in the whole of training.
+- Every attempt started at the **exact centre** of its tile, so each of those edges was always met at the same place under the robot.
+
+So the robot wasn't learning "steps"; it was learning its own ten steps. That also explains why each training seed had its own weak step direction. Two changes fix it:
+
+- **24 columns instead of 8,** which gives about 7 step tiles per row.
+- **Placement jitter:** each attempt shifts the whole motion by a random amount, up to 15 cm in x and y, so the same edge is met at many different places.
+
+For the punch, 10 cm steps went from 24% to 46% completed within 750 iterations of making this change.
+
+### The level only counts attempts that include the hard part
+
+Training starts attempts at random points in the motion, and on uneven ground only the opening (the big step into the stance) is hard. Most attempts skipped it, completed easily and moved their robot up a row, so the terrain level looked much better than the robot really was.
+
+Now 70% of attempts on uneven tiles start within the first second of the motion, and **only those attempts move a robot up or down**. The level then measures the motion from its opening, and the robots spend their time on rows that are hard for the right reason. For the pose this improved or held every one of the 17 test settings (8 cm bumps from 68% to 82%, 24° slope from 31% to 43%).
 
 ### A quirk to know about
 
@@ -249,7 +270,7 @@ So the original setup **rewards the wrong behaviour on uneven ground**. Even a p
 - An **average** of the two would put the foot on the higher side partly **inside** the step (we measured up to 3.5 cm inside).
 - So we use (roughly) the **higher of the two**, so no foot ends up inside the ground.
 - But only for feet that are **bearing weight**. A foot the ghost is lifting (swinging through the air) shouldn't pull the whole body up just because it passes over a high spot. So each foot's ground height is lowered by how high the ghost lifts that foot before picking the higher one.
-- We use a "soft" version of "the higher of the two", which blends smoothly instead of jumping. In formula form: `support = Σ wᵢ · groundᵢ`, with weights `w = softmax((groundᵢ − liftᵢ) / 2 cm)`. If you don't know softmax: it gives most of the weight to the largest value, but changes smoothly as the values change.
+- We use a "soft" version of "the higher of the two", which blends smoothly instead of jumping. In formula form: `support = Σ wᵢ · groundᵢ`, with weights `w = softmax((groundᵢ − gain · liftᵢ) / 2 cm)`. The gain is 1 for the pose and 4 for the punch (see "A motion that barely lifts its foot" below). If you don't know softmax: it gives most of the weight to the largest value, but changes smoothly as the values change.
 
 **Step 4: lift the whole ghost by the support height.** Every body part of the ghost is moved up (or down) by that one number. The ghost's shape doesn't change, only its height.
 
@@ -291,8 +312,17 @@ So the original setup **rewards the wrong behaviour on uneven ground**. Even a p
 ### What it doesn't do on its own
 
 - **It didn't make the robot complete more motions.** With the ground-relative ghost but no way to see the ground, the robot stopped falling, but its attempts ended by drifting away from the ghost instead. A blind robot still can't place its feet on uneven ground. That needed the height scan.
-- **It only fixes heights.** The ghost's legs keep the same joint angles as on flat ground, and its feet land in the same places on the floor plan. We tried three ways of also bending the ghost's legs to fit the ground (per-foot shifts, inverse kinematics, lifting a swinging foot over a nearby step). None of them made results better, so they are off. Moving *where* the ghost's feet land, away from step edges, hasn't been tried yet.
+- **It only fixes heights.** The ghost's legs keep the same joint angles as on flat ground, and its feet land in the same places on the floor plan. For the pose we tried three ways of also bending the ghost's legs to fit the ground (per-foot shifts, inverse kinematics, lifting a swinging foot over a nearby step). None of them made the pose better, so they are off for the pose. The punch does need the third one (next section). Moving *where* the ghost's feet land, away from step edges, hasn't been tried yet.
 - **Its effect on its own, alongside the height scan, hasn't been measured.** Every height-scan run used the ground-relative ghost; we never trained one with the original ghost.
+
+### A motion that barely lifts its foot (found with the punch)
+
+The pose lifts its stepping foot 23–28 cm, well above any step we test. The **Horse-stance punch** opens with a 47 cm side-step that lifts the foot only **6 cm**. On a taller step that caused two problems:
+
+- **The ghost's foot went through the step.** A foot lifted 6 cm can't pass over a 10 cm edge, so the ghost's foot passed through the riser, and the robot was being asked to do the same.
+- **The swinging foot was taken for a standing foot.** With so little lift, the support-height formula above still gave the swinging foot a lot of weight, so the whole ghost was pulled up as that foot passed over the upper level.
+
+Two options fix this, and the punch uses both: **swing clearance** (a lifted ghost foot is raised over nearby higher ground) and a **support-lift gain of 4** (a foot counts as lifted four times sooner). The pose doesn't need either.
 
 ---
 
@@ -444,7 +474,7 @@ Three things caused this:
 - **The released optimizer's state is kept** instead of starting fresh.
 - **No exploration bonus,** and the robot's random jitter is frozen at the released policy's level.
 
-This fixed the collapse. Flat-ground precision recovered step by step and is now as good as the released policy's (about 20 mm average body-position error).
+This fixed the collapse. Flat-ground precision recovered step by step, to the released policy's level (about 20 mm average body-position error) by early November. The later runs on harder ground are at 22–23 mm.
 
 ### Problem 2: new inputs would scramble the network
 
@@ -472,7 +502,8 @@ PBHC tightens σ (the strictness of the tracking scores) based on the average er
 
 ### Things we tried in training that didn't help
 
-- **Starting more attempts at the hard part of the motion.** Most failures happen 1–2 seconds in, so we started some training attempts there. It didn't improve attempts that start at the beginning of the motion, even after we stopped those attempts from moving robots down the curriculum.
+- **Starting more attempts at the hard part of the motion, on its own.** Most failures happen 1–2 seconds in, so we started some training attempts there. That alone didn't improve attempts that start at the beginning of the motion. It did work later, once **only** those attempts were allowed to move robots up and down the curriculum (Part 3).
+- **Bigger learning rates.** For the punch we tried rates 3–5 times larger to learn faster. From the same starting point it was worse on every terrain (10 cm steps 12% against 20%).
 - **Training longer.** This helped one seed and not the other. The one it didn't help had spent its extra training on easy rows because its curriculum level had been reset, which is what led to saving the levels with the checkpoint.
 
 ---
@@ -486,7 +517,7 @@ How you measure decides what you conclude, and several early conclusions turned 
 - **Every test attempt starts at the beginning of the motion**, so it has to get through the hard part. (Training starts attempts at random points in the motion, mostly in the easy parts, which made training numbers look much better than reality.)
 - **Each attempt ends in one of three ways:** **completed**, **fall**, or **drift** (more than 0.7 m from the ghost).
 - **The test terrains** are flat, rough (never trained on), and steps, slopes and bumps at five difficulties each: 17 settings in total.
-- **600 attempts per setting** (3 test seeds × 200), and **two training seeds** for important comparisons.
+- **600 attempts per setting** (3 test seeds × 200). Comparisons up to early November used two or three training seeds; the latest runs use one.
 
 ### Fair counting
 
@@ -501,15 +532,15 @@ Because steps were the hardest problem, the tests also record for every step att
 - whether the shin touched the step;
 - whether the robot's feet ended on the same level as the ghost's.
 
-These showed:
+These showed, for the runs up to early November:
 - **Nearly every step failure happens 1–2.5 seconds in,** during the weight shift and the big sideways step. A robot that gets past that point almost always finishes.
-- **The worst case is a step up directly in front of the robot.**
+- **The worst case was a step up directly in front of the robot** (10–25% falls at 10 cm). With the varied layouts of Part 3 that is down to 3%, and the weakest direction is now a raised part on the robot's left.
 - **Many "drift" endings on steps are really falls in progress:** they happen within half a second, with the pelvis already tipped about 30°, before the fall check (about 50°) triggers.
 - **Shin contact is not the cause:** it happens as often in successful attempts as in failed ones.
 
 ### Training seeds matter
 
-Two runs with identical settings except the seed differed by about **15 percentage points** on 10 cm steps. So a single run can't show an improvement smaller than that. Several ideas that looked worse on one run were inside that range, which is why we moved to two seeds per idea.
+Two runs with identical settings except the seed differed by about **15 percentage points** on 10 cm steps. So a single run can't show an improvement smaller than that. Several ideas that looked worse on one run were inside that range, which is why we moved to two seeds per idea. Much of that difference came from each run having its own ten step layouts (Part 3).
 
 ---
 
@@ -517,7 +548,7 @@ Two runs with identical settings except the seed differed by about **15 percenta
 
 | | Original PBHC | Our version |
 |---|---|---|
-| **Ground** | Flat only | Slopes, steps, bumps, rough; training curriculum up to 17 cm steps |
+| **Ground** | Flat only | Slopes, steps, bumps, rough; training curriculum up to 17 cm steps, 21° slopes and 8 cm bumps, with 24 columns of tiles and a random shift of the motion on its tile |
 | **Where the ghost is** | One fixed height per robot (world frame) | Moved onto the ground under its feet every step (ground-relative) |
 | **Feet reward** | World height | Height above the ground under each foot |
 | **What the actor sees** | Its own body + motion phase | + a 121-point ground scan, + a 91-point scan under each foot, + where the ghost is relative to it now and in the next 0.5 s |
@@ -526,7 +557,7 @@ Two runs with identical settings except the seed differed by about **15 percenta
 | **Fall vs drift** | Same penalty | Drift costs a quarter of a fall |
 | **Drift limit in training** | Shrinks to 0.3 m | Fixed at 0.7 m (same as testing) |
 | **σ (strictness)** | Adapts during training | Frozen |
-| **How it's trained** | From scratch, ~27 h | Fine-tuned gently from the released policy, ~1.7 h per stage |
+| **How it's trained** | From scratch, ~27 h | Fine-tuned gently from the released policy, in stages of 0.5–1.7 h |
 
 Actor inputs went from **380 numbers** (original) to **749 numbers**.
 
@@ -534,30 +565,60 @@ Actor inputs went from **380 numbers** (original) to **749 numbers**.
 
 ## Part 10: Results in plain words
 
-Percent of attempts that complete the whole motion, starting from the beginning (averages over training seeds):
+Percent of attempts that complete the whole motion, starting from the beginning. The "early November" row is a two-seed average; the "current best" row is one training seed:
 
 | | Flat | Rough (never trained on) | 12° slope | 18° slope | 4 cm bumps | 8 cm bumps | 10 cm step | 17 cm step |
 |---|---|---|---|---|---|---|---|---|
 | Original PBHC | 98.8 | 0 | 0 | 0 | 0.5 | 0 | 21.0 | 23.2 |
-| Our current best | 99.6 | 55.0 | 89.6 | 44.8 | 92.7 | 42.3 | 50.7 | 25.6 |
+| Ours, early November | 99.6 | 55.0 | 89.6 | 44.8 | 92.7 | 42.3 | 50.7 | 25.6 |
+| Ours, current best (10 November) | 99.7 | 80.5 | 98.3 | 85.8 | 96.7 | 82.0 | 64.5 | 49.8 |
 
-- **Flat ground:** just as good as the original, and just as precise (about 20 mm average body-position error, the same as the released policy).
-- **Slopes:** from failing every time to completing 9 in 10 attempts at 12°, and still most attempts at 15° (73%).
-- **Bumps:** from failing every time to completing 93% at 4 cm, and 70% at 6 cm.
-- **Rough ground it has never seen:** from 0% to 55%.
-- **Steps:** better, but still the weakest. About half the attempts complete at 10 cm and a quarter at 17 cm. Falls on steps are 6% at 10 cm and 16% at 17 cm.
+What changed between the last two rows: slope and bump maximums raised in the curriculum, 24 columns with placement jitter, and the level counted from early starts only (all in Part 3).
+
+- **Flat ground:** just as good as the original. Precision is slightly lower: about 23 mm average body-position error, against 20 mm for the released policy.
+- **Slopes:** from failing every time to completing 98% at 12°, 86% at 18° and 43% at 24°.
+- **Bumps:** from failing every time to completing 97% at 4 cm and 82% at 8 cm.
+- **Rough ground it has never seen:** from 0% to 80%.
+- **Steps:** better, but still the weakest. About two in three attempts complete at 10 cm and half at 17 cm.
+- **Falls are now rare:** none on flat, rough, bumps and slopes up to 18°; 1% on 10 cm steps, 3.5% on 17 cm steps, 5% on the 24° slope. When an attempt fails, the robot has usually lost the ghost, not fallen over.
+
+The same recipe trained 1,500 more iterations reads higher again on a shorter test (5 settings): 69% on 10 cm steps, 55% on 17 cm steps, 91% on the 18° slope, and 21.5 mm error on flat ground. Its full test is running.
 
 One oddity: the original PBHC scores higher on 17 cm steps than on 6.5 cm steps, which a blind robot shouldn't do. We haven't found out why, so treat its step numbers with care.
 
-**A second motion:** we are now applying the same recipe to the **Horse-stance punch**, to show the approach isn't specific to one motion. The released punch policy already handles steps well (78–83% at every height up to 17 cm), because the punch barely moves its feet, but it fails completely on slopes, bumps and rough ground. That run is finishing now.
+### A second motion: the Horse-stance punch
+
+To show the approach isn't specific to one motion, we applied it to the **Horse-stance punch**, starting from its released policy. Completed / fell, in percent:
+
+| Ground | Released punch | Ours (10 November) |
+|---|---|---|
+| Flat | 99.2 / 0.2 | 99.2 / 0 |
+| Rough (never trained on) | 0 / 22.3 | 88.3 / 0.2 |
+| 12° slope | 0 / 1.7 | 97.2 / 0 |
+| 18° slope | 0 / 5.2 | 85.3 / 0.3 |
+| 8 cm bumps | 0 / 9.2 | 86.7 / 0.2 |
+| 10 cm step | 18.8 / 14.7 | 66.8 / 0.8 |
+| 17 cm step | 20.3 / 11.5 | 48.5 / 1.0 |
+
+- **The punch is now level with the pose** on every kind of ground, with falls at or below 1%.
+- **The pose recipe alone was not enough.** With it, the punch completed only 10% of 10 cm steps. It needed the ghost changes for a low foot lift (Part 4) and the two curriculum changes (Part 3). Those curriculum changes then turned out to help the pose too.
+- **It is less precise on flat ground** than the released punch: 24 mm average body-position error against 17 mm. We haven't fixed that.
+- **A measuring trap:** the punch's motion file starts 1.17 m away from the origin. Unless the motion is re-centred on its tile, the robot stands away from the step edge and the released punch seems to complete about 80% of steps. An earlier version of this file reported that number; the correct one is about 20%.
+- A further 1,500 iterations read 69% on 10 cm steps, 54% on 17 cm steps, 89% on the 18° slope and 90% on 8 cm bumps on the shorter test.
+
+### Motions with no released policy
+
+PBHC ships five more motions without a trained policy: the Hooks punch, side kick, roundhouse kick, Charleston dance and Bruce Lee pose. We have just started on the first (Hooks punch), using the punch's terrain policy as the starting point. There are no results yet.
 
 ---
 
 ## Part 11: What still doesn't work, and why
 
-- **Steps, especially a step up directly in front.** At 10 cm, our best runs fall 10–25% of the time when the raised part is ahead, against 1–6% when it's to the side or behind. The trouble is the big sideways step 1–2 seconds in. The foot lands about 50 cm out, right at the edge of the body scan, and the foot scans only cover where the feet are now, not where they are going.
+- **Steps.** About a third of attempts on 10 cm steps and half on 17 cm steps still fail. The robot rarely falls now; it loses the ghost during the big sideways step 1–2.5 seconds in (and, for the punch, the step back at the end). The foot lands about 50 cm out, right at the edge of the body scan, and the foot scans only cover where the feet are now, not where they are going. The weakest cases are a raised part on the robot's left and starts with one foot already on the upper level.
 - **Starts that straddle the edge.** About half the test attempts start with one foot already on the step. Those complete far less often. A real robot would probably not start a kung-fu move standing across a step edge, so these should be reported separately.
 - **The small steps are ramps.** Steps below about 7.5 cm are slopes, not walls (Part 3).
+- **The punch is less precise on flat ground** than its released policy (24 mm against 17 mm).
+- **The newest results are one training seed.**
 - **A real robot would need to know where it is.** Both the ground map and the preview depend on that, and we haven't tested how much an imperfect estimate hurts the preview.
 - **Simulation only.** Nothing has run on a real robot.
 
@@ -567,7 +628,8 @@ One oddity: the original PBHC scores higher on 17 cm steps than on 6.5 cm steps,
 3. Reporting clean starts and edge-straddling starts separately.
 4. Turning the small ramps into real steps.
 5. Testing the preview with an imperfect position estimate.
-6. More motions: the kicks (long time on one leg) and the Bruce Lee pose (very deep crouch), and eventually one policy for several motions.
+6. More motions, which has started: the Hooks punch first, then the kicks (long time on one leg), the Charleston dance (20 seconds long) and the Bruce Lee pose (very deep crouch), and eventually one policy for several motions.
+7. Confirming the final recipe on a second training seed.
 
 ---
 
@@ -598,6 +660,7 @@ One oddity: the original PBHC scores higher on 17 cm steps than on 6.5 cm steps,
 | **Motion phase** | How far through the motion the robot is, from 0 to 1. |
 | **Observation** | The numbers the policy receives each step. |
 | **Optimizer** | The part of training that turns the reward signal into network updates. |
+| **Placement jitter** | A random shift (up to 15 cm) of the whole motion on its tile each attempt, so a step edge is met at many places. |
 | **Policy** | The robot's decision-maker (the actor network). |
 | **PPO** | The reinforcement-learning algorithm used to train the networks. |
 | **Privileged information** | Information only the critic gets, which a real robot wouldn't have. |
@@ -609,6 +672,7 @@ One oddity: the original PBHC scores higher on 17 cm steps than on 6.5 cm steps,
 | **σ (sigma)** | How strict a tracking score is: smaller means stricter. |
 | **Step (time)** | One decision of the policy; there are 50 per second. |
 | **Support height** | The height we move the ghost to each step: roughly the higher ground under its weight-bearing feet. |
+| **Swing clearance** | Raising a lifted ghost foot over nearby higher ground, for motions that lift the foot less than the step height. |
 | **Termination** | Cutting an attempt off early (fall or drift). |
 | **Tracking** | Making the robot's body follow the reference motion. |
 | **World frame** | Positions measured from one fixed point and height for the whole simulated world. |
