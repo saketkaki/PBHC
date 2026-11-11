@@ -3,12 +3,13 @@
 # terrain, put them side by side, and attach them to the W&B runs.
 #
 # usage (from the repo root, env `pbhc` active, a display available):
-#   [SECONDS_PER_CLIP=10] [OUT=DIR] [CAM_OFFSET="2.2 -1.2 -0.3"] [NO_WANDB="TAG ..."] \
+#   [SECONDS_PER_CLIP=10] [OUT=DIR] [CAM_OFFSET="2.2 -1.2 -0.3"] [NO_WANDB="TAG ..."] [NO_A=1] \
 #       scripts/record_pilot_videos.sh TAG=RUN_DIR|CKPT [TAG=RUN_DIR|CKPT ...]
 #   e.g. scripts/record_pilot_videos.sh B=logs/.../model_53500.pt C=logs/.../model_53500.pt E=logs/.../model_53500.pt
 # (a run directory means its latest checkpoint; pass checkpoint files to compare at equal iterations)
 # Known tags get a description in the caption (B naive ref, C ground-relative ref, E height scan, E1/E2/E2pf for
 # rounds 1 and 2 of E, E2c for the continuation of E2, E2c2 and E2ik for its plain and leg-IK continuations, F2s1/F2s2 for the fall-penalty runs with the 0.7 m drift cutoff, F3s1/F3s2 for perception v2 from F2s2, CTRL/SWING for the control and swing-clearance continuations, CONT/REFLU/PREVIEW for the plain, reference-lookup and reference-preview continuations of F3s2, PREVREF/PREVIEW_s3/PREVIEW_s4/EARLY/PREVLONG/EARLYLONG_s2/EARLYLONG_s3/PREVMORE_s2/PREVMORE_s4/STEP17_s2/STEP17_s4/HARD_s2/HARD_s4 for the preview variants, PUNCH_released/PUNCH_s2 for the Horse-stance punch). Tags listed in NO_WANDB are recorded but nothing is uploaded to their W&B runs.
+# NO_A=1 leaves out the released pose (A), for the clips of another motion.
 # The camera is low and to the side (CAM_OFFSET, relative to the start root) so steps and bumps show, and the
 # height-scan points are drawn on the ground (blue) in every clip to show the terrain shape.
 set -euo pipefail
@@ -48,6 +49,8 @@ declare -A DESCRIPTION=([B]="naive ref" [C]="ground-relative ref" [E]="height sc
                         [STEP17_s4]="F3s2 + reference preview, step curriculum to 17 cm, seed 4"
                         [HARD_s2]="F3s2 + reference preview, curriculum to 17 cm steps, 21 deg tilt, 8 cm bumps, seed 2"
                         [HARD_s4]="F3s2 + reference preview, curriculum to 17 cm steps, 21 deg tilt, 8 cm bumps, seed 4"
+                        [HONEST_s2]="curriculum to 17 cm steps, 21 deg tilt, 8 cm bumps, varied step layouts, level from early starts, seed 2"
+                        [PUNCH_BEST]="Horse-stance punch, pose recipe + swing clearance, varied step layouts, level from early starts, seed 2"
                         [PUNCH_released]="released PBHC Horse-stance punch (zero-shot)"
                         [PUNCH_s2]="Horse-stance punch + terrain-aware recipe (perception v2, reference preview), seed 2")
 # released checkpoints predate the terrain-aware options: place them on the terrain feature like the trained runs
@@ -88,8 +91,10 @@ TERRAINS=(
   "step_d15|terrain.terrain_types=[step] terrain.terrain_proportions=[1.0] terrain.fixed_difficulty=1.5|step 13.5 cm"
   "step_d10|terrain.terrain_types=[step] terrain.terrain_proportions=[1.0] terrain.fixed_difficulty=1.0|step 10 cm"
   "step_d05|terrain.terrain_types=[step] terrain.terrain_proportions=[1.0] terrain.fixed_difficulty=0.5|step 6.5 cm"
+  "tilt_d15|terrain.terrain_types=[tilt] terrain.terrain_proportions=[1.0] terrain.fixed_difficulty=1.5|tilt 18 deg"
   "tilt_d10|terrain.terrain_types=[tilt] terrain.terrain_proportions=[1.0] terrain.fixed_difficulty=1.0|tilt 12 deg"
   "tilt_d05|terrain.terrain_types=[tilt] terrain.terrain_proportions=[1.0] terrain.fixed_difficulty=0.5|tilt 6 deg"
+  "bumps_d20|terrain.terrain_types=[bumps] terrain.terrain_proportions=[1.0] terrain.fixed_difficulty=2.0|bumps 8 cm"
   "bumps_d10|terrain.terrain_types=[bumps] terrain.terrain_proportions=[1.0] terrain.fixed_difficulty=1.0|bumps 4 cm"
   "flat|terrain.terrain_types=[flat] terrain.terrain_proportions=[1.0]|flat"
 )
@@ -97,9 +102,12 @@ TERRAINS=(
 for entry in "${TERRAINS[@]}"; do
     IFS='|' read -r name overrides label <<< "$entry"
     read -r -a ov <<< "$overrides"
-    record "$A_CKPT" --out "$OUT/A_$name.mp4" --seconds "$SECONDS_PER_CLIP" \
-        --label "A: released (flat-trained), $label" "${VIEW[@]}" "${A_FLAGS[@]}" "${ov[@]}"
-    clips=("$OUT/A_$name.mp4")
+    clips=()
+    if [ -z "${NO_A:-}" ]; then
+        record "$A_CKPT" --out "$OUT/A_$name.mp4" --seconds "$SECONDS_PER_CLIP" \
+            --label "A: released (flat-trained), $label" "${VIEW[@]}" "${A_FLAGS[@]}" "${ov[@]}"
+        clips+=("$OUT/A_$name.mp4")
+    fi
     for tag in "${TAGS[@]}"; do
         run=${WANDB_RUN[$tag]}
         read -r -a extra <<< "${EXTRA[$tag]:-}"
@@ -112,7 +120,8 @@ done
 
 # attach the side-by-side comparisons to every run
 runs=(); for tag in "${TAGS[@]}"; do [ -n "${WANDB_RUN[$tag]}" ] && runs+=("${WANDB_RUN[$tag]}"); done
-python - "$OUT" "A | ${TAGS[*]}" "${runs[@]}" <<'EOF'
+caption="${TAGS[*]}"; [ -z "${NO_A:-}" ] && caption="A | $caption"
+python - "$OUT" "$caption" "${runs[@]}" <<'EOF'
 import sys
 from pathlib import Path
 import wandb
