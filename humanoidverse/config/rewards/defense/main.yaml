@@ -1,0 +1,19 @@
+# @package _global_
+
+# Guard tracking (motion_tracking/main) as a style prior, plus the defense outcomes. Scales are multiplied by dt
+# (0.02): an event term of -500 costs 10 once; all tracking terms together earn at most ~0.2 per step.
+
+defaults:
+  - /rewards/motion_tracking/main
+  - _self_
+
+rewards:
+  reward_scales:
+    feet_air_time: 0.0 # the guard reference never lifts a foot
+    defense_hit: -500.0
+    defense_block: 100.0
+    defense_evade: 100.0
+    defense_striker_proximity: -10.0
+
+  adaptive_tracking_sigma:
+    enable: False # a static reference would shrink sigma until any defensive move loses all tracking reward

@@ -1,0 +1,44 @@
+# @package _global_
+
+# Defense against a second G1 (see DEFENSE_MANEUVERS.md): motion tracking of a static guard
+# (robot.motion.motion_file = .../defender_guard.pkl) while a kinematic attacker replays the attack dataset.
+
+defaults:
+  - motion_tracking
+
+env:
+  _target_: humanoidverse.envs.defense.defense.LeggedRobotDefense
+  config:
+    max_episode_length_s: 20 # about 10 attacks
+    termination:
+      terminate_when_motion_end: False # the guard is held past the end of its 2 s clip
+    termination_scales:
+      termination_motion_far_threshold: 0.6
+    termination_curriculum:
+      terminate_when_motion_far_curriculum: False
+
+    defense:
+      attack_file: g1_attack_dataset/PBHC_attacks/motion_data/attacks/attacks_all.pkl # file or directory of clips
+      attacks: null # subset of attack names, e.g. [jab, cross]; null = all 8
+      keypoints: [pelvis, head_link, left_elbow_link, right_elbow_link, left_hand_link, right_hand_link,
+                  left_knee_link, right_knee_link, left_ankle_roll_link, right_ankle_roll_link]
+      keypoint_history: # attacker_keypoints: newest first; obs_dims.attacker_keypoints = keypoints x 3 x length
+        length: 10
+        stride: 2 # control steps between frames (10 x 2 covers 0.36 s; a jab takes 0.14-0.2 s from onset to impact)
+      placement_noise: # per clip, around the defender's root and heading at the clip start
+        yaw_deg: 0.0
+        range: 0.0 # [m] the attacker stands up to this much closer or farther
+      standoff: 0.25 # [m] the attacker stands this much farther back in guard and steps in during the strike (onset to impact), so the guards don't touch before an attack
+      blend_time: 0.25 # [s] ease the attacker's pose from the end of one clip into the next (clips start with >= 0.35 s of guard)
+      hit_radius: 0.08 # [m] striker path to the target point (fist radius ~4 cm)
+      block_radius: 0.07 # [m] striker path to a defender forearm axis (elbow to hand); 0 disables blocks
+      threat_lead_time: 0.1 # [s] the threat window starts this long before the onset and ends at the recovered frame
+      tracking_relax: 0.5 # guard-tracking rewards are scaled by (1 - tracking_relax) in the threat window
+      proximity_sigma: 0.1 # [m] defense_striker_proximity reward
+      tti_clip: 1.0 # [s] time to impact in attack_privileged
+      terminate_on_hit: False
+      outcome_log_decay: 0.999 # per step, for the logged hit / block / evade rates
+      debug_draw: True # env 0 in the viewer: striker, target, aim point, outcome markers (and the attacker skeleton without attacker_actor)
+      outcome_marker_time: 1.0 # [s] how long the viewer shows where the last attack ended
+      blind_actor: none # none, or for evaluation: freeze (the actor sees the attacker held in its guard before each strike) or zero
+      attacker_actor: auto # draw the attacker as a G1 (visual-only actors, no collision); auto = only with a viewer

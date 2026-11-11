@@ -16,12 +16,30 @@ from pathlib import Path
 import time
 
 
+def _origin_matrix(element):
+    """ 4x4 transform of a URDF element's <origin xyz rpy> (identity without one); rpy are fixed x, y, z rotations. """
+    origin = element.find('origin')
+    xyz = [float(v) for v in origin.get('xyz', '0 0 0').split()] if origin is not None else [0., 0., 0.]
+    r, p, y = [float(v) for v in origin.get('rpy', '0 0 0').split()] if origin is not None else [0., 0., 0.]
+    rx = np.array([[1, 0, 0], [0, np.cos(r), -np.sin(r)], [0, np.sin(r), np.cos(r)]])
+    ry = np.array([[np.cos(p), 0, np.sin(p)], [0, 1, 0], [-np.sin(p), 0, np.cos(p)]])
+    rz = np.array([[np.cos(y), -np.sin(y), 0], [np.sin(y), np.cos(y), 0], [0, 0, 1]])
+    m = np.eye(4)
+    m[:3, :3], m[:3, 3] = rz @ ry @ rx, xyz
+    return m
+
+
+def _matrix_rpy(R):
+    return np.arctan2(R[2, 1], R[2, 2]), np.arcsin(np.clip(-R[2, 0], -1., 1.)), np.arctan2(R[1, 0], R[0, 0])
+
+
 class IsaacGym(BaseSimulator):
     def __init__(self, config, device):
         super().__init__(config, device)
         self.simulator_config = config.simulator.config
         self.robot_config = config.robot
         self.visualize_viewer = False
+        self.visual_link_assets = []  # (body name, asset), see add_visual_link_actors
         if config.save_rendering_dir is not None:
             self.save_rendering_dir = Path(config.save_rendering_dir)
 
@@ -283,6 +301,62 @@ class IsaacGym(BaseSimulator):
         self.gym.set_actor_rigid_body_properties(env_ptr, robot_handle, body_props, recomputeInertia=True)
         self.envs.append(env_ptr)
         self.robot_handles.append(robot_handle)
+        for name, asset in self.visual_link_assets:
+            handle = self.gym.create_actor(env_ptr, asset, start_pose, f'visual_{name}', env_id, 0, 0)
+            self.gym.set_rigid_body_color(env_ptr, handle, 0, gymapi.MESH_VISUAL, gymapi.Vec3(*self.visual_link_color))
+
+    def add_visual_link_actors(self, body_names, color):
+        """ Before create_envs: add to every env, after the robot, one actor per robot body carrying that body's visual
+        meshes (with those of its fixed-joint children) and nothing else: no joints, no collision shapes, no gravity.
+        Together they are a kinematic copy of the robot that never interacts with anything, posed by writing
+        visual_root_states [num_envs, len(body_names), 13] and calling set_visual_actor_states. """
+        import tempfile
+        import xml.etree.ElementTree as ET
+        urdf_path = os.path.join(self.robot_config.asset.asset_root, self.robot_config.asset.urdf_file)
+        urdf_dir = os.path.dirname(os.path.abspath(urdf_path))
+        root = ET.parse(urdf_path).getroot()
+        links = {link.get('name'): link for link in root.findall('link')}
+        fixed_children = {}
+        for joint in root.findall('joint'):
+            if joint.get('type') == 'fixed':
+                fixed_children.setdefault(joint.find('parent').get('link'), []).append((joint.find('child').get('link'), _origin_matrix(joint)))
+
+        def visuals(link_name, transform):  # visual elements of the link and its fixed-joint descendants, in the link frame
+            for visual in links[link_name].findall('visual'):
+                yield visual, transform @ _origin_matrix(visual)
+            for child, joint_transform in fixed_children.get(link_name, []):
+                yield from visuals(child, transform @ joint_transform)
+
+        out_dir = tempfile.mkdtemp(prefix='visual_links_')
+        mesh_dirs = set()
+        asset_options = gymapi.AssetOptions()
+        asset_options.disable_gravity = True
+        asset_options.flip_visual_attachments = bool(self.robot_config.asset.flip_visual_attachments)
+        for name in body_names:
+            link = ET.Element('robot', name=f'visual_{name}')
+            body = ET.SubElement(link, 'link', name='base')
+            inertial = ET.SubElement(body, 'inertial')
+            ET.SubElement(inertial, 'mass', value='1.0')
+            ET.SubElement(inertial, 'inertia', ixx='0.01', ixy='0', ixz='0', iyy='0.01', iyz='0', izz='0.01')
+            for visual, transform in visuals(name, np.eye(4)):
+                geometry = visual.find('geometry')
+                for mesh in geometry.iter('mesh'):
+                    mesh_dirs.add(mesh.get('filename').split('/')[0])
+                v = ET.SubElement(body, 'visual')
+                ET.SubElement(v, 'origin', xyz=' '.join(map(str, transform[:3, 3])), rpy=' '.join(map(str, _matrix_rpy(transform[:3, :3]))))
+                v.append(geometry)
+            ET.ElementTree(link).write(os.path.join(out_dir, f'{name}.urdf'))
+        for d in mesh_dirs:  # mesh paths are relative to the robot's URDF
+            os.symlink(os.path.join(urdf_dir, d), os.path.join(out_dir, d))
+        for name in body_names:
+            self.visual_link_assets.append((name, self.gym.load_asset(self.sim, out_dir, f'{name}.urdf', asset_options)))
+        self.visual_link_color = color
+
+    def set_visual_actor_states(self):
+        """ Apply visual_root_states (add_visual_link_actors) to the simulation. """
+        ids = self.visual_actor_ids.flatten()
+        self.gym.set_actor_root_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self.all_root_states),
+                                                     gymtorch.unwrap_tensor(ids), len(ids))
 
     def _process_rigid_shape_props(self, props, env_id):
         """ Callback allowing to store/change/randomize the rigid shape properties of each environment.
@@ -611,6 +685,11 @@ class IsaacGym(BaseSimulator):
             self.num_envs, num_actors, actor_root_state.shape[-1]
         )[..., 0, :]
         self.base_quat = self.robot_root_states[..., 3:7] # isaacgym uses xyzw
+        # actor indices: the robot is the first actor of each env, its visual link actors follow it
+        self.robot_actor_ids = torch.arange(self.num_envs, dtype=torch.int32, device=self.device) * num_actors
+        num_visual = len(self.visual_link_assets)
+        self.visual_actor_ids = self.robot_actor_ids[:, None] + 1 + torch.arange(num_visual, dtype=torch.int32, device=self.device)
+        self.visual_root_states = self.all_root_states.view(self.num_envs, num_actors, actor_root_state.shape[-1])[:, 1:1 + num_visual]
 
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.dof_pos = self.dof_state.view(self.num_envs, -1, 2)[..., 0]
@@ -640,8 +719,12 @@ class IsaacGym(BaseSimulator):
         self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(torques))
 
     def set_actor_root_state_tensor(self, set_env_ids, root_states):
-        set_env_ids_int32 = set_env_ids.to(torch.int32)
-        
+        set_env_ids_int32 = self.robot_actor_ids[set_env_ids.long()]
+        if len(self.visual_link_assets) > 0:
+            # resend the visual actors too: they are set earlier in the step, and of several indexed sets of root
+            # states before a simulation step only the last one is guaranteed to take effect
+            set_env_ids_int32 = torch.cat([set_env_ids_int32, self.visual_actor_ids.flatten()])
+
         self.gym.set_actor_root_state_tensor_indexed(self.sim, 
                                                     gymtorch.unwrap_tensor(root_states), 
                                                     gymtorch.unwrap_tensor(set_env_ids_int32), 
@@ -654,7 +737,7 @@ class IsaacGym(BaseSimulator):
                                                        gymapi.ENV_SPACE)
 
     def set_dof_state_tensor(self, set_env_ids, dof_states):
-        set_env_ids_int32 = set_env_ids.to(torch.int32)
+        set_env_ids_int32 = self.robot_actor_ids[set_env_ids.long()]
         self.gym.set_dof_state_tensor_indexed(self.sim, 
                                              gymtorch.unwrap_tensor(dof_states), 
                                              gymtorch.unwrap_tensor(set_env_ids_int32), 
