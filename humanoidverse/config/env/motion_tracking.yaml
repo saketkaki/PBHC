@@ -83,7 +83,12 @@ env:
     terrain_aware:
       ground_relative_ref: False # shift the reference by the local ground height under its feet
       recenter_motion_xy: False # place each motion's start xy at the tile centre (where terrain features are); use for all terrain runs
+      placement_jitter: 0.0 # [m] shift the motion by a random xy offset in +-this per episode. Without it every episode on a
+                            # tile has the same step edge or slope under the feet (a tile holds one layout)
       support_height_tau: 0.02 # [m] softness of the soft-max over the supporting feet
+      support_lift_gain: 1.0 # a reference foot lifted by h counts as h * gain lower when choosing the supporting foot. With 1, a
+                             # swinging foot lifted less than a step is high takes over the support as soon as it is above
+                             # the upper level (low steps, e.g. the punch's 6 cm lift); 4 keeps it out for steps up to 4 x lift
       per_foot_ref: False # also shift each leg towards the ground under its own foot (ankle 1, knee 0.5)
       swing_clearance: False # raise a lifted reference foot (ankle 1, knee 0.5) by how far the highest ground within
                              # swing_clearance_radius lies above its own ground, so it does not sweep through a riser
@@ -128,6 +133,8 @@ env:
         max_time: 1.5 # [s] start uniformly in [0, max_time] (default: anywhere in the motion)
         terrain_types: [step]
         keep_level_on_failure: False # an early start that fails does not move the robot down the terrain curriculum
+        levels_only: False # on these terrain types only early starts move the curriculum level, so the level measures the
+                           # motion from its opening (other starts skip the opening, complete easily and inflate the level)
       privileged_height_scan: # used by the critic-only `privileged_height_scan` observation (exact lookup, no noise)
         x_range: [-0.7, 0.7] # [m] in the robot heading frame
         y_range: [-0.7, 0.7]

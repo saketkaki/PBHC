@@ -2,10 +2,10 @@
 
 Final project: extend PBHC (KungfuBot, NeurIPS 2025) so a humanoid can perform highly dynamic motions on non-flat ground.
 
-**Status (2026-11-04):**
+**Status (2026-11-10):**
 - The Horse-stance pose policy now handles tilts, bumps, held-out rough ground and steps, while matching the released policy on flat ground.
-- Steps are the weakest terrain, and a step up directly ahead is the main remaining failure.
-- A second motion (Horse-stance punch) is training.
+- Steps are the weakest terrain, but falls are rare: the usual failure is losing the motion in the opening step.
+- A second motion (Horse-stance punch, one seed) now matches the pose on every terrain tested (10 cm steps 69%, 18° tilt 89–91%, 8 cm bumps 83–90%, falls below 1%). It needed three more changes: a reference that clears step edges, a curriculum measured from the motion start, and far more varied step layouts in training.
 
 Every run, with its settings, results and problems, is in [LOG.md](LOG.md). The original plan from 2026-10-27 is kept in the appendix.
 
@@ -122,12 +122,15 @@ Completion rate (%), from the motion start, 3 evaluation seeds × 200 episodes; 
 | + fall penalty, 0.7 m cutoff (F2, 2 seeds) | 95.3 | 20.2 | 63.6 | 10.5 | 58.4 | 8.2 | 24.6 | 8.9 | 2.8 | 1.7 | 32.2 mm |
 | + perception v2 (F3, 2 seeds) | 97.3 | 18.9 | 82.7 | 31.8 | 71.9 | 15.1 | 34.2 | 9.3 | 4.4 | 1.6 | 28.2 mm |
 | + reference preview (3 seeds) | 99.2 | 51.1 | 85.7 | 36.2 | 88.6 | 35.8 | 54.9 | 38.1 | 23.2 | 13.4 | 22.2 mm |
-| + 3,250 more iterations (2 seeds) | **99.9** | **55.5** | **91.7** | 37.2 | 90.6 | 36.2 | 59.7 | 45.1 | 29.2 | 16.8 | **20.4 mm** |
-| **+ step curriculum to 17 cm (2 seeds, current best)** | 99.6 | 55.0 | 89.6 | **44.8** | **92.7** | **42.3** | **62.3** | **50.7** | **36.2** | **25.6** | 20.6 mm |
+| + 3,250 more iterations (2 seeds) | **99.9** | 55.5 | 91.7 | 37.2 | 90.6 | 36.2 | 59.7 | 45.1 | 29.2 | 16.8 | **20.4 mm** |
+| + step curriculum to 17 cm (2 seeds) | 99.6 | 55.0 | 89.6 | 44.8 | 92.7 | 42.3 | 62.3 | 50.7 | 36.2 | 25.6 | 20.6 mm |
+| + tilt curriculum to 21°, bumps to 8 cm (2 seeds, 1,000 iterations) | 99.7 | 71.6 | **96.2** | 73.3 | **95.9** | **67.6** | 70.2 | 58.1 | 44.8 | 32.7 | 22.0 mm |
+| + varied layouts: 24 terrain columns, placement jitter (seed 2, 1,000 iterations) | 98.8 | 75.3 | 94.0 | 80.3 | 95.3 | 67.5 | 74.5 | 60.3 | 53.5 | 43.0 | 22.9 mm |
+| **+ curriculum level from early starts only (seed 2, 1,000 iterations, current best recipe)** | 99.7 | **80.5** | **98.3** | **85.8** | **96.7** | **82.0** | **79.7** | **64.5** | **56.5** | **49.8** | 23.1 mm |
 
-Fall rates of the current best: 0% on flat, rough and tilts up to 12°; 0.8% on 15° tilts and 8 cm bumps. On steps it falls 1.6, 6.3, 13.3 and 16.1% at 6.5, 10, 13.5 and 17 cm.
+Fall rates of the current best: 0% on flat, rough, bumps up to 8 cm and tilts up to 18°. On steps it falls 0.2, 0.8, 1.5 and 3.5% at 6.5, 10, 13.5 and 17 cm. The last two rows are one training seed (seed 2); the two-seed row above them reads 99.7 / 64.2 / 96.3 / 71.7 / 96.0 / 65.3 / 68.0 / 59.8 / 48.0 / 35.3 for that seed. A further 1,500 iterations of the same recipe (`ft33`, quick eval only) read 69.0% on 10 cm steps, 55.2% on 17 cm steps, 90.7% on 18° tilt, 82.5% on 8 cm bumps and 21.5 mm flat error.
 
-- **Flat error** is the root-relative body position error on flat ground, as PBHC's E_mpbpe. The current best matches the released policy.
+- **Flat error** is the root-relative body position error on flat ground, as PBHC's E_mpbpe. The last three rows are 2–3 mm worse than the released policy; the rows before them match it.
 - **The B and C rows** come from the first fine-tuning recipe, which damaged the released policy (Section 4). They show what the reference change does on its own, not a tuned baseline.
 - **Released policy on steps:** its completion rises with step height, which a blind policy shouldn't do. The cause hasn't been checked, so treat that row with care.
 - **Training seeds** differ by up to about 15 points on 10 cm steps, so differences of a few points between rows are not meaningful.
@@ -136,13 +139,27 @@ Fall rates of the current best: 0% on flat, rough and tilts up to 12°; 0.8% on 
 
 | Terrain | Holds | Breaks |
 |---|---|---|
-| Tilt | 15° (72.6%) | 18° (44.8%); 24° fails for every policy (5%) |
-| Bumps | 6 cm (69.9%) | 8 cm (42.3%) |
-| Steps | 10 cm (50.7%) | 11.8 cm (46.7%); 17 cm 25.6% |
+| Tilt | 18° (85.8%) | 24° (43.3%) |
+| Bumps | 8 cm (82.0%), the hardest tested | – |
+| Steps | 13.5 cm (56.5%) | 17 cm (49.8%; 55.2% after 1,500 more iterations) |
 
-**Second motion (Horse-stance punch):**
-- The released punch, zero-shot, completes 78–83% of steps up to 17 cm, because the punch barely moves its feet. It completes 0% on tilt, bumps and rough.
-- Fine-tuning it with the full recipe (`ft18_P_preview_s2`) finishes on 2026-11-04 evening; results go into [LOG.md](LOG.md).
+**Second motion (Horse-stance punch).** Completion rate (%) / falls (%), one training seed. Both checkpoints are evaluated with the motion recentred on its tile; the last column has only the quick eval (5 settings):
+
+| Terrain | Released punch | First recipe (`ft18`, 6,500 it) | Current best (`ft32`, 18,250 it in total) |
+|---|---|---|---|
+| Flat | 99.2 / 0.0 | 99.3 / 0.0 | 100.0 / 0.0 |
+| Tilt 18° | 0.0 / 5.2 | 12.8 / 4.5 | **88.8** / 0.0 |
+| Bumps 8 cm | 0.0 / 9.2 | 37.2 / 1.3 | **90.3** / 0.0 |
+| Steps 10 cm | 18.8 / 14.7 | 9.8 / 6.2 | **69.2** / 0.3 |
+| Steps 17 cm | 20.3 / 11.5 | 5.8 / 15.3 | **53.8** / 0.8 |
+| Flat error | **17.3 mm** | 25.4 mm | 25.2 mm |
+
+What the punch needed beyond the pose recipe (details in LOG.md, 2026-11-10):
+- **A reference that clears step edges.** The punch's opening side-step lifts the foot only 6 cm (the pose: 23 cm), so on a taller step the reference foot passed through the riser, and the swinging foot was taken as the supporting foot mid-step. `swing_clearance=True` and `support_lift_gain=4` fix both.
+- **A curriculum measured from the motion start.** Training starts episodes anywhere in the motion, and only the opening is hard on steps. `early_start` (70% of episodes on terrain tiles start in the first 0.8 s) with `levels_only=True` (only those episodes move the level).
+- **Varied layouts.** A step tile has one edge, and a run had 2–3 step tiles per level, each always met at the same place. `terrain.num_cols=24` and `placement_jitter=0.15` took 10 cm steps from 24 to 46% in 750 iterations.
+- **A trap with this motion:** the motion file starts 1.17 m from the origin. Without `recenter_motion_xy` the robot stands away from the step edge, and the released punch then seems to complete about 80% of steps.
+- **Open:** flat error is 8 mm worse than the released punch.
 
 ## 4. What works and what does not
 
@@ -155,23 +172,31 @@ Fall rates of the current best: 0% on flat, rough and tilts up to 12°; 0.8% on 
 | | Perception v2: wide scan, foot scans, exact lookup | Tilt 12° 64 → 83%, tilt 18° 11 → 32%, bumps better. A control with the same training but old observations got worse on tilt and bumps |
 | | Robot-frame reference preview (C4) | The largest gain on every terrain, across 3 seeds |
 | | Step curriculum to 17 cm | Two-seed mean +6 to +9 points at every step height ≥ 10 cm (seed 4 +8 to +14; seed 2 mainly at 17 cm, +9.5); bumps 8 cm and tilt 18° up 6–8 points |
+| | Tilt curriculum to 21°, bumps to 8 cm | Better on all 16 terrain settings for both seeds after 1,000 iterations: tilt 18° 45 → 73%, bumps 8 cm 42 → 68%, rough 55 → 72%, steps +6 to +9 points; flat error +1.4 mm |
+| | Varied layouts: 24 terrain columns + placement jitter | Punch: 10 cm steps 24 → 46% in 750 iterations. Pose: rough +11, tilt 18° +9, steps ≥ 13.5 cm +5 to +8, mid steps unchanged |
+| | Curriculum level from early starts only | The level stops being inflated by episodes that skip the opening. Punch: 10 cm steps 19.5 → 24% in 750 iterations. Pose: best or level on all 17 settings after 1,000 iterations (bumps 8 cm +14.5, tilt 24° +13, 17 cm steps +7) |
+| | Swing clearance + support-lift gain (punch) | Needed for a motion whose step lifts the foot less than the step height; tilt 18° 35 → 51%, steps only with the two rows above |
 | | Fair evaluation | Fixed over-counting of early failures (A on 10 cm steps 13% → 37% episode length) |
-| **Does not work** | Per-foot reference | Fewer falls, but much worse on tilts (57% vs 82% on 6°) |
+| **Does not work** | Higher learning rates (actor 1e-4, critic 3e-4; punch) | Worse on every terrain than the gentle rates from the same checkpoint (10 cm steps 11.8 against 19.5%) |
+| | Per-foot reference | Fewer falls, but much worse on tilts (57% vs 82% on 6°) |
 | | Leg-IK reference | Swapping it in or out at evaluation changes results by 1–4 points; its run's tilt gain came from training variance |
 | | Swing clearance | No better than the plain continuation; worse on tilt |
 | | min3 lookup for the reference | Worse everywhere |
 | | Fall penalty with the 0.3 m cutoff | Never fired: training had no falls |
 | | Preview in the reference frame | No gain with a single motion |
 | | Preview to 1.0 s | Steps and tilt worse in all 3 runs |
-| | Early starts on step tiles | Even without curriculum demotion, no gain from the motion start |
+| | Early starts on step tiles, with all starts moving the level | Even without curriculum demotion, no gain from the motion start (they work once only early starts move the level, see above) |
 | | Shin-contact penalty (idea) | Shin contact is as common in completed episodes as in failed ones; dropped before building |
-| **Mixed** | Training longer | Helps a run whose curriculum is on hard tiles (s2: 10 cm steps 46 → 54%), not one stuck on easy tiles (s4) |
+| | Training longer | Helps a run whose curriculum is on hard tiles (s2: 10 cm steps 46 → 54%), not one stuck on easy tiles (s4) |
 | | Scan noise | Policies tolerate noise, dropout, map shift and delay; a 5 cm height offset costs 8–15 points |
 
 ## 5. Open problems and next steps
 
 **Steps are the weakest terrain.**
-- **Where they fail:** nearly all failures happen in the 1–2.5 s weight shift and big right-foot step of the horse stance. A step up directly ahead is the main failure: at 10 cm the current runs fall 10–25% of the time there, against 1–6% in the other directions. At 17 cm, seed 4 also falls 30% of the time with the raised side on the right.
+- **Training saw too few layouts** (found 2026-11-10): one edge per step tile, 2–3 step tiles per level, every episode at the tile centre. This is the likely cause of each training seed having its own weak step direction; the direction numbers below are from before the varied-layout runs.
+- **Where they fail (current best, seed 2):** in the 1–2.5 s weight shift and big step of the horse stance, and almost always by losing the motion, not by falling (10 cm steps: 34.7% drift, 0.8% falls).
+  - Worst with the raised side on the robot's left (48% not completed at 10 cm, against 24% on the right) and when one reference foot starts on the upper level (48%, against 17% with none).
+  - Before the varied-layout runs the main failure was a fall with the step up directly ahead (10–25% falls at 10 cm); that is now 3%.
 - **Starting layout:** about half the evaluation starts straddle the edge, and those complete far less often.
 - **Small steps are ramps:** the trimesh conversion turns height changes under 7.5 cm per 10 cm cell into ramps (`slope_treshold: 0.75`), so the 6.5 cm step and the lowest curriculum rows are not walls.
 
@@ -179,18 +204,17 @@ Fall rates of the current best: 0% on flat, rough and tilts up to 12°; 0.8% on 
 1. **Foothold scan:** a small height patch around each reference foot 0.3–0.5 s ahead. The big step lands about 50 cm out, at the edge of the body scan, and the foot scans only cover where the feet are now.
 2. **Move reference landing points away from step edges** horizontally (not only in height, which every reference variant so far changed).
 3. **Report start layouts separately** (clean starts vs straddling the edge), and decide whether training should include straddle starts.
-4. **Make small steps real walls** (`slope_treshold` ≈ 0.5), and raise the tilt and bumps ceilings now that those terrains have headroom.
+4. **Make small steps real walls** (`slope_treshold` ≈ 0.5). (The tilt and bump ceilings were raised on 2026-11-10.)
 5. **Preview robustness:** add noise and drift to the robot position estimate the preview uses, since deployment needs localisation.
 6. **More motions:**
-   - the punch result;
-   - the side and roundhouse kicks (long single-leg phases) and Bruce Lee pose (deep crouch, 1 m of travel), which have no released checkpoints;
+   - the motions without a released checkpoint, starting with the Hooks punch (feet barely move), then the side and roundhouse kicks (long single-leg phases), the Charleston dance (20 s) and the Bruce Lee pose (deep crouch, 1 m of travel);
    - one terrain-aware policy for several motions, where the reference-frame preview could carry the motion content without localisation.
 
-Keep 2 training seeds per variant: single-seed comparisons on steps cannot detect changes smaller than about 15 points.
+Seeds: with the old terrain (2–3 step layouts per level) training seeds differed by up to about 15 points on steps. Since 2026-11-10 changes are tested on seed 2 only; confirm the final recipe on a second seed before quoting small differences.
 
 **Limitations compared with the paper:**
 - The preview needs an estimate of the robot's position relative to the motion start, and the height scan needs an elevation map. The original policy needs neither.
-- Everything is in simulation, and so far with one motion.
+- Everything is in simulation. The punch is the only second motion so far, and the current best pose and punch are one training seed each.
 
 ## 6. Implementation reference
 
@@ -300,7 +324,17 @@ Step terrain at difficulty 1.0; error = foot clearance above the ground under it
 conda activate pbhc && cd ~/ws/PBHC
 ```
 
-**Fine-tuning recipe of the current best run** (STEP17; continue a preview checkpoint). The tracking σ values are frozen at the ones the pose run had adapted to:
+**Current best run as a preset.** `humanoidverse/config/exp/terrain_tracking.yaml` holds every setting of the current best pose run (`ft31_E_honest`), so the command is:
+
+```bash
+python humanoidverse/train_agent.py +simulator=isaacgym +exp=terrain_tracking +opt=wandb +device=cuda:0 \
+  robot.motion.motion_file=example/motion_data/Horse-stance_pose.pkl seed=2 \
+  checkpoint=<checkpoint or warm start> experiment_name=<name>
+```
+
+It trains 1,000 iterations by default (`algo.config.num_learning_iterations`), and anything in it can be overridden on the command line.
+
+**The same recipe written out** (STEP17; the preset adds `tilt:1.75,bumps:2.0` to the curriculum ceilings, `terrain.num_cols=24`, `placement_jitter=0.15` and the early starts with `levels_only=True`). The tracking σ values are frozen at the ones the pose run had adapted to:
 
 ```bash
 SIGMA="rewards.reward_tracking_sigma.teleop_max_joint_pos=0.2952 rewards.reward_tracking_sigma.teleop_upper_body_pos=0.0021 \

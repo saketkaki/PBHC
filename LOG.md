@@ -52,6 +52,10 @@ The 17 settings are flat, rough 0.9 (held out, never trained on) and five diffic
 | PREVMORE_s2/4 | `ft16_E_prevmore_s2/4` | PREVIEW trained 3,250 more iterations |
 | STEP17_s2/4 | `ft17_E_step17_s2/4` | PREVIEW + step curriculum to 17 cm |
 | PUNCH_released, PUNCH_s2 | `example/pretrained_horse_stance_punch/model_33000.pt`, `ft18_P_preview_s2` | Horse-stance punch: released, and with the full recipe |
+| HARD_s2/4 | `ft19_E_hard_s2/4` | STEP17 + tilt curriculum to 21°, bumps to 8 cm |
+| PUNCH17, PUNCH_EARLY, PUNCH_EARLYLR, PUNCH_SWING | `ft20_P_step17_s2`, `ft21_P_early_s2`, `ft22_P_earlylr_s2`, `ft23_P_swing_s2` + `ft24_P_swing_long_s2` / `ft24_P_swing_lr_s2` | Punch: 17 cm step curriculum; + early starts; + higher learning rate; + swing clearance and support-lift gain |
+| PUNCH_HONEST, PUNCH_DIVERSE | `ft25_P_honest_s2`, `ft26_P_diverse_s2` | Punch: + only early starts move the level; + 24 terrain columns and placement jitter (continued as `ft27`, `ft29`, `ft30`, `ft32_P_diverse*_s2`; `ft32` is the current best punch) |
+| DIVERSE_s2, HONEST_s2 | `ft28_E_diverse_s2`, `ft31_E_honest_s2` + `ft33_E_honest2_s2` | Pose: HARD + 24 terrain columns and placement jitter; + early starts that alone move the level (current best pose, the `terrain_tracking` preset) |
 
 ### Lineage
 
@@ -66,7 +70,13 @@ released pose model_50000 (A)
                    F3s2 → SWING, REFLU, CONT, PREVIEW_s2/s3/s4, PREVREF,
                           EARLY, PREVLONG, EARLYLONG_s2/s3 → 65,500
                           PREVIEW_s2/s4 → PREVMORE_s2/s4, STEP17_s2/s4 → 68,500
-released punch model_33000 → PUNCH_s2 ──────────────── → 39,500 (running)
+                          STEP17_s2/s4 → HARD_s2/s4 ──── → 69,250
+                          HARD_s2 → DIVERSE_s2 → 70,250 → HONEST_s2 (ft31 → 71,000, ft33 → 72,250, kept)
+released punch model_33000 → PUNCH_s2 ──────────────── → 39,500
+    └── PUNCH17 → 41,000 → PUNCH_EARLY → 42,000 → PUNCH_SWING
+                           PUNCH_EARLY 41,750 → PUNCH_EARLYLR
+        PUNCH_SWING → PUNCH_HONEST → 44,750 → PUNCH_DIVERSE → 46,250
+            → ft27 → ft29 → ft30 → 50,000 → ft32 → 51,250 (kept)
 ```
 
 ### Checkpoint naming quirk
@@ -716,32 +726,375 @@ Two-seed means against the control:
 - **A step up ahead is still the main failure:** at 10 cm, s2 falls there 25% of the time and s4 10%, against 1–6% in the other directions. At 17 cm, s2 falls 49% with the step ahead; s4 falls 19% ahead and 30% with the raised side on the right.
 - **The punch training shared the GPU with the s4 sweep**, which slowed it to 3.3 s per iteration (normally about 1.7).
 
-**Verdict:** keep the 17 cm step curriculum. Videos are in `logs/MotionTracking/videos_step17_s2_it68500/` (released pose, PREVMORE_s2 and STEP17_s2, including new 13.5 and 17 cm step clips). Step timing for both seeds and the s4 videos are queued after the punch run.
+**Step failure timing** (10 cm steps, 3 × 200 episodes per run):
+
+| Run | Failed | Falls | Fall time (median) | Falls in 1–2.5 s | Falls with the raised side ahead | Failed by raised side: ahead / left / behind / right |
+|---|---|---|---|---|---|---|
+| PREVMORE_s2 | 265 | 40 | 1.32 s | 95% | 22 of 40 | 83/160, 66/154, 52/156, 64/130 |
+| PREVMORE_s4 | 386 | 26 | 1.92 s | 73% | 7 of 26 | 95/160, 138/155, 86/157, 67/128 |
+| STEP17_s2 | 288 | 46 | 1.20 s | 85% | 38 of 46 | 97/160, 94/153, 59/156, 38/131 |
+| STEP17_s4 | 298 | 26 | 1.24 s | 85% | 15 of 26 | 83/160, 87/153, 65/155, 63/132 |
+
+- **Falls happen in the same horse-stance weight shift as before**, at a median of about 1.2 s.
+- **Falls concentrate on steps up ahead even more than before.** For STEP17_s2, 38 of 46 falls had the raised side ahead.
+- **Seed 4's gain comes from the left side:** its failures with the raised side on the left dropped from 138 to 87 of about 155. Non-fall failures (drift) are spread over all directions.
+- **The share of episodes ending with the feet on a different level from the reference** stays at 31–35%, and shin contact is as common in completed episodes as in failed ones (46–61%), as before.
+
+**Verdict:** keep the 17 cm step curriculum. The next fix should target the step up ahead (a foothold scan, moving reference landing points). Videos:
+- `logs/MotionTracking/videos_step17_s2_it68500/`: released pose, PREVMORE_s2 and STEP17_s2, including new 13.5 and 17 cm step clips.
+- `logs/MotionTracking/videos_step17_it68500/`: released pose, STEP17_s2 and STEP17_s4. These are attached to both W&B runs.
 
 ### PUNCH_released: released Horse-stance punch, zero-shot (eval only)
 
-`example/pretrained_horse_stance_punch/model_33000.pt` (v3, ground-relative reference, motion recentred):
+`example/pretrained_horse_stance_punch/model_33000.pt`, evaluated with protocol v3 and the ground-relative reference.
+
+**First evaluation, invalid on steps.** It was run without `recenter_motion_xy`. The punch motion starts 1.17 m from the origin, at (−0.42, 1.10), so the robot stood away from the step edge: in 410 of 600 episodes per height the edge was more than 20 cm from both feet. The resulting 78–83% step completion measured flat ground. Results are in `metrics/terrain_eval_v3/`.
+
+**Rerun with the motion recentred** (`metrics/terrain_eval_v3_recenter/`, completion / falls):
 
 | Terrain | Completion / falls |
 |---|---|
-| Flat | 98.7 / 0.2 |
-| Rough | 0.0 / 21.5 |
-| Tilt 6° / 12° | 0.0 / 8.5, 0.0 / 2.0 |
-| Bumps 4 cm | 0.7 / 21.3 |
-| Steps 6.5 / 10 / 13.5 / 17 cm | 77.7 / 2.5, 81.2 / 2.8, 81.8 / 1.0, 82.7 / 1.2 |
+| Flat | 99.2 / 0.0 |
+| Rough | 0.0 / 22.3 |
+| Tilt 6° / 12° / 18° | 0.0 / 14.0, 0.0 / 1.7, 0.0 / 5.2 |
+| Bumps 2 cm / 4 cm | 9.8 / 24.5, 0.0 / 19.7 |
+| Steps 6.5 / 10 / 11.8 / 13.5 / 17 cm | 4.3 / 8.8, 18.8 / 14.7, 20.2 / 12.8, 19.5 / 13.3, 20.3 / 11.5 |
 
 - **Flat error:** 17.3 mm.
-- **The punch barely moves its feet**, so steps are easy for it even blind.
-- **Tilt, bumps and rough fail completely,** mostly by drifting.
+- **Steps from 10 cm up complete about 20% of the time**, but with large seed spread (± 9–11 points). The completed episodes are mostly the ones that start with both reference feet on the lower side: 56% of those complete, against 7–12% with one or both feet on the raised side. The 6.5 cm step (a ramp after the trimesh conversion) completes only 4%.
+- **Tilt, bumps and rough fail completely**, mostly by drifting, as for the released pose policy.
+- **Problem:** `scripts/record_pilot_videos.sh` adds `recenter_motion_xy` only for the released pose (A), so the PUNCH_released clips in `videos_punch_it39500` are not recentred either.
 
-### PUNCH_s2: Horse-stance punch with the full recipe (`ft18_P_preview_s2`), running
+### PUNCH_s2: Horse-stance punch with the full recipe (`ft18_P_preview_s2`)
 
 - **W&B:** `cs47ubpi`.
 - **Iterations:** 33,000 → 39,500 (6,500 iterations, twice a pose continuation, because it starts from a flat-ground policy).
 - **Warm start:** `logs/warmstart/punch_preview_from_33000.pt` (actor 380 → 749, critic 630 → 1,224). `expand_checkpoint.py` was fixed to accept the released config, which has no `terrain_aware` section.
-- **Recipe:** the same as PREVIEW (perception v2, 0.5 s robot-frame preview, fall penalty, 0.7 m cutoff, gentle fine-tuning). The step curriculum tops out at 10 cm, as for PREVIEW.
+- **Recipe:** the same as PREVIEW (perception v2, 0.5 s robot-frame preview, fall penalty, 0.7 m cutoff, gentle fine-tuning). The step curriculum tops out at 10 cm (rows 4.4–10 cm), as for PREVIEW; it was set up before STEP17's result.
 - **σ:** frozen at the pose run's values, because the released checkpoint doesn't store the adapted σ.
-- **Status at 16:30:**
-  - Iteration 34,975, about 1.6 s per iteration; it should finish around 18:30.
-  - Training levels: flat 3.6, tilt 3.5, bumps 3.2, step 1.8. The low step level is unexpected, since the released punch completes 80% of steps zero-shot; check it once the sweep is in.
-- **Queued after training:** the sweep against PUNCH_released, then the step timing for STEP17_s2/s4, then videos (`videos_step17_it68500`, `videos_punch_it39500`).
+- **Training:**
+  - Robots started at levels 0–1, since the released checkpoint has no saved levels.
+  - Flat, tilt and bumps reached level 3.5–3.6.
+  - The step level rose to 1.9 by iteration 35,500 and then stalled at 2.1–2.2 for the last 4,000 iterations. That is roughly the 7.2 cm row, a ramp after the trimesh conversion.
+
+**Results** (v3, 3 seeds, completion / falls; released recentred):
+
+| Terrain | PUNCH_released | PUNCH_s2 |
+|---|---|---|
+| Flat | 99.2 / 0.0 | 99.3 / 0.0 |
+| Tilt 6° | 0.0 / 14.0 | **97.3** / 0.2 |
+| Tilt 12° | 0.0 / 1.7 | **77.8** / 1.7 |
+| Tilt 15° | 0.0 / 3.0 | **39.7** / 3.2 |
+| Tilt 18° | 0.0 / 5.2 | **12.8** / 4.5 |
+| Bumps 4 cm | 0.0 / 19.7 | **89.2** / 0.5 |
+| Bumps 6 cm | 0.0 / 10.7 | **63.7** / 0.5 |
+| Bumps 8 cm | 0.0 / 9.2 | **37.2** / 1.3 |
+| Rough | 0.0 / 22.3 | **34.5** / 0.5 |
+| Step 6.5 cm | 4.3 / 8.8 | **24.8** / 4.3 |
+| Step 10 cm | **18.8** / 14.7 | 9.8 / 6.2 |
+| Step 13.5 cm | **19.5** / 13.3 | 7.3 / 12.8 |
+| Step 17 cm | **20.3** / 11.5 | 5.8 / 15.3 |
+| Flat error | **17.3 mm** | 25.4 mm |
+
+- **The recipe transfers to a second motion on tilt, bumps and rough.** The gains are as large as for the pose: 0 → 78% on 12° tilt, 0 → 89% on 4 cm bumps, and falls drop to at most 1.3% on bumps and rough.
+- **Steps from 10 cm up got worse** (about 19–20% → 6–10%), with a high seed spread (± 5–7 points). On steps 70–84% of episodes end by drifting. Even starts with both reference feet on the lower side fail 78% of the time at 10 cm, against 44% for the released punch.
+- **Flat error rose** from 17.3 to 25.4 mm. The pose run's flat error ended near the released pose's (about 20 mm).
+
+**Problems:**
+- **The step curriculum never got past the ramp rows**, so the run hardly trained on real step edges. The 10 cm ceiling, starting at level 0, and a σ copied from another motion are the likely causes.
+- **One seed only.**
+
+**Verdict:** the terrain recipe generalises to the punch on tilt, bumps and rough. Steps need another run: the 17 cm step curriculum, more iterations, and a second seed. Videos are in `logs/MotionTracking/videos_punch_it39500/` (PUNCH_released not recentred there).
+
+## 2026-11-10
+
+From this day on, runs are sized to be just long enough to judge, watched while they train, and stopped early when they are clearly good or clearly bad. Intermediate checkpoints get a quick eval: 10 and 17 cm steps, 18° tilt, 8 cm bumps and flat, 3 seeds × 200 episodes (protocol v3).
+
+### HARD: tilt and bump curriculum ceilings raised (`ft19_E_hard_s2/s4`)
+
+- **W&B:** `p3en7k75` (s2), `vy3xi8ka` (s4).
+- **Iterations:** STEP17_s2/s4 from 68,250, planned to 71,500. Stopped at about 69,650; the checkpoint kept is `model_69250.pt` (1,000 iterations).
+- **What changed:** `terrain.curriculum_max_difficulty_by_type={step:2.0,tilt:1.75,bumps:2.0}`, so the top rows are 21° tilt and 8 cm bumps (before: 12° and 4 cm). Steps are unchanged (17 cm).
+- **Why:** in STEP17 the tilt, bump and flat levels sat at 3.6–3.7 of 4, so those terrains had nothing harder to learn from.
+- **Training:** levels dropped in the first 25 iterations (step 3.3 → 2.1–2.5), then recovered and flattened at step 2.8–2.9, tilt 3.5, bumps 3.6 on the harder rows. Falls in training ended at 0.2–0.8%.
+
+**Results** (v3, completion / falls):
+
+| Terrain | STEP17_s2 | HARD_s2 | STEP17_s4 | HARD_s4 | STEP17 mean | HARD mean |
+|---|---|---|---|---|---|---|
+| Flat | 100.0 / 0.0 | 99.7 / 0.0 | 99.2 / 0.0 | 99.7 / 0.0 | 99.6 / 0.0 | 99.7 / 0.0 |
+| Rough | 53.0 / 0.0 | 64.2 / 0.0 | 57.0 / 0.0 | 79.0 / 0.0 | 55.0 / 0.0 | **71.6** / 0.0 |
+| Tilt 6° | 99.0 / 0.0 | 99.0 / 0.0 | 97.3 / 0.0 | 99.2 / 0.0 | 98.2 / 0.0 | 99.1 / 0.0 |
+| Tilt 12° | 91.3 / 0.0 | 96.3 / 0.0 | 87.8 / 0.0 | 96.2 / 0.0 | 89.6 / 0.0 | **96.2** / 0.0 |
+| Tilt 15° | 72.5 / 0.8 | 87.7 / 0.3 | 72.7 / 0.7 | 90.5 / 0.2 | 72.6 / 0.8 | **89.1** / 0.2 |
+| Tilt 18° | 41.7 / 6.3 | 71.7 / 1.2 | 48.0 / 4.3 | 75.0 / 1.8 | 44.8 / 5.3 | **73.3** / 1.5 |
+| Tilt 24° | 5.5 / 12.8 | 20.5 / 10.2 | 4.5 / 17.7 | 10.3 / 15.2 | 5.0 / 15.2 | 15.4 / 12.7 |
+| Bumps 2 cm | 99.5 / 0.0 | 98.3 / 0.0 | 97.3 / 0.0 | 99.2 / 0.0 | 98.4 / 0.0 | 98.8 / 0.0 |
+| Bumps 4 cm | 94.5 / 0.0 | 96.0 / 0.0 | 90.8 / 0.0 | 95.8 / 0.2 | 92.7 / 0.0 | **95.9** / 0.1 |
+| Bumps 5 cm | 83.5 / 0.0 | 93.2 / 0.0 | 85.0 / 0.2 | 93.3 / 0.0 | 84.2 / 0.1 | **93.2** / 0.0 |
+| Bumps 6 cm | 69.2 / 0.0 | 86.2 / 0.0 | 70.7 / 0.3 | 86.3 / 0.2 | 69.9 / 0.2 | **86.2** / 0.1 |
+| Bumps 8 cm | 40.7 / 0.8 | 65.3 / 0.0 | 44.0 / 0.8 | 69.8 / 0.3 | 42.3 / 0.8 | **67.6** / 0.2 |
+| Step 6.5 cm | 61.3 / 1.8 | 68.0 / 0.5 | 63.2 / 1.3 | 72.5 / 0.8 | 62.3 / 1.6 | **70.2** / 0.7 |
+| Step 10 cm | 51.7 / 7.8 | 59.8 / 1.0 | 49.7 / 4.8 | 56.3 / 6.5 | 50.7 / 6.3 | **58.1** / 3.7 |
+| Step 11.8 cm | 49.8 / 9.5 | 56.3 / 0.7 | 43.5 / 7.5 | 49.3 / 10.2 | 46.7 / 8.5 | **52.8** / 5.4 |
+| Step 13.5 cm | 39.2 / 13.7 | 48.0 / 2.5 | 33.2 / 13.0 | 41.7 / 10.3 | 36.2 / 13.3 | **44.8** / 6.4 |
+| Step 17 cm | 28.5 / 17.7 | 35.3 / 3.5 | 22.7 / 14.5 | 30.0 / 12.5 | 25.6 / 16.1 | **32.7** / 8.0 |
+| Flat error | 20.2 mm | 22.2 mm | 21.0 mm | 21.8 mm | 20.6 mm | 22.0 mm |
+
+- **Better on every terrain setting for both seeds**, after only 1,000 iterations. The largest gains are where the ceilings were raised (18° tilt +28 points, 8 cm bumps +25) and on held-out rough ground (+17).
+- **Steps improved too** (+6 to +9 points at every height), although the step rows did not change.
+- **Falls on steps:** seed 2 dropped to 0.5–3.5% at every height; seed 4 stayed at 6.5–12.5% from 10 cm up.
+
+**Problems:**
+- **Flat error rose by 1–2 mm** (20.6 → 22.0 mm).
+- **Steps still complete only 58% at 10 cm**, and seed 4 still falls on them.
+- **Every restart costs step level.** The step level fell by about 0.7–1.0 in the first 25 iterations of each run started today (the actor is frozen for the first 100), while tilt and bump levels did not, and it took hundreds of iterations to recover. The cause is not found.
+
+**Verdict:** current best pose policy. Its settings are the preset `humanoidverse/config/exp/terrain_tracking.yaml` (`+exp=terrain_tracking`), which reproduces this run's saved config exactly except for the checkpoint and the iteration count (1,000).
+
+### PUNCH17: punch with the 17 cm step curriculum (`ft20_P_step17_s2`)
+
+- **W&B:** `4mygljw5`.
+- **Iterations:** PUNCH_s2 from 39,250, planned 6,500; stopped at about 41,075 (last checkpoint 41,000).
+- **What changed:** `terrain.curriculum_max_difficulty_by_type={step:2.0}`.
+
+Quick eval at 1,000 iterations (`model_40250.pt`, completion / falls):
+
+| Terrain | PUNCH_s2 | PUNCH17 |
+|---|---|---|
+| Flat | 99.3 / 0.0 | 99.8 / 0.0 |
+| Tilt 18° | 12.8 / 4.5 | 27.0 / 2.3 |
+| Bumps 8 cm | 37.2 / 1.3 | 52.0 / 1.2 |
+| Step 10 cm | 9.8 / 6.2 | 15.2 / 1.8 |
+| Step 17 cm | 5.8 / 15.3 | 6.7 / 7.0 |
+| Flat error | 25.4 mm | 24.7 mm |
+
+- **Tilt and bumps improved, steps barely.** The step level stalled at 2.2.
+- **Where steps fail:** of the failed 10 cm step episodes, 75% end between 0.5 and 1.5 s and nearly all within 2 s, in every step direction. Even starts with both reference feet on the lower side complete only 27%. That is the opening of the motion, where the right foot steps 0.5 m back into the horse stance.
+- **Why the step level was inflated:** training starts episodes anywhere in the motion, so only about 15% include the opening step. Episodes that start in the stance complete easily and keep the level up.
+
+**Verdict:** stopped; not a step fix.
+
+### PUNCH_EARLY and PUNCH_EARLYLR: early starts, and a higher learning rate (`ft21_P_early_s2`, `ft22_P_earlylr_s2`)
+
+- **W&B:** `eg1e09bc`, `kbt64ctg`.
+- **PUNCH_EARLY:** PUNCH17 from 41,000 with `early_start.prob=0.5`, `max_time=0.8`, `terrain_types=[step,tilt,bumps]`, demotion on. Stopped at about 42,075.
+- **PUNCH_EARLYLR:** PUNCH_EARLY from 41,750 with actor and critic learning rates 1e-4 and 3e-4 (5× and 3×). Stopped at about 42,050.
+- **Training (PUNCH_EARLY):** the step level fell from 2.2 to 0.9 at once and rose to 1.3 in 1,000 iterations (rows 5.8 and 8.6 cm). Tilt and bump levels rose slightly (3.6).
+- **Quick eval of PUNCH_EARLY at 750 iterations:** step 10 cm 14.5 / 3.2, step 17 cm 8.2 / 3.2, tilt 18° 34.5 / 2.3, bumps 8 cm 52.5 / 1.0, flat error 25.8 mm. No gain on steps over PUNCH17.
+- **PUNCH_EARLYLR:** lost 0.7 of a step level at its restart (see HARD) and was at 0.64 after 300 iterations; not evaluated.
+
+**Verdict:** early starts make the curriculum honest (the punch cannot do its opening on steps above about 6–9 cm) but do not teach the step. Both stopped.
+
+### Finding: the punch reference cannot be tracked on steps
+
+Forward kinematics of the two reference motions (ankle height above the ground, flat):
+
+| | Pose | Punch |
+|---|---|---|
+| Opening step of the right foot | 1.4–2.0 s, about 0.45 m | 1.1–1.8 s, about 0.5 m |
+| Peak foot lift | 23 cm | 6 cm |
+| Starting stance | feet side by side, 0.24 m apart | feet in line, 0.23 m apart front to back |
+
+- **The punch's stepping foot is only 6 cm off the ground.** On any step above 6 cm, the reference foot passes through the riser.
+- **The support height jumps mid-step.** The rigid shift picks the supporting foot with softmax((ground − lift) / τ). A foot lifted 6 cm over a 10 cm upper level scores higher than the stance foot on the lower level, so the whole reference rises by the step height while the robot is in single support. The pose's 23 cm lift keeps its swing foot out until it lands.
+
+### PUNCH_SWING: swing clearance and support-lift gain (`ft23_P_swing_s2`, `ft24_P_swing_long_s2`, `ft24_P_swing_lr_s2`)
+
+- **W&B:** `3abbrdtt`, then `6ob6uxjw` (same settings, continued) and `wnkg3i27` (actor and critic learning rates 1e-4 and 3e-4).
+- **What changed:** `swing_clearance=True` (raise a lifted reference foot over higher ground near it) and a new option `terrain_aware.support_lift_gain=4` (the lift counts 4× when choosing the supporting foot; default 1 = unchanged behaviour). Early starts kept.
+- **Iterations:** PUNCH_EARLY 42,000 → 43,000 (ft23), then → 43,750 (long, stopped) and → 43,525 (higher rate, stopped).
+
+Quick evals (completion / falls):
+
+| Terrain | PUNCH_EARLY (41,750) | ft23 (42,500) | long (43,500) | higher rate (43,500) |
+|---|---|---|---|---|
+| Flat | 99.8 / 0.0 | 99.2 / 0.0 | 98.5 / 0.0 | 98.7 / 0.0 |
+| Tilt 18° | 34.5 / 2.3 | 50.7 / 2.8 | 40.2 / 1.8 | 33.5 / 3.3 |
+| Bumps 8 cm | 52.5 / 1.0 | 56.7 / 0.5 | 56.2 / 2.0 | 55.2 / 1.8 |
+| Step 10 cm | 14.5 / 3.2 | 16.5 / 3.5 | 19.5 / 3.0 | 11.8 / 4.5 |
+| Step 17 cm | 8.2 / 3.2 | 7.7 / 4.5 | 12.0 / 5.8 | 7.5 / 3.0 |
+
+- **Steps improve slowly** (about 3 points per 1,000 iterations at 10 cm).
+- **The higher learning rate is worse** on every terrain.
+- **What a failing clip shows** (10 cm step, fails at 1.48 s): the robot lifts the stepping leg far above the reference, leans the torso the other way and topples over the stance foot.
+- **Layout breakdown** (ft23, 10 cm steps): 21% completed when no reference foot changes level (the pose: 68%), 10% when one does.
+- **Problem:** the training step level read 2.3 while the eval completed 20% at 10 cm. Starts after the opening still promoted robots.
+
+**Verdict:** keep both reference options for the punch; not enough alone.
+
+### PUNCH_HONEST: only early starts move the curriculum level (`ft25_P_honest_s2`)
+
+- **W&B:** `0alyeu9c`.
+- **What changed:** new option `early_start.levels_only=True` (on the early-start terrain types, only episodes that start in the opening move a robot up or down), and `early_start.prob` 0.5 → 0.7.
+- **Iterations:** long 43,750 → 44,750 (stopped).
+- **Training:** the step level fell to 0.55 within 250 iterations (the punch could not do its opening on an 8.6 cm step), then rose to 2.5.
+- **Quick eval at 750 iterations:** step 10 cm 24.0 / 0.7, step 17 cm 17.5 / 4.7, tilt 18° 50.7 / 1.7, bumps 8 cm 65.5 / 1.2, flat 99.0 / 0.0 (error 24.9 mm).
+- **Problem:** training level 2.5 (about half of the from-start episodes complete at roughly 12 cm) against 24% in the eval at 10 cm.
+
+### Finding: a training run has about two step layouts per level
+
+- A step tile has one edge, with one direction and one offset (±0.15 m from the tile centre), and every episode starts at the tile centre.
+- With `num_cols: 8` and 30% step tiles, a run has 2–3 step columns: 2–3 layouts per level and 10–15 in total. Tilt has as few directions.
+- The eval builds 40 tiles of the evaluated type per seed.
+- So the policy learns its own few layouts. This also explains why each pose training seed has its own weak step direction (STEP17, HARD).
+
+### PUNCH_DIVERSE: more columns and placement jitter (`ft26_P_diverse_s2`)
+
+- **W&B:** `0t93nd7b`.
+- **What changed:** `terrain.num_cols=24` (about 7 step columns) and a new option `terrain_aware.placement_jitter=0.15` (the motion is shifted by a random xy offset in ±0.15 m per episode). Everything from PUNCH_HONEST kept. Terrain levels could not be restored (different columns), so robots started at levels 0–1; tilt and bump levels were back at 3.65 within 125 iterations.
+- **Iterations:** PUNCH_HONEST 44,750 → 46,250 (1,500; 1.2 s per iteration alone on the GPU).
+
+Quick eval at 750 iterations (`model_45500.pt`, completion / falls):
+
+| Terrain | PUNCH_HONEST (44,500) | PUNCH_DIVERSE (45,500) |
+|---|---|---|
+| Flat | 99.0 / 0.0 | 99.5 / 0.0 |
+| Tilt 18° | 50.7 / 1.7 | 57.7 / 2.8 |
+| Bumps 8 cm | 65.5 / 1.2 | 65.0 / 0.5 |
+| Step 10 cm | 24.0 / 0.7 | **46.5** / 1.7 |
+| Step 17 cm | 17.5 / 4.7 | **24.5** / 3.7 |
+| Flat error | 24.9 mm | 24.9 mm |
+
+- **10 cm steps nearly doubled in 750 iterations.** The lack of layout variety was the main bottleneck for the punch on steps.
+- **The training step level is now 1.4–1.6** (about 9–10 cm), in line with the eval.
+
+**Verdict:** keep.
+
+### PUNCH_DIVERSE continued (`ft27_P_diverse2_s2`, `ft29_P_diverse3_s2`)
+
+- **W&B:** `mkqq4eb0`, `aumd0bza`.
+- **ft27:** PUNCH_DIVERSE 46,250 → 47,500 by the saved counter (1,500 iterations), same settings.
+- **ft29:** ft27 → 48,750 (1,500 iterations), with the tilt and bump ceilings of HARD added (`{step:2.0,tilt:1.75,bumps:2.0}`).
+- **Training (ft29):** step level 2.0 → 2.8 (about 14 cm, from the motion start); tilt dipped to 3.1 on the harder rows and recovered to 3.6; bumps 3.6. Completed episodes 63 → 70%, falls about 1.5%.
+
+Quick evals (completion / falls):
+
+| Terrain | PUNCH_DIVERSE (45,500) | ft27 (47,000) | ft29 (48,250) |
+|---|---|---|---|
+| Flat | 99.5 / 0.0 | 99.3 / 0.0 | 99.3 / 0.0 |
+| Tilt 18° | 57.7 / 2.8 | 60.5 / 1.3 | **77.8** / 0.8 |
+| Bumps 8 cm | 65.0 / 0.5 | 73.5 / 0.2 | **84.8** / 0.0 |
+| Step 10 cm | 46.5 / 1.7 | 50.2 / 0.5 | **61.5** / 0.7 |
+| Step 17 cm | 24.5 / 3.7 | 25.2 / 2.7 | **38.3** / 1.7 |
+| Flat error | 24.9 mm | 24.6 mm | 24.8 mm |
+
+- **The punch now matches the pose on steps** (10 cm: 61.5% against 60.3%) and is ahead of it on 8 cm bumps.
+- **Raising the tilt and bump ceilings helped the punch as it helped the pose**, and steps improved in the same run.
+
+**Problems:**
+- **Flat error is 24.8 mm** against 17.3 mm for the released punch.
+- **One training seed.**
+
+**Verdict:** current best punch policy; still improving, continued as `ft30_P_diverse4_s2` (W&B `qf10wga5`).
+
+### DIVERSE: the pose with more columns and placement jitter (`ft28_E_diverse_s2`)
+
+- **W&B:** `lnplx6kg`. Two launches before it failed on shell quoting and left an empty W&B run (`8a8s5tql`).
+- **Iterations:** HARD_s2 69,250 → 70,250 (1,000). Levels restarted at 0–1 (different columns) and were back at step 2.9, tilt 3.4, bumps 3.55 by the end.
+- **What changed:** `terrain.num_cols=24`, `terrain_aware.placement_jitter=0.15`. No early starts.
+
+**Results** (v3, completion / falls):
+
+| Terrain | HARD_s2 | DIVERSE_s2 |
+|---|---|---|
+| Flat | 99.7 / 0.0 | 98.8 / 0.0 |
+| Rough | 64.2 / 0.0 | **75.3** / 0.0 |
+| Tilt 6° | 99.0 / 0.0 | 98.5 / 0.0 |
+| Tilt 12° | 96.3 / 0.0 | 94.0 / 0.0 |
+| Tilt 15° | 87.7 / 0.3 | 87.5 / 0.0 |
+| Tilt 18° | 71.7 / 1.2 | **80.3** / 0.7 |
+| Tilt 24° | 20.5 / 10.2 | **30.5** / 4.8 |
+| Bumps 2 cm | 98.3 / 0.0 | 98.7 / 0.0 |
+| Bumps 4 cm | 96.0 / 0.0 | 95.3 / 0.0 |
+| Bumps 5 cm | 93.2 / 0.0 | 91.2 / 0.0 |
+| Bumps 6 cm | 86.2 / 0.0 | 85.2 / 0.0 |
+| Bumps 8 cm | 65.3 / 0.0 | 67.5 / 0.0 |
+| Step 6.5 cm | 68.0 / 0.5 | **74.5** / 0.3 |
+| Step 10 cm | 59.8 / 1.0 | 60.3 / 1.5 |
+| Step 11.8 cm | 56.3 / 0.7 | 57.8 / 1.2 |
+| Step 13.5 cm | 48.0 / 2.5 | **53.5** / 2.3 |
+| Step 17 cm | 35.3 / 3.5 | **43.0** / 4.8 |
+| Flat error | 22.2 mm | 22.9 mm |
+
+- **Better at the hard end** (rough +11, tilt 18° +9, tilt 24° +10, steps of 13.5 cm and above +5 to +8), unchanged on 10–12 cm steps, and 1–2 points lower on flat, 12° tilt and 4–6 cm bumps.
+- **The quick eval at 500 iterations** read 64.0% on 10 cm steps; the final checkpoint reads 60.3%. Differences of about 4 points between checkpoints of one run are noise.
+
+**Verdict:** new best pose checkpoint by a moderate margin (single seed; from here on changes are tested on seed 2 only, with a second seed kept for a final confirmation). Next: the from-start curriculum that helped the punch (`early_start.prob=0.7`, `max_time=1.0`, `levels_only=True`) in `ft31_E_honest_s2` (W&B `qdieofsw`).
+
+### HONEST: the pose with the from-start curriculum (`ft31_E_honest_s2`, `ft33_E_honest2_s2`)
+
+- **W&B:** `qdieofsw`, `mois3a8e`.
+- **What changed:** DIVERSE plus `early_start.prob=0.7`, `max_time=1.0`, `terrain_types=[step,tilt,bumps]`, `levels_only=True`. No swing clearance or support-lift gain (the pose lifts its foot 23 cm).
+- **Iterations:** ft31: DIVERSE_s2 70,250 → 71,000 by the saved counter (1,000 iterations). ft33: ft31 → 72,250 (1,500 iterations), same settings.
+- **Training:** step level 3.0 → 2.65 → 3.2 in ft31 and 3.2 → 2.75 → 2.95 in ft33 (the usual dip after a restart); tilt 3.5, bumps 3.55–3.6. ft33 was flattening by its end: drift terminations 22 → 19–20%, falls about 1%.
+
+**Results of ft31** (v3 full sweep, `model_71000.pt`, completion / falls):
+
+| Terrain | HARD_s2 | DIVERSE_s2 | HONEST_s2 (ft31) |
+|---|---|---|---|
+| Flat | 99.7 / 0.0 | 98.8 / 0.0 | 99.7 / 0.0 |
+| Rough | 64.2 / 0.0 | 75.3 / 0.0 | **80.5** / 0.0 |
+| Tilt 6° | 99.0 / 0.0 | 98.5 / 0.0 | 99.0 / 0.0 |
+| Tilt 12° | 96.3 / 0.0 | 94.0 / 0.0 | **98.3** / 0.0 |
+| Tilt 15° | 87.7 / 0.3 | 87.5 / 0.0 | **94.0** / 0.0 |
+| Tilt 18° | 71.7 / 1.2 | 80.3 / 0.7 | **85.8** / 0.0 |
+| Tilt 24° | 20.5 / 10.2 | 30.5 / 4.8 | **43.3** / 5.2 |
+| Bumps 2 cm | 98.3 / 0.0 | 98.7 / 0.0 | 99.0 / 0.0 |
+| Bumps 4 cm | 96.0 / 0.0 | 95.3 / 0.0 | 96.7 / 0.0 |
+| Bumps 5 cm | 93.2 / 0.0 | 91.2 / 0.0 | 93.5 / 0.0 |
+| Bumps 6 cm | 86.2 / 0.0 | 85.2 / 0.0 | **91.7** / 0.0 |
+| Bumps 8 cm | 65.3 / 0.0 | 67.5 / 0.0 | **82.0** / 0.0 |
+| Step 6.5 cm | 68.0 / 0.5 | 74.5 / 0.3 | **79.7** / 0.2 |
+| Step 10 cm | 59.8 / 1.0 | 60.3 / 1.5 | **64.5** / 0.8 |
+| Step 11.8 cm | 56.3 / 0.7 | 57.8 / 1.2 | 60.2 / 1.5 |
+| Step 13.5 cm | 48.0 / 2.5 | 53.5 / 2.3 | 56.5 / 1.5 |
+| Step 17 cm | 35.3 / 3.5 | 43.0 / 4.8 | **49.8** / 3.5 |
+| Flat error | 22.2 mm | 22.9 mm | 23.1 mm |
+
+- **Best or level on all 17 settings.** The largest gains over DIVERSE are bumps 8 cm (+14.5), tilt 24° (+13), tilt 15° (+6.5) and 17 cm steps (+7).
+- **Step failures are drift, not falls** (10 cm: 34.7% drift, 0.8% falls). They are worst with the raised side on the robot's left (48% not completed at 10 cm, against 24% on the right) and when one reference foot starts on the upper level (48%, against 17% with none).
+
+**Quick eval of ft33** (`model_72250.pt`, completion / falls; ft31 column from its full sweep):
+
+| Terrain | ft31 (71,000) | ft33 (72,250) |
+|---|---|---|
+| Flat | 99.7 / 0.0 | 99.7 / 0.0 |
+| Tilt 18° | 85.8 / 0.0 | **90.7** / 0.0 |
+| Bumps 8 cm | 82.0 / 0.0 | 82.5 / 0.3 |
+| Step 10 cm | 64.5 / 0.8 | **69.0** / 0.7 |
+| Step 17 cm | 49.8 / 3.5 | **55.2** / 0.8 |
+| Flat error | 23.1 mm | **21.5 mm** |
+
+**Problems:**
+- **One training seed.**
+- **Steps:** a third of 10 cm episodes still lose the motion in the opening step.
+
+**Verdict:** the recipe is the current best for the pose and is now the preset `humanoidverse/config/exp/terrain_tracking.yaml` (composed and compared with the ft31 config: identical apart from checkpoint and name). ft33 is the best pose checkpoint by the quick eval; its full sweep is pending.
+
+### PUNCH_DIVERSE continued, rounds 4 and 5 (`ft30_P_diverse4_s2`, `ft32_P_diverse5_s2`)
+
+- **W&B:** `qf10wga5`, `511nkndo`.
+- **Settings:** as ft29 (24 columns, placement jitter 0.15, early starts 0.7 / 0.8 s / levels only, swing clearance, support-lift gain 4, ceilings `{step:2.0,tilt:1.75,bumps:2.0}`).
+- **Iterations:** ft30: ft29 48,500 → 50,000 by the saved counter (1,500). ft32: ft30 → 51,250 (1,500).
+- **Training:** step level 2.8 → 3.0 in ft30 and 3.0 → 2.8 → 3.26 in ft32, still rising at the end; tilt 3.55, bumps 3.65. Drift terminations 31 → 24% in ft32, falls about 1%.
+
+Quick evals (completion / falls):
+
+| Terrain | ft29 (48,250) | ft30 (49,250) | ft32 (51,250) |
+|---|---|---|---|
+| Flat | 99.3 / 0.0 | 99.7 / 0.0 | 100.0 / 0.0 |
+| Tilt 18° | 77.8 / 0.8 | 85.8 / 0.3 | **88.8** / 0.0 |
+| Bumps 8 cm | 84.8 / 0.0 | 86.5 / 0.0 | **90.3** / 0.0 |
+| Step 10 cm | 61.5 / 0.7 | 63.7 / 0.3 | **69.2** / 0.3 |
+| Step 17 cm | 38.3 / 1.7 | 42.3 / 0.7 | **53.8** / 0.8 |
+| Flat error | 24.8 mm | 24.0 mm | 25.2 mm |
+
+- **Every terrain improved in both rounds**, and falls are below 1% everywhere tested.
+- **Failures at 10 cm** (ft30) are spread evenly over the step layouts, in the opening step (1.0–2.5 s) and the return step (after 4 s); almost all are drift.
+
+**Problems:**
+- **Flat error 25 mm** against 17.3 mm for the released punch; it has not improved in any round.
+- **One training seed.**
+
+**Verdict:** ft32 is the current best punch checkpoint. The punch and the pose are now level (10 cm steps 69%, 17 cm steps 54–55%, tilt 18° 89–91%, bumps 8 cm 83–90%). Next: the motions without a released checkpoint, Hooks punch first.

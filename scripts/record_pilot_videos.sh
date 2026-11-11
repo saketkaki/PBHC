@@ -8,7 +8,7 @@
 #   e.g. scripts/record_pilot_videos.sh B=logs/.../model_53500.pt C=logs/.../model_53500.pt E=logs/.../model_53500.pt
 # (a run directory means its latest checkpoint; pass checkpoint files to compare at equal iterations)
 # Known tags get a description in the caption (B naive ref, C ground-relative ref, E height scan, E1/E2/E2pf for
-# rounds 1 and 2 of E, E2c for the continuation of E2, E2c2 and E2ik for its plain and leg-IK continuations, F2s1/F2s2 for the fall-penalty runs with the 0.7 m drift cutoff, F3s1/F3s2 for perception v2 from F2s2, CTRL/SWING for the control and swing-clearance continuations, CONT/REFLU/PREVIEW for the plain, reference-lookup and reference-preview continuations of F3s2, PREVREF/PREVIEW_s3/PREVIEW_s4/EARLY/PREVLONG/EARLYLONG_s2/EARLYLONG_s3/PREVMORE_s2/PREVMORE_s4/STEP17_s2/STEP17_s4 for the preview variants, PUNCH_released/PUNCH_s2 for the Horse-stance punch). Tags listed in NO_WANDB are recorded but nothing is uploaded to their W&B runs.
+# rounds 1 and 2 of E, E2c for the continuation of E2, E2c2 and E2ik for its plain and leg-IK continuations, F2s1/F2s2 for the fall-penalty runs with the 0.7 m drift cutoff, F3s1/F3s2 for perception v2 from F2s2, CTRL/SWING for the control and swing-clearance continuations, CONT/REFLU/PREVIEW for the plain, reference-lookup and reference-preview continuations of F3s2, PREVREF/PREVIEW_s3/PREVIEW_s4/EARLY/PREVLONG/EARLYLONG_s2/EARLYLONG_s3/PREVMORE_s2/PREVMORE_s4/STEP17_s2/STEP17_s4/HARD_s2/HARD_s4 for the preview variants, PUNCH_released/PUNCH_s2 for the Horse-stance punch). Tags listed in NO_WANDB are recorded but nothing is uploaded to their W&B runs.
 # The camera is low and to the side (CAM_OFFSET, relative to the start root) so steps and bumps show, and the
 # height-scan points are drawn on the ground (blue) in every clip to show the terrain shape.
 set -euo pipefail
@@ -46,8 +46,12 @@ declare -A DESCRIPTION=([B]="naive ref" [C]="ground-relative ref" [E]="height sc
                         [PREVMORE_s4]="F3s2 + reference preview, trained 3,250 more iterations, seed 4"
                         [STEP17_s2]="F3s2 + reference preview, step curriculum to 17 cm, seed 2"
                         [STEP17_s4]="F3s2 + reference preview, step curriculum to 17 cm, seed 4"
+                        [HARD_s2]="F3s2 + reference preview, curriculum to 17 cm steps, 21 deg tilt, 8 cm bumps, seed 2"
+                        [HARD_s4]="F3s2 + reference preview, curriculum to 17 cm steps, 21 deg tilt, 8 cm bumps, seed 4"
                         [PUNCH_released]="released PBHC Horse-stance punch (zero-shot)"
                         [PUNCH_s2]="Horse-stance punch + terrain-aware recipe (perception v2, reference preview), seed 2")
+# released checkpoints predate the terrain-aware options: place them on the terrain feature like the trained runs
+declare -A EXTRA=([PUNCH_released]="${A_FLAGS[*]}")
 read -r -a NO_WANDB <<< "${NO_WANDB:-}"
 mkdir -p "$OUT"
 
@@ -98,8 +102,9 @@ for entry in "${TERRAINS[@]}"; do
     clips=("$OUT/A_$name.mp4")
     for tag in "${TAGS[@]}"; do
         run=${WANDB_RUN[$tag]}
+        read -r -a extra <<< "${EXTRA[$tag]:-}"
         record "${CKPT[$tag]}" --out "$OUT/${tag}_$name.mp4" --seconds "$SECONDS_PER_CLIP" \
-            --label "${LABEL[$tag]}, $label" "${VIEW[@]}" "${ov[@]}" ${run:+--wandb-run "$run" --wandb-key "videos/$name"}
+            --label "${LABEL[$tag]}, $label" "${VIEW[@]}" "${extra[@]}" "${ov[@]}" ${run:+--wandb-run "$run" --wandb-key "videos/$name"}
         clips+=("$OUT/${tag}_$name.mp4")
     done
     python scripts/record_video.py stack "$OUT/compare_$name.mp4" "${clips[@]}"

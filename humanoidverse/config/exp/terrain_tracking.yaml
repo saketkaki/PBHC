@@ -1,0 +1,84 @@
+# @package _global_
+
+# Terrain-aware motion tracking: the settings of the best Horse-stance pose run (ft31_E_honest, TERRAIN_AWARE_TRACKING.md),
+# so a run needs only the motion, the seed and the checkpoint to continue:
+#
+#   python humanoidverse/train_agent.py +simulator=isaacgym +exp=terrain_tracking +opt=wandb +device=cuda:0 \
+#       robot.motion.motion_file=example/motion_data/Horse-stance_pose.pkl seed=2 \
+#       checkpoint=<checkpoint or warm start> experiment_name=<name>
+#
+# This is a fine-tuning recipe: it continues a terrain-aware checkpoint, or a released flat-ground checkpoint warm-started
+# with scripts/expand_checkpoint.py. The config groups below replace `+terrain= +robot= +domain_rand= +rewards= +obs=`
+# on the command line; anything here can still be overridden there.
+
+defaults:
+  - motion_tracking
+  - /terrain: terrain_kungfu
+  - /robot: g1/g1_23dof_lock_wrist
+  - /domain_rand: main
+  - /rewards: motion_tracking/main
+  - /obs: motion_tracking/main_terrain_v2_preview # wide height scan, foot scans, 0.5 s robot-frame reference preview
+  - _self_
+
+project_name: MotionTracking
+experiment_name: terrain_tracking
+num_envs: 1536
+
+env:
+  config:
+    terrain_aware:
+      recenter_motion_xy: True
+      spawn_clearance: 0.01
+      ground_relative_ref: True
+      height_scan:
+        y_range: [-0.5, 0.5]
+      height_lookup: exact
+      ref_height_lookup: exact
+      placement_jitter: 0.15 # [m] random xy shift of the motion per episode, so each tile's edge is met at many offsets
+      early_start: # most episodes start in the motion's opening (the step into the stance), and only those move the level
+        prob: 0.7
+        max_time: 1.0
+        terrain_types: [step, tilt, bumps]
+        levels_only: True
+    termination_curriculum:
+      terminate_when_motion_far_curriculum: False # a fixed cutoff, so falls in progress end the episode (and are penalised)
+    termination_scales:
+      termination_motion_far_threshold: 0.7
+      termination_drift_penalty_scale: 0.25
+
+terrain:
+  curriculum: True
+  num_cols: 24 # 3x the default tiles per level: many more step layouts (edge direction and offset) than 8 columns give
+  max_init_terrain_level: 1 # only used when the checkpoint has no saved terrain levels
+  curriculum_graduate_rows: 2
+  curriculum_max_difficulty_by_type: {step: 2.0, tilt: 1.75, bumps: 2.0} # top rows: 17 cm steps, 21 deg tilt, 8 cm bumps
+
+algo:
+  config:
+    # gentle fine-tuning: the checkpoint's optimizer state, low fixed learning rates, no exploration changes
+    load_optimizer: True
+    load_optimizer_lr: False
+    schedule: fixed
+    actor_learning_rate: 2.e-5
+    critic_learning_rate: 1.e-4
+    entropy_coef: 0
+    fix_noise_std: True
+    actor_lr_ramp_iterations: 100
+    actor_warmup_iterations: 100
+    save_interval: 250
+    num_learning_iterations: 1000 # ft31_E_honest ran 1,000 iterations
+
+rewards:
+  adaptive_tracking_sigma:
+    enable: False # frozen at the values the pose run had adapted to:
+  reward_tracking_sigma:
+    teleop_max_joint_pos: 0.2952
+    teleop_upper_body_pos: 0.0021
+    teleop_lower_body_pos: 0.0015
+    teleop_vr_3point_pos: 0.0022
+    teleop_feet_pos: 0.0013
+    teleop_body_rot: 0.0998
+    teleop_body_vel: 0.0713
+    teleop_body_ang_vel: 1.9885
+    teleop_joint_pos: 0.0215
+    teleop_joint_vel: 3.3087

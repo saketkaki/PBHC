@@ -281,7 +281,10 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self._leg_ik_iterations = int(ta.get('leg_ik_iterations', 6))
         self._leg_ik_support_ratio = float(ta.get('leg_ik_support_ratio', 0.0))
         assert not (self._leg_ik_ref and self._per_foot_ref), 'leg_ik_ref replaces per_foot_ref'
-        self._custom_ref_offset = self._ground_relative_ref or self._recenter_motion_xy
+        # training: shift the motion by a random xy offset per episode, so one tile gives many layouts under the feet
+        self._placement_jitter = float(ta.get('placement_jitter', 0.0))
+        self._placement_offset = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
+        self._custom_ref_offset = self._ground_relative_ref or self._recenter_motion_xy or self._placement_jitter > 0
         if self._ground_relative_ref:
             logger.info(colored(f"Terrain-aware tracking: ground-relative reference (recenter_motion_xy={self._recenter_motion_xy}, "
                                 f"per_foot_ref={self._per_foot_ref}, leg_ik_ref={self._leg_ik_ref}, "
@@ -300,6 +303,7 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self._init_leg_kinematics()
         # swing clearance: a lifted reference foot is raised by how far the highest ground within `radius` of it lies
         # above the ground its target is relative to (0 on flat ground and when stepping down)
+        self._support_lift_gain = float(ta.get('support_lift_gain', 1.0))
         self._swing_clearance = bool(ta.get('swing_clearance', False))
         self._swing_clearance_lift = float(ta.get('swing_clearance_lift', 0.02))
         radius = float(ta.get('swing_clearance_radius', 0.15))
@@ -368,6 +372,7 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self._early_start_max_time = float(es.get('max_time', 1.5))
         self._early_start_types = list(es.get('terrain_types', ['step']))
         self._early_start_keep_level = bool(es.get('keep_level_on_failure', False))
+        self._early_start_levels_only = bool(es.get('levels_only', False)) and self._early_start_prob > 0
         self._early_started = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._ref_preview_frame = rp.get('frame', 'robot')
         assert self._ref_preview_frame in ('robot', 'reference'), f'ref_preview.frame: {self._ref_preview_frame}'
@@ -512,6 +517,8 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             offset[:, 2] = 0.  # the per-frame support height replaces the fixed origin height
         if self._recenter_motion_xy:
             offset[:, :2] -= self._motion_start_xy
+        if self._placement_jitter > 0:
+            offset[:, :2] += self._placement_offset
         return offset
 
     def _ground_relative_z_offsets(self, motion_res):
@@ -541,7 +548,7 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         if self._per_foot_ref or self._leg_ik_ref:
             weights = torch.softmax(-feet_lift / self._support_lift_tau, dim=-1)
         else:
-            weights = torch.softmax((feet_ground - feet_lift) / self._support_height_tau, dim=-1)
+            weights = torch.softmax((feet_ground - self._support_lift_gain * feet_lift) / self._support_height_tau, dim=-1)
         support_height = (weights * feet_ground).sum(dim=-1)  # [N]
         if self._leg_ik_ref:  # move the pelvis towards the lower supporting foot: legs can bend further than stretch
             low_weights = torch.softmax(-(feet_ground + feet_lift) / self._support_height_tau, dim=-1)
@@ -734,6 +741,11 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         move_down = ~completed & (elapsed < 0.5 * remaining)
         if self._early_start_keep_level:  # early starts aim at the hardest part of the motion: failing it is no demotion
             move_down &= ~self._early_started[env_ids]
+        if self._early_start_levels_only:  # only episodes that contain the opening of the motion move the level
+            on_type = self._early_start_type_mask(self.terrain_types[env_ids])
+            counts = self._early_started[env_ids] | ~on_type
+            move_up &= counts
+            move_down &= counts
         levels = self.terrain_levels[env_ids] + move_up.long() - move_down.long()
         graduate_rows = self.config.terrain.get('curriculum_graduate_rows', None) or self.max_terrain_level
         graduated = self.max_terrain_level - graduate_rows + torch.randint_like(levels, graduate_rows)
@@ -746,16 +758,20 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             if of_type.any():
                 self.log_dict[f"terrain_level_{name}"] = self.terrain_levels[of_type].float().mean()
 
-    def _sample_early_starts(self, env_ids):
-        """ Training: with probability early_start.prob, robots on the early_start.terrain_types start the motion
-        uniformly in [0, early_start.max_time] instead of anywhere in it (the early part holds the hardest move of the
-        horse stance on steps, and uniform starts rarely reach it). """
+    def _early_start_type_mask(self, types):
+        """ Which of the given terrain type columns belong to early_start.terrain_types. """
         cols = getattr(self.simulator.terrain, 'sub_terrain_cols', {})
-        types = self.terrain_types[env_ids]
         on_type = torch.zeros_like(types, dtype=torch.bool)
         for name in self._early_start_types:
             if name in cols:
                 on_type |= (types >= cols[name][0]) & (types < cols[name][1])
+        return on_type
+
+    def _sample_early_starts(self, env_ids):
+        """ Training: with probability early_start.prob, robots on the early_start.terrain_types start the motion
+        uniformly in [0, early_start.max_time] instead of anywhere in it (the early part holds the hardest move of the
+        horse stance on steps, and uniform starts rarely reach it). """
+        on_type = self._early_start_type_mask(self.terrain_types[env_ids])
         early = on_type & (torch.rand(len(env_ids), device=self.device) < self._early_start_prob)
         max_time = torch.clamp(self.motion_len[env_ids], max=self._early_start_max_time)
         times = torch.rand(len(env_ids), device=self.device) * max_time
@@ -1016,6 +1032,8 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         if len(env_ids) == 0:
             return
         self.motion_len[env_ids] = self._motion_lib.get_motion_length(self.motion_ids[env_ids])
+        if self._placement_jitter > 0:
+            self._placement_offset[env_ids] = (torch.rand(len(env_ids), 2, device=self.device) * 2 - 1) * self._placement_jitter
         
         if self.is_evaluating and not self.config.enforce_randomize_motion_start_eval:
             self.motion_start_times[env_ids] = torch.zeros(len(env_ids), dtype=torch.float32, device=self.device)
