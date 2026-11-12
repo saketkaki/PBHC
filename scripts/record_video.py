@@ -58,14 +58,22 @@ def record(args, overrides):
         cfg.pop('defaults', None)
         for key in cfg:  # replace whole groups (e.g. `terrain`), like a hydra group override
             config[key] = cfg[key]
-    config = OmegaConf.merge(config, OmegaConf.from_dotlist(['headless=False', 'num_envs=1'] + overrides))
+    # terrain-aware runs: draw the height scan the policy sees (blue dots); env.config.terrain_aware.debug_draw_height_scan=False hides it
+    scan = ['env.config.terrain_aware.debug_draw_height_scan=True'] if config.env.config.get('terrain_aware') else []
+    config = OmegaConf.merge(config, OmegaConf.from_dotlist(['headless=False', 'num_envs=1'] + scan + overrides))
+    if config.terrain.get('fixed_difficulty', None) is not None:
+        # the terrain curriculum builds its own rows of difficulty and ignores fixed_difficulty: without this a run
+        # trained with terrain.curriculum=True is filmed on an easy row, not on the difficulty asked for
+        config.terrain.curriculum = False
     # same episode ends as terrain_eval.py, so every checkpoint is judged alike (training configs carry their own,
     # e.g. a motion-far threshold from 0.3 to 1.5 m with its curriculum still running)
-    termination = config.env.config.termination
-    for key in termination:
-        termination[key] = key in ('terminate_when_motion_end', 'terminate_by_gravity', 'terminate_when_motion_far')
-    config.env.config.termination_scales.termination_motion_far_threshold = args.far
-    config.env.config.termination_curriculum.terminate_when_motion_far_curriculum = False
+    defense = config.env.config.get('defense', None) is not None  # defense runs keep their own episode ends (the guard
+    if not defense:                                                # is held past its end, drift cutoff as trained)
+        termination = config.env.config.termination
+        for key in termination:
+            termination[key] = key in ('terminate_when_motion_end', 'terminate_by_gravity', 'terminate_when_motion_far')
+        config.env.config.termination_scales.termination_motion_far_threshold = args.far
+        config.env.config.termination_curriculum.terminate_when_motion_far_curriculum = False
     pre_process_config(config)
     frames_dir = Path(tempfile.mkdtemp(prefix='pbhc_frames_'))
     config.env.config.save_rendering_dir = str(frames_dir)  # required by the viewer setup; its own recorder is not used
@@ -105,24 +113,46 @@ def record(args, overrides):
 
     num_steps = int(round(args.seconds / env.dt))
     falls, episodes, ends = 0, 0, []
+    outcomes = [0, 0, 0]  # defense: attacks hit, blocked, evaded
+    status, lands = [], []  # per step: text shown under the caption (the counter in progress); times of landed counters
     with torch.no_grad():
         obs = env.reset_all()
         for step in range(num_steps):
             obs, _, dones, extras = env.step({'actions': policy(obs['actor_obs'])})
+            if defense and int(env._defense_event[0]) > 0:
+                outcomes[int(env._defense_event[0]) - 1] += 1
+            status.append('')
+            if defense and getattr(env, '_counter_enabled', False):
+                if bool(env._counter_active[0]):
+                    status[-1] = 'COUNTER: ' + env._counter_bank.names[int(env._counter_clip[0])].replace('_', ' ')
+                if float(env._counter_land_age[0]) < 0.6:
+                    status[-1] += '  - LANDED'
+                if float(env._counter_event[0]) > 0:
+                    lands.append(f'{(step + 1) * env.dt:.2f}s')
             if dones[0]:
                 episodes += 1
                 reasons = [k for k, v in env.reset_buf_terminate_by.items() if bool(v[0])]
                 ends.append(f'{(step + 1) * env.dt:.2f}s:{"+".join(reasons) or "?"}')
-                if 'motion_end' not in reasons:
+                if 'motion_end' not in reasons and not (defense and bool(env.time_out_buf[0])):
                     falls += 1
 
     # label every frame, then encode
     caption = f'{args.label}   falls: {falls} in {args.seconds:g} s' if args.label else f'falls: {falls} in {args.seconds:g} s'
+    if defense:
+        caption = (f'{args.label}   ' if args.label else '') + \
+            f'hit {outcomes[0]}  blocked {outcomes[1]}  evaded {outcomes[2]}  lost guard/fell: {falls}  ({args.seconds:g} s)'
+        if getattr(env, '_counter_enabled', False):
+            totals = env._counter_totals.sum(dim=0).tolist()
+            caption = (f'{args.label}   ' if args.label else '') + \
+                f'hit {outcomes[0]} blocked {outcomes[1]} evaded {outcomes[2]} | counters {int(totals[0])}, landed {int(totals[1])} | lost/fell {falls}'
     for png in sorted(frames_dir.glob('*.png')):
         img = Image.open(png).convert('RGB')
         draw = ImageDraw.Draw(img)
         draw.rectangle([0, 0, img.width, 44], fill=(0, 0, 0))
         draw.text((12, 6), caption, fill=(255, 255, 255), font=font)
+        step = int(png.stem) - (state['frame'] - num_steps)  # the frames before the first step are the reset's
+        if 0 <= step < len(status) and status[step]:
+            draw.text((12, 52), status[step], fill=(255, 230, 80), font=font)
         img.save(png)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -130,6 +160,8 @@ def record(args, overrides):
     shutil.rmtree(frames_dir)
     print(f'wrote {out}: {state["frame"]} frames, {episodes} episode ends, {falls} falls (episode ends before the motion end)')
     print('episode ends (time: reason):', ' '.join(ends))
+    if lands:
+        print('counters landed at:', ' '.join(lands))
 
     if args.wandb_run:
         import wandb

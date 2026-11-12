@@ -1103,8 +1103,9 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         for env_id in range(1):
         # for env_id in range(self.num_envs):
             if not self.config.use_teleop_control:
-                # draw marker joints
-                for pos_id, pos_joint in enumerate(self.marker_coords[env_id]): # idx 0 torso (duplicate with 11)
+                # draw marker joints (env.config.draw_reference_markers=False hides them, e.g. in videos)
+                markers = self.marker_coords[env_id] if self.config.get('draw_reference_markers', True) else []
+                for pos_id, pos_joint in enumerate(markers): # idx 0 torso (duplicate with 11)
                     if self.config.robot.motion.visualization.customize_color:
                         color_inner = self.config.robot.motion.visualization.marker_joint_colors[pos_id % len(self.config.robot.motion.visualization.marker_joint_colors)]
                     else:

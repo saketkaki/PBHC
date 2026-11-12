@@ -1,0 +1,53 @@
+# @package _global_
+
+# Defense on uneven terrain (DEFENSE_MANEUVERS.md, Section 9): the defense env and attack-conditioned policy of
+# exp/defense.yaml on the terrain of the terrain-aware tracking work (flat, bumps, tilt, step tiles with a curriculum),
+# with the ground-relative guard reference and the terrain scans as extra observations.
+#
+#   python humanoidverse/train_agent.py +simulator=isaacgym +exp=defense_terrain +opt=wandb +device=cuda:0 headless=True \
+#       project_name=Defense seed=2 checkpoint=<flat defense checkpoint expanded with scripts/expand_checkpoint.py> \
+#       experiment_name=<name>
+#
+# The config groups below replace `+terrain= +robot= +domain_rand= +rewards= +obs=` on the command line.
+
+defaults:
+  - defense
+  - /terrain: terrain_kungfu
+  - /robot: g1/g1_23dof_lock_wrist
+  - /domain_rand: main
+  - /rewards: defense/main
+  - /obs: defense/main_terrain # + height scan, foot scans, privileged scan for the critic
+  - _self_
+
+project_name: Defense
+experiment_name: defense_terrain
+num_envs: 4096
+
+robot:
+  motion:
+    motion_file: g1_attack_dataset/PBHC_attacks/motion_data/attacks/defender_guard.pkl
+
+env:
+  config:
+    terrain_aware:
+      recenter_motion_xy: True # the guard on the centre of its tile, where the terrain features pass
+      spawn_clearance: 0.01
+      ground_relative_ref: True # the guard reference (and with it the attacker) stands on the local terrain
+      height_scan:
+        y_range: [-0.5, 0.5]
+      height_lookup: exact
+      ref_height_lookup: exact
+      placement_jitter: 0.15 # [m] random xy shift of the guard per episode: each tile's features are met at many offsets
+      early_start:
+        prob: 0.0 # the guard has no opening move
+
+terrain:
+  curriculum: True # defense rule (LeggedRobotDefense._update_terrain_curriculum): up after a survived episode, down after an early end
+  num_cols: 24
+  max_init_terrain_level: 1
+  curriculum_graduate_rows: 2
+  curriculum_max_difficulty_by_type: {step: 2.0, tilt: 1.75, bumps: 2.0} # top rows: 17 cm steps, 21 deg tilt, 8 cm bumps
+
+algo:
+  config:
+    save_interval: 500

@@ -1332,3 +1332,263 @@ The user redirected the work to the defense maneuvers on terrain. State of the m
 | Roundhouse kick | ft41 `model_58500.pt` | 100.0 | 66.7 | 75.4 mm | kick only loosely tracked |
 | Charleston dance, Bruce Lee pose | – | – | – | – | not started |
 
+### Defense on terrain: start (branch `terrain-aware-defense`)
+
+PR #2 (akhilghar's `defense-maneuvers`) is merged into `terrain-aware-tracking`; the terrain work for defense is on the new branch `terrain-aware-defense`. Design: [DEFENSE_MANEUVERS.md](DEFENSE_MANEUVERS.md).
+
+**Dataset.** The 480 attack clips are not committed. `generate_attacks.py --per_attack 60 --seed 0` fails in the `pbhc` env: MuJoCo 3.2.3 reports larger self-penetration than the version the dataset was made with (16.2 mm against 12.2 mm for `body_shot_0000`, limit 15 mm), so every body shot is rejected. Generated in a separate conda env `attackgen` (Python 3.12, MuJoCo 4.0.0, NumPy 1.26): 469 clips equal the committed `index.json`, 11 were resampled (crosses, rear hooks, rear uppercuts). The committed `index.json` is unchanged; the env reads the labels from the clips. `defense_check.py bank / policy / env` pass, and the do-nothing baseline equals the document's (54% hit, 46% blocked).
+
+### DEF-FLAT: first full flat-ground defense run (`def01_flat_s2`)
+
+- **W&B:** `yvdaw6rw` (project `Defense`). The command of DEFENSE_MANEUVERS.md Section 7 with seed 2, 4,096 envs. Stopped at 3,000 of 20,000 iterations (about 65 minutes) because it was already good.
+- **Training:** episode length 15 → 937 steps (of 1,000); drift terminations 99% → 21% at 2,000 iterations; falls < 1%; noise std 0.80 → 0.70.
+
+`defense_eval.py`, 256 episodes of 20 s, eval seed 0:
+
+| | Do-nothing guard | 2,000 it | 3,000 it |
+|---|---|---|---|
+| Hit / blocked / evaded | 54 / 46 / 0 | 0.1 / 85.7 / 14.2 | 0.0 / 88.6 / 11.4 |
+| Survived 20 s | – | 99.2 | 100.0 |
+| Guard body error | – | 85.8 mm | 56.2 mm |
+| Hit, attacker hidden (`--blind freeze`) | – | 15.3 | 32.7 |
+| Hit, blocks disabled (`block_radius=0`) | – | 4.0 | – |
+| Belief class accuracy during the strike | – | 85% | 86% |
+
+- **Hits go to zero within 2,000 iterations,** with no falls and no attacks interrupted by drift.
+- **The policy uses what it sees more as training goes on:** hiding the attacker raises the hit rate to 15% at 2,000 iterations and 33% at 3,000 (calf kick 87% at 2,000).
+- **Part of the defense is a posture, not a reaction:** with blocks disabled 96% of attacks still miss at 2,000 iterations, and the guard is held 56–86 mm off the reference.
+
+**Problems:** one training seed, one eval seed. The geometric block rule (7 cm around the forearm axis) is easy to satisfy; no physical contact.
+
+**Verdict:** keep as the flat-ground baseline and warm start. `model_2000.pt` was used for the terrain run because it was the checkpoint available when that run started.
+
+### Terrain code for defense
+
+- `envs/defense/defense.py`: the attack clips stand on the support height of the defender's guard reference (terrain under its feet) when `ground_relative_ref` is on, updated every step; unchanged on flat ground. Terrain curriculum for a held guard: up one row after a survived episode, down after an episode that ended before half time. The attacker keypoint history is refilled on the first step after a reset.
+- `config/obs/defense/main_terrain.yaml`: defense observations + height scan (11 × 11), foot scans, privileged scan for the critic. Actor 978, critic 1,470 inputs.
+- `config/exp/defense_terrain.yaml`: preset (defense env, `terrain_kungfu`, ground-relative guard, re-centring, jitter 0.15 m, 24 columns, ceilings `{step: 2.0, tilt: 1.75, bumps: 2.0}`, graduate rows 2).
+- `scripts/expand_checkpoint.py`: handles the attack-conditioned actor (first layer of its policy MLP; the encoder is unchanged).
+- `scripts/defense_eval.py`: `--terrain {flat,step,tilt,bumps} --difficulty D`.
+- Check: the expanded flat policy evaluated in the terrain env on flat tiles gives 98.0% survival and 0.1% hits, as in its own env.
+
+### DEF-TERRAIN: first terrain defense run (`def02_terrain_s2`, running)
+
+- **W&B:** `p9ni5abm`. `+exp=defense_terrain`, warm-started from DEF-FLAT `model_2000.pt` expanded to the terrain observations, optimizer state loaded, PPO settings as the flat run, up to 6,000 iterations (saved counter 2,000 → 8,000).
+- **Training, first 1,150 iterations:** levels step 0.17 → 2.53, tilt 0.04 → 2.44, bumps 0.33 → 3.36; drift terminations 63 → 45%; falls 1.4%.
+
+`defense_eval.py --terrain`, 256 episodes of 20 s, eval seed 0 (survived / hit rate of resolved attacks / guard body error):
+
+| Terrain | Flat policy (0 it of terrain) | 500 it | 1,000 it | 2,500 it |
+|---|---|---|---|---|
+| Flat | 98.0 / 0.1 / 88 mm | 96.9 / 0.3 / 120 mm | 98.8 / 0.2 / 94 mm | 99.6 / 0.1 / 70 mm |
+| Steps 10 cm | 26.2 / 0.1 / 99 mm | 55.1 / 1.0 / 167 mm | 79.7 / 0.7 / 149 mm | **82.8** / 0.3 / 123 mm |
+| Steps 17 cm | 28.9 / 0.4 / 102 mm | 29.7 / 1.6 / 193 mm | 63.7 / 1.8 / 178 mm | **81.2** / 0.8 / 148 mm |
+| Tilt 18° | 0.0 / 28.6 / 160 mm | 26.6 / 1.4 / 227 mm | 42.2 / 2.6 / 212 mm | **94.5** / 1.4 / 153 mm |
+| Bumps 8 cm | 7.4 / 1.0 / 159 mm | 74.2 / 0.7 / 178 mm | 83.2 / 0.1 / 158 mm | **96.5** / 0.2 / 118 mm |
+
+At 2,500 iterations falls are 5.1% on 10 cm steps, 3.5% on 17 cm steps and 0% elsewhere; training levels are step 3.36, tilt 3.48, bumps 3.60, with drift terminations down to 24%.
+
+Videos of `model_3500.pt` (1,500 it of terrain training), 20 s each: `logs/Defense/videos_def02_it3500/` (flat, steps 10 and 17 cm, tilt 18°, bumps 8 cm; no hits in any clip). `scripts/record_video.py` now keeps a defense run's own episode ends and puts the hit / block / evade counts in the caption.
+
+- **Survival on terrain rises fast** and hits stay below 3% everywhere; the episodes that end, end by drift from the guard (falls 0–4%).
+- **The guard is held loosely on terrain** (150–210 mm error).
+
+Final eval, `model_5000.pt` (3,000 it of terrain training): flat 100.0 / 0.0 / 63 mm, steps 10 cm 82.8 / 0.4 / 114 mm, steps 17 cm 82.0 / 1.3 / 140 mm, tilt 18° 98.8 / 0.4 / 126 mm, bumps 8 cm 94.1 / 0.1 / 115 mm; falls 3.1% and 2.7% on steps, 0 elsewhere. Steps did not improve after 2,500 iterations.
+
+**Problems:** steps level off at about 82% survival. One training seed, one eval seed. The policy defends only; it never attacks back (the user's objection, which led to the counterattack work below).
+
+**Verdict:** keep as the terrain defense baseline and the warm start for the counterattacks. Stopped at 3,175 of 6,000 iterations to free the GPU. Videos are in the run on W&B (`videos/…`).
+
+### Counterattacks: design and code
+
+The user's requirement (2026-11-11): the defender must not only dodge; it must counterattack with the kung-fu motions trained on terrain, after each defended attack.
+
+- **Clips** (`scripts/make_defense_counters.py`): Horse-stance punch, Hooks punch, Side kick, Roundhouse kick, each turned and moved to start at the guard's root position and heading, with a 0.6 s blend from the guard and a 0.8 s blend back. 6.7–8.1 s each. Strikes: right fist at 3.50 s (0.97 m high) and 2.87 s (1.16 m), right foot at 2.97 s (1.32 m), left foot at 2.63 s (1.20 m).
+- **Env** (`envs/defense/defense.py`, `counter_bank.py`, `env.config.defense.counter`): after a blocked or evaded attack, with probability 0.7, the defender's reference switches from the held guard to a clip and back at its end. The attacker holds its guard and moves (over 0.6 s) to where the clip's strike lands; the target is a point on its pelvis, torso or head vertical at the strike height. The counter lands when the striking hand or foot passes within 0.15 m of the target within ±0.4 s of the strike time. The guard keeps a 0.6 m drift cutoff; the clips use the env's cutoff (0.7 m for the punches).
+- **Observation** `counter_command` (6): one-hot of the clip, phase, active flag. **Rewards:** `defense_counter_hit` +5 per landed counter, `defense_counter_proximity` up to +0.1 per step around the strike.
+- **Preset** `+exp=defense_terrain_counter`; `expand_checkpoint.py` adds zero-initialised critic heads for new reward terms; `defense_eval.py` and `record_video.py` report counters.
+- **Check:** with the reference tracked exactly the striker passes 5–7 cm (mean) from the target for the punches and the side kick on terrain; the roundhouse check gave 18 cm with outliers (not resolved).
+- **Limit:** the clips are not turned to face the attacker; the ghost attacker is moved to the strike point.
+
+### DEF-COUNTER stage 1: the two punches (`def03_counter_punch_s2`, running)
+
+- **W&B:** `jogyxnn3`. `+exp=defense_terrain_counter`, clips `[horse_stance_punch, hooks_punch]`, warm-started from DEF-TERRAIN `model_5000.pt` (new inputs and value heads zero), 4,096 envs, about 3.9 s per iteration.
+- **Training, first 1,150 iterations:** terrain levels fell when the counters started (step 2.25 → 0.95) and recovered (step 2.80, tilt 3.21, bumps 3.46). Counters that land, of those performed to the end: 0 → 97%. Drift terminations 95 → 35%, falls 2.8%, hit rate 2.3%.
+
+`defense_eval.py --terrain`, 256 episodes of 20 s, eval seed 0. Survived / hit rate / counters landed, of those started:
+
+| Terrain | 500 it | 1,000 it | 2,000 it |
+|---|---|---|---|
+| Flat | 91.0 / 0.1 / 90.3 | 98.0 / 0.0 / 88.9 | 97.3 / 0.0 / **90.9** |
+| Steps 10 cm | 68.0 / 2.7 / 73.2 | 78.9 / 1.8 / 83.1 | 77.3 / 1.0 / **84.3** |
+| Steps 17 cm | 60.9 / 3.4 / 65.1 | 68.0 / 3.1 / 75.7 | 74.6 / 2.0 / **87.1** |
+| Tilt 18° | 56.6 / 1.6 / 34.9 | 74.2 / 0.6 / 60.4 | 92.2 / 0.1 / **87.3** |
+| Bumps 8 cm | 78.5 / 0.4 / 75.4 | 89.1 / 0.3 / 81.2 | 95.3 / 0.1 / **83.3** |
+
+At 2,000 iterations falls are 6.6% and 3.9% on steps and 0 elsewhere; per clip the Hooks punch lands 86–94% and the Horse-stance punch 80–88%. Training levels: step 3.31, tilt 3.49, bumps 3.55; drift terminations 21%.
+
+- **The counters land** on every terrain after 1,000 iterations, 60–89% of those started, and both punches are similar (Hooks a few points higher).
+- **Survival is below the terrain-only policy** (steps 79 and 68% against 83 and 82%; tilt 74% against 99%) but still rising.
+- About 550 counters and 700 attacks per 256 episodes: a counter takes 7–8 s, so there are fewer attacks per episode than without counters (about 2,700).
+
+**Problems:** steps remain the weakest terrain (75–77% survival, 4–7% falls). The attacker is moved to the strike point, the clip is not aimed. One training seed, one eval seed.
+
+**Verdict:** keep; stopped at 2,075 of 6,000 iterations (`model_7000.pt`) to start the kicks. Videos (side camera): `logs/Defense/videos_def03_it7000/`, logged into the run on W&B.
+
+### DEF-COUNTER stage 2: punches and kicks (`def04_counter_kicks_s2`, running)
+
+- **W&B:** `g4ht9wtr` (two earlier launches failed on a W&B start timeout; `wiemqe8a` is an empty run from one of them). From stage 1 `model_7000.pt`, up to 5,000 iterations.
+- **Settings:** clips `[horse_stance_punch, hooks_punch, side_kick ×2, roundhouse_kick ×2]` (kicks sampled twice as often); the kicks' drift cutoff follows PBHC's curriculum from 1.5 m to 0.7 m at a slower rate (`curriculum_degree=1.5e-5`, about 2,100 iterations), the punches keep 0.7 m (`counter.clip_far_threshold`, new) and the guard 0.6 m.
+- **Stopped at 350 iterations** (cutoff 1.5 → 1.34 m, kicks 0% landed, punches 97%) when the user reported three problems in the stage 1 videos; the design below replaces the one this run used.
+
+### Rework after the stage 1 videos: attacker on the ground, counters aimed at it
+
+Problems the user saw in the `def03` videos: (1) the red attacker lifts into the air so that the defender's move reaches it; (2) only the reference dots reach the attacker, not the robot itself; (3) the attacker's feet slide.
+
+Causes: the attacker's height followed the ground under the defender, and it was moved to where the counter clip's strike lands (1, 3); the standoff step-in and every new clip's placement translate the whole ghost (3); the counter was scored against a point placed where the reference strikes, within 15 cm (2).
+
+Changes (`envs/defense/defense.py`, `attack_bank.py`, `counter_bank.py`):
+
+- **Attacker feet (`defense.attacker_feet`, on by default).** Each foot stays where it stands while its clip has it in contact, on the terrain under it; the pelvis and upper body are placed as before (clip, standoff, defender position), and the legs shear between them, so the step-in of the standoff becomes a lunge over planted feet. A foot farther than 0.3 m from where the clip has it is re-planted with a lifted step of 0.3 s; a foot the clip lifts (calf kick) follows the clip. Upper-body height: the attacker's own ground, lowered by up to 0.2 m or raised by up to 0.05 m towards the defender's ground so its strikes stay aimed where its legs allow.
+- **The attacker is no longer moved for counters.** The counter clip is aimed: turned about its start and shifted along the strike direction so the strike reaches the attacker's trunk, eased in over the clip's blend from the guard and out at its end (limits 100° and 0.4 m). New observation `counter_aim` (yaw, xy shift).
+- **Landing is judged on the robot and the attacker's body:** the defender's own striking hand or foot must pass within 0.12 m of the attacker's trunk axis (pelvis to the top of the head) within ±0.4 s of the strike.
+- **Clips rebuilt** with 1.5 s blends in and out (8.3–9.7 s), because aiming needs a pivot: the guard is bladed 25° and the motions strike 27–49° to the right of their start heading, so the aim yaw is 40–100° (mean 68°). Counter episodes are 30 s.
+- **Checks (128 envs, terrain curriculum tiles):** planted feet move 0.0 mm per step; a planted foot's height above its ground varies by at most 20 mm; with the clip tracked exactly the striker passes 4–7 cm (mean; 90th percentile 8–12 cm) from the trunk axis.
+
+**Limits:** the attacker's legs are sheared, not solved by inverse kinematics (the viewer turns the thigh and shin links to follow). The attacker still cannot be touched. The reference feet of the defender slide during the pivot; the robot has to step.
+
+### DEF-AIM stage 1: aimed counter punches (`def05_aim_punch_s2`, running)
+
+- **W&B:** `ukdg2kn6`. `+exp=defense_terrain_counter` with the rework, punches only, from DEF-COUNTER stage 1 `model_7000.pt` (`counter_aim` inputs zero), up to 5,000 iterations, 30 s episodes.
+
+
+### DEF-AIM stage 1 stopped, counters moved farther apart (2026-11-11, 10:45 PM)
+
+`def05_aim_punch_s2` (W&B `ukdg2kn6`) stopped at iteration 10,850 (3,850 into the run); last checkpoint `model_10500.pt`.
+Survival / attacker hits / counters landed at `model_10000.pt` (30 s episodes): flat 100 / 1.3 / 89.8, step 10 cm
+69.9 / 2.8 / 75.0, step 17 cm 69.9 / 3.0 / 76.2, tilt 18° 91.8 / 1.4 / 90.2, bumps 8 cm 98.4 / 1.3 / 86.8.
+
+User feedback on the `model_10000.pt` videos: only the yellow reference dots appear to hit, not the robot's hands;
+suggested standing farther away. Measured on flat (`scratchpad/counter_diag.py`): the guard keeps the two pelvises
+0.78 m apart, but the aimed clip walked the defender in by 0.33 m, so at the strike the pelvises were 0.45–0.47 m apart
+and the fist ended 3–5 cm from the attacker's trunk axis, i.e. inside the ghost. The fist itself did extend (0.41–0.46 m
+from the defender's root, reference 0.43–0.49 m), but the two bodies overlapped and hid it.
+
+Changes:
+- `counter.aim_depth` 0 → 0.13 m: the strike is aimed at the trunk's surface, pelvises 0.56–0.58 m apart at the strike.
+- `counter.hit_radius` 0.12 → 0.17 m (surface of the trunk plus the fist), and new `counter.min_extension: 0.8`: a
+  counter lands only if the striker is also at least 80% of the clip's reach away from the defender's own root.
+- `defense_counter_proximity` no longer rewards going deeper than `aim_depth`.
+- `env.config.draw_reference_markers=False` hides the yellow reference dots (used for the videos).
+
+`def06_apart_punch_s2` (W&B `ofsvbg44`): from `logs/warmstart/def05_10500_apart.pt`, punches only, 2,000 iterations.
+
+### Kung-fu counters paused; counters are now the dataset strikes (2026-11-11, 11:50 PM)
+
+`def06_apart_punch_s2` (W&B `ofsvbg44`) stopped at about iteration 11,450 (950 into the run; last checkpoint
+`model_11000.pt`). At `model_11000.pt` (30 s episodes) survival / attacker hits / counters landed: flat 100 / 0.6 / 88.0,
+step 10 cm 75.4 / 1.4 / 76.7, step 17 cm 76.6 / 2.0 / 73.5, tilt 18° 86.3 / 1.3 / 85.9, bumps 8 cm 98.8 / 0.4 / 86.5.
+With the farther aim the pelvises are 0.55–0.59 m apart at the punch and the fist ends 12–13 cm from the attacker's
+centre line. Check videos (no reference dots, white rings on the fist when a counter lands):
+`logs/Defense/videos_def06_it11000/`.
+
+User request: use the eight strikes of the attack dataset as the counters for now, instead of the kung-fu motions.
+
+- `scripts/make_defense_counters.py` also builds one counter clip per attack class (jab, cross, lead_hook, rear_hook,
+  lead_uppercut, rear_uppercut, body_shot, calf_kick): the class's clip with the median striking distance, 0.3 s blends
+  from and to the guard (the dataset clips already start and end in it, feet planted). 2.0–3.3 s per clip.
+- Strikers `left_shin` / `right_shin` (75 % from knee to ankle) and a `leg` target for the calf kick: it is aimed at the
+  attacker's nearer shin and lands within `counter.leg_hit_radius` (0.12 m) of the attacker's thigh or shin segments.
+- `+exp=defense_terrain_strikes`, obs `defense/main_terrain_strikes` (`counter_command` 10 = 8 clips + phase + flag).
+- Aim check (`scratchpad/strike_geom.py`, 256 envs): aim yaw −22…25° (the kung-fu clips needed 40–100°), shift towards
+  the attacker 0.08–0.26 m (mean per clip), reference fist 11–14 cm from the trunk axis at the strike (calf kick 5.6 cm
+  from the leg), reference pelvises 0.58–0.67 m apart.
+
+`def07_strikes_s2` (W&B `6869b32v`): from DEF-TERRAIN `model_5000.pt` expanded to the new inputs
+(`logs/warmstart/def02_5000_strikes.pt`), all eight strikes, up to 3,000 iterations (labels 5,000 → 8,000).
+
+### DEF-STRIKES stage 1 (`def07_strikes_s2`, stopped at 1,200 it) and restart (`def08_strikes_ease_s2`) (2026-11-12, 2:00 AM)
+
+`def07_strikes_s2` (W&B `6869b32v`; videos of `model_6000.pt` logged into the run). 30 s episodes, 256 episodes each:
+
+| Terrain | Survived 500 → 1,000 it | Drift at 1,000 it | Attacker hits | Counters landed 500 → 1,000 it |
+|---|---|---|---|---|
+| Flat | 91.8 → 78.9% | 21.1% | 0.0% | 45.4 → 83.8% |
+| Step 10 cm | 53.1 → 40.2% | 57.0% | 0.5% | 43.5 → 81.1% |
+| Step 17 cm | 44.1 → 32.4% | 66.8% | 0.9% | 36.3 → 76.0% |
+| Tilt 18° | 43.4 → 29.7% | 70.3% | 0.9% | 43.2 → 76.8% |
+| Bumps 8 cm | 73.0 → 68.0% | 32.0% | 0.2% | 45.0 → 82.4% |
+
+- The seven hand strikes land 80–97% on every terrain at 1,000 it (the rear-hand ones only after 500 it).
+- The calf kick lands 0%: the robot does not throw it; its shin stays 55 cm from the attacker's leg (`scratchpad/calf_diag.py`).
+- Survival fell with training: drift terminations. Two causes found. (1) The aim (0.2–0.3 m towards the attacker) was
+  eased in over the clip's 0.3 s blend, a move no robot can follow; (2) a robot that does not kick is about 0.5 m from
+  the reference leg, close to the 0.7 m cutoff, so calf-kick counters ended episodes.
+
+Changes for `def08_strikes_ease_s2` (W&B `l0ybapr8`, from `def07` `model_6000.pt`, up to 3,000 it):
+- The aim of a dataset strike eases in from the clip's start to 0.1 s before the strike and out from 0.3 s after it to
+  the clip's end (`counter_meta.aim_span`); the kung-fu clips keep the easing over their blends.
+- Drift cutoff: the seven hand strikes keep 0.7 m (`counter.clip_far_threshold`); the calf kick follows the PBHC
+  curriculum 1.5 → 0.7 m (degree 1.5e-5).
+- `counter.leg_proximity_sigma: 0.3` (0.15 for the trunk): the proximity reward reaches a kick that is not thrown yet.
+
+### `def08_strikes_ease_s2` stopped at 1,175 it; `def09_strikes_kick_s2` (2026-11-12, 4:00 AM)
+
+`def08_strikes_ease_s2` (W&B `l0ybapr8`; videos of `model_7000.pt` logged into the run). 30 s episodes:
+
+| Terrain | Survived 500 → 1,000 it | Drift at 1,000 it | Attacker hits | Counters landed at 1,000 it |
+|---|---|---|---|---|
+| Flat | 97.7 → 99.6% | 0.4% | 0.0% | 82.8% |
+| Step 10 cm | 64.8 → 69.9% | 27.7% | 1.0% | 82.0% |
+| Step 17 cm | 53.5 → 64.8% | 33.6% | 0.8% | 77.0% |
+| Tilt 18° | 26.6 → 75.4% | 24.6% | 1.0% | 76.1% |
+| Bumps 8 cm | 86.7 → 95.3% | 4.7% | 0.0% | 82.7% |
+
+The gentler aim and the calf-kick cutoff curriculum restored survival. The calf kick still lands 0%: the robot keeps
+its right foot down (shin 57 cm from the attacker's leg, extension 0.18 m of the clip's 0.33 m).
+
+`def09_strikes_kick_s2` (W&B `142e0ih8`, from `def08` `model_7000.pt`, up to 3,000 it): the calf kick is drawn three
+times as often (3 of 10 counters) and `counter.leg_reward_scale: 3.0` triples its hit and proximity rewards.
+
+### 2026-11-12 — DEF-STRIKES: def09 results (calf kick lands), re-anchoring, def10
+- `def09_strikes_kick_s2` (W&B `142e0ih8`, from def08 `model_7000`, calf kick sampled 3x, `leg_reward_scale` 3.0), stopped at ~8,350.
+  `model_8000`, 256 episodes of 30 s, survived / attacker hits / counters landed (calf kick landed):
+  flat 81.6 / 1.6 / 87.0 (92.1), steps 10 cm 42.6 / 2.1 / 84.7 (83.4), steps 17 cm 28.9 / 1.4 / 76.8 (64.5),
+  tilt 18 deg 37.9 / 1.0 / 75.9 (78.1), bumps 8 cm 66.4 / 0.7 / 85.8 (92.5). The calf kick now lands (0 % before), but
+  survival fell again: drift 18–59 %.
+- Diagnosis (scratchpad `drift_diag.py`, `retreat_diag.py`): the robot follows the step-in (root error ≈ 0 at the strike)
+  but does not step back: at the end of every clip its root is +0.15…0.22 m towards the attacker (p90 0.3 m) while the
+  reference has eased back to the guard's place. Drift ends cluster at the clip's end (0.7 m cutoff) and in the first
+  second of the guard after it (0.6 m cutoff); calf kick +0.3 m forward during the whole clip.
+- Fix `counter.reanchor` (0.45 m per counter, `reanchor_total` 1.0 m per episode): the aim's shift no longer eases out
+  (`CounterBank.hold_shift`), and when the clip ends the guard reference moves to the robot's root
+  (`_placement_offset`). The attacker's next clip is placed relative to the robot anyway. Without retraining, def09
+  `model_8000` with it: steps 10 cm 42.6 → 60.9 % survival, tilt 18 deg 37.9 → 68.0 %.
+- Videos of def09 `model_8000` (recorded with re-anchoring) are in `logs/Defense/videos_def09_it8000/` and in run `142e0ih8`.
+- `def10_strikes_reanchor_s2` (W&B `hi21mtti`) continues from def09 `model_8000` with `reanchor: 0.45`.
+
+### 2026-11-12 — DEF-STRIKES: def10 results (re-anchoring), def11
+- `def10_strikes_reanchor_s2` (W&B `hi21mtti`, from def09 `model_8000`, `reanchor: 0.45`), stopped at ~10,200.
+  `model_10000`, 256 episodes of 30 s, survived / attacker hits / counters landed (calf kick landed):
+  flat 99.2 / 0.0 / 92.9 (95.7), steps 10 cm 71.9 / 0.6 / 92.2 (92.8), steps 17 cm 60.5 / 0.6 / 87.4 (84.6),
+  tilt 18 deg 85.5 / 1.0 / 83.4 (86.1), bumps 8 cm 98.4 / 0.0 / 88.9 (95.2).
+  Earlier checkpoints, survival flat/step10/step17/tilt/bumps: 8500 87.5/60.2/47.3/61.3/88.3; 9000 97.7/71.9/52.3/64.1/93.4;
+  9500 91.8/69.5/60.9/55.9/94.5.
+- Diagnosis at `model_10000` (scratchpad `drift_diag2.py`): on 10 cm steps the drift ends are falls in progress (head
+  farthest, pelvis 9–16 cm low, trunk tipping), median 4.6 s into the episode, half during a counter. On tilt the one
+  drift end seen had reached `reanchor_total` 1.0 m (every counter moves robot and attacker ~0.2 m on).
+- Videos of `model_10000` (flat, 10 cm steps, 18 deg tilt): `logs/Defense/videos_def10_it10000/`, logged into `hi21mtti`.
+- `def11_strikes_steps_s2` (W&B `3hh6zfuw`) continues from def10 `model_10000` with `reanchor_total: 1.5` and
+  terrain proportions flat/bumps/tilt/step 0.1/0.2/0.3/0.4 (was 0.1/0.3/0.3/0.3).
+
+### 2026-11-12 — Defense videos were filmed on easy curriculum rows (fixed)
+- `scripts/record_video.py` left `terrain.curriculum=True` of the defense exps on; the curriculum builds its own rows and
+  ignores `terrain.fixed_difficulty`, and robots start on rows 0–1. So every defense terrain video up to def10's first
+  set was on ~6–9 cm steps / 4–8 deg tilt, not the labelled 10 cm / 18 deg (measured slope under the robot 3.7–8.1 deg;
+  17.4–17.7 deg with the curriculum off). The scratchpad diagnostics (`drift_diag*.py`, `retreat_diag.py`) had the same
+  problem. `scripts/defense_eval.py` sets `terrain.curriculum=False`, so the evaluation numbers are at the stated difficulty.
+- Fix: `record_video.py` sets `terrain.curriculum=False` when a fixed difficulty is asked for, and draws the height scan
+  (`terrain_aware.debug_draw_height_scan`) by default. The step video is filmed with `--cam-offset -1.0 -2.2 0.7` so the
+  step face is towards the camera.
+- def10 `model_10000` re-recorded: `videos_def10_it10000/def10_10000_{step,tilt}_fixed.mp4`, logged into `hi21mtti`
+  (same keys, newer step). 10 cm steps: one drift end at 2.7 s, 4 of 5 counters land; 18 deg tilt: no episode end, 4 of 6 land.

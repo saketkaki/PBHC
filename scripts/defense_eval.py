@@ -7,6 +7,8 @@ more than the training threshold from the guard reference). Attacks are counted 
   interrupted           the episode ended by a fall or drift after the attack's onset and before its outcome
 Rates are shares of the resolved attacks; interrupted attacks are reported separately, so a policy that falls instead of
 getting hit does not look better (check fall_rate and interrupted together).
+Counterattacks (env.config.defense.counter): per clip, the counters started, the share whose strike landed on the attacker
+and the share performed to the end (the rest ended with the episode: a fall, drift from the reference or the time-out).
 Belief head (actor's encoder on the observed keypoints, against the privileged labels), over all steps of all episodes:
   class accuracy per attack phase (0 guard, 1 strike, 2 retract, 3 guard), phase accuracy, time-to-impact MAE during
   the strike phase.
@@ -18,7 +20,7 @@ are unchanged, and the belief metrics are computed on what the actor sees):
 
 usage (from the repo root, env `pbhc` active):
   python scripts/defense_eval.py CKPT [--name default] [--episodes 256] [--num-envs 256] [--seed 0] [--episode-s 20]
-         [--blind {none,freeze,zero}] [--env-from RUN] [key=value ...]   e.g. env.config.defense.block_radius=0 env.config.defense.placement_noise.yaw_deg=30
+         [--blind {none,freeze,zero}] [--env-from RUN] [--terrain {flat,step,tilt,bumps} --difficulty D] [key=value ...]   e.g. env.config.defense.block_radius=0 env.config.defense.placement_noise.yaw_deg=30
                                 "env.config.defense.attacks=[cross,rear_hook]"
 --env-from RUN (a defense run's directory, checkpoint or config.yaml) evaluates a checkpoint trained without the defense
 env, e.g. a plain PBHC guard tracker: the env (attacks, standoff, terminations) comes from RUN, the policy's observations,
@@ -40,6 +42,8 @@ parser.add_argument('--episode-s', type=float, default=20.0)
 parser.add_argument('--device', default='cuda:0')
 parser.add_argument('--blind', choices=['none', 'freeze', 'zero'], default='none')
 parser.add_argument('--env-from', default=None)
+parser.add_argument('--terrain', default=None)  # flat, step, tilt or bumps: one terrain type for all envs (terrain runs)
+parser.add_argument('--difficulty', type=float, default=1.0)  # with --terrain: 1 = 10 cm steps, 12 deg tilt, 4 cm bumps
 args, overrides = parser.parse_known_args()
 
 import numpy as np  # noqa: E402
@@ -65,7 +69,10 @@ if args.env_from is not None:
     config.env = env_config.env  # its obs, rewards and robot interpolate to CKPT's
 config = OmegaConf.merge(config, OmegaConf.from_dotlist(
     ['headless=True', f'num_envs={args.num_envs}', f'env.config.max_episode_length_s={args.episode_s}',
-     'env.config.defense.debug_draw=False', f'env.config.defense.blind_actor={args.blind}'] + overrides))
+     'env.config.defense.debug_draw=False', f'env.config.defense.blind_actor={args.blind}']
+    + ([] if args.terrain is None else [  # a run trained with +exp=defense_terrain, on one terrain type and difficulty
+        'terrain.curriculum=False', f'terrain.terrain_types=[{args.terrain}]', 'terrain.terrain_proportions=[1.0]',
+        f'terrain.fixed_difficulty={args.difficulty if args.terrain != "flat" else 0}']) + overrides))
 pre_process_config(config)
 
 random.seed(args.seed)
@@ -157,7 +164,8 @@ for c in range(C):
 tot = outcomes.sum(dim=0).tolist()
 resolved = max(sum(tot[:3]), 1)
 result = {
-    'checkpoint': str(ckpt), 'name': args.name, 'seed': args.seed, 'blind': args.blind, 'env_from': args.env_from, 'overrides': overrides,
+    'checkpoint': str(ckpt), 'name': args.name, 'seed': args.seed, 'blind': args.blind, 'env_from': args.env_from, 'terrain': args.terrain,
+    'difficulty': args.difficulty if args.terrain is not None else None, 'overrides': overrides,
     'episodes': n_ep, 'episode_s': args.episode_s,
     'survival_rate': episode_counts['survived'] / n_ep, 'fall_rate': episode_counts['fall'] / n_ep,
     'drift_rate': episode_counts['drift'] / n_ep, 'mean_episode_s': float(np.mean(lengths)),
@@ -166,6 +174,15 @@ result = {
     'interrupted_rate': tot[3] / max(sum(tot), 1),
     'per_class': per_class,
 }
+counters = None
+if getattr(env, '_counter_enabled', False):  # counterattacks: started, landed on the attacker, performed to the end
+    totals = env._counter_totals.tolist()
+    counters = {name: {'started': int(n[0]), 'landed': n[1] / max(n[0], 1), 'finished': n[2] / max(n[0], 1)}
+                for name, n in zip(env._counter_bank.names, totals) if n[0] > 0}
+    started = max(sum(n[0] for n in totals), 1)
+    counters['all'] = {'started': int(sum(n[0] for n in totals)), 'landed': sum(n[1] for n in totals) / started,
+                       'finished': sum(n[2] for n in totals) / started}
+    result['counters'] = counters
 if has_belief:
     result['belief'] = {
         'class_acc_by_phase': (belief_correct / belief_steps.clamp(min=1)).tolist(),
@@ -184,6 +201,10 @@ print(f"{'attack':15s} {'n':>5s} {'hit':>6s} {'block':>6s} {'evade':>6s} {'inter
 for name, r in list(per_class.items()) + [('all', {'attacks': result['attacks'], 'hit': result['hit_rate'], 'block': result['block_rate'],
                                                    'evade': result['evade_rate'], 'interrupted': result['interrupted_rate']})]:
     print(f"{name:15s} {r['attacks']:5d} {r['hit']:6.1%} {r['block']:6.1%} {r['evade']:6.1%} {r['interrupted']:7.1%}")
+if counters:
+    print(f"{'counter':20s} {'n':>5s} {'landed':>7s} {'finished':>9s}")
+    for name, r in counters.items():
+        print(f"{name:20s} {r['started']:5d} {r['landed']:7.1%} {r['finished']:9.1%}")
 if has_belief:
     b = result['belief']
     print(f"belief: class acc {b['class_acc']:.1%} (by phase guard/strike/retract/guard: "

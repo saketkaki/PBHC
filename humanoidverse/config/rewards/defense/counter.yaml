@@ -1,0 +1,12 @@
+# @package _global_
+
+# defense/main.yaml + the counterattack terms (env.config.defense.counter). Scales are multiplied by dt (0.02).
+
+defaults:
+  - /rewards/defense/main
+  - _self_
+
+rewards:
+  reward_scales:
+    defense_counter_hit: 250.0 # +5 when the counter strike lands on the attacker
+    defense_counter_proximity: 5.0 # up to +0.1 per step around the strike time, by the striker's distance to the target

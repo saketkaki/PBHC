@@ -1,0 +1,78 @@
+# @package _global_
+
+# Defense with counterattacks on uneven terrain, the counters being the strikes of the attack dataset (DEFENSE_MANEUVERS.md,
+# Section 10): exp/defense_terrain.yaml, and after a blocked or evaded attack the defender throws one of the eight dataset
+# strikes (jab ... calf kick; one clip per class, scripts/make_defense_counters.py) aimed at the attacker.
+#
+#   python scripts/make_defense_counters.py
+#   python scripts/expand_checkpoint.py logs/Defense/<defense_terrain run>/model_<it>.pt \\
+#       humanoidverse/config/obs/defense/main_terrain_strikes.yaml logs/warmstart/defense_strikes.pt \\
+#       "env.config.terrain_aware.height_scan.y_range=[-0.5,0.5]" rewards.reward_scales.defense_counter_hit=250.0 \\
+#       rewards.reward_scales.defense_counter_proximity=5.0
+#   python humanoidverse/train_agent.py +simulator=isaacgym +exp=defense_terrain_strikes +opt=wandb +device=cuda:0 \\
+#       headless=True seed=2 checkpoint=logs/warmstart/defense_strikes.pt experiment_name=<name>
+
+defaults:
+  - defense
+  - /terrain: terrain_kungfu
+  - /robot: g1/g1_23dof_lock_wrist
+  - /domain_rand: main
+  - /rewards: defense/counter
+  - /obs: defense/main_terrain_strikes
+  - _self_
+
+project_name: Defense
+experiment_name: defense_terrain_strikes
+num_envs: 4096
+
+robot:
+  motion:
+    motion_file: g1_attack_dataset/PBHC_attacks/motion_data/attacks/defender_guard.pkl
+
+env:
+  config:
+    terrain_aware:
+      recenter_motion_xy: True # the guard on the centre of its tile, where the terrain features pass
+      spawn_clearance: 0.01
+      ground_relative_ref: True # the guard reference (and with it the attacker) stands on the local terrain
+      height_scan:
+        y_range: [-0.5, 0.5]
+      height_lookup: exact
+      ref_height_lookup: exact
+      placement_jitter: 0.15 # [m] random xy shift of the guard per episode: each tile's features are met at many offsets
+      early_start:
+        prob: 0.0 # the guard has no opening move
+      swing_clearance: True # a lifted reference foot of a counter clip clears a riser next to it
+      support_lift_gain: 4
+    max_episode_length_s: 30 # an attack and its counter take about 5 s
+    defense:
+      counter:
+        enable: True
+        clips_all: [jab, cross, lead_hook, rear_hook, lead_uppercut, rear_uppercut, body_shot, calf_kick]
+        # the calf kick three times: it is the only strike that lifts a foot and is learned last (LOG.md, DEF-STRIKES)
+        clips: [jab, cross, lead_hook, rear_hook, lead_uppercut, rear_uppercut, body_shot, calf_kick, calf_kick, calf_kick]
+        leg_reward_scale: 3.0
+        reanchor: 0.45 # the robot stays where it stepped in for the strike: the guard moves there when the counter ends
+        reanchor_total: 1.5 # 1.0 was reached late in 30 s episodes (the robot then has to step back again)
+        # the punches keep a fixed 0.7 m drift cutoff; the calf kick follows the curriculum below (a robot that cannot
+        # kick yet is far from the reference leg and would be cut off at every kick)
+        clip_far_threshold: {jab: 0.7, cross: 0.7, lead_hook: 0.7, rear_hook: 0.7, lead_uppercut: 0.7, rear_uppercut: 0.7, body_shot: 0.7}
+    termination_scales:
+      termination_motion_far_threshold: 1.5 # drift cutoff of the calf kick (curriculum to 0.7); the guard keeps counter.guard_far_threshold (0.6 m)
+    termination_curriculum:
+      terminate_when_motion_far_curriculum: True
+      terminate_when_motion_far_initial_threshold: 1.5
+      terminate_when_motion_far_threshold_min: 0.7
+      terminate_when_motion_far_curriculum_degree: 1.5e-5
+
+terrain:
+  curriculum: True # defense rule (LeggedRobotDefense._update_terrain_curriculum): up after a survived episode, down after an early end
+  num_cols: 24
+  terrain_proportions: [0.1, 0.2, 0.3, 0.4] # flat, bumps, tilt, step: more steps, the terrain that is behind
+  max_init_terrain_level: 1
+  curriculum_graduate_rows: 2
+  curriculum_max_difficulty_by_type: {step: 2.0, tilt: 1.75, bumps: 2.0} # top rows: 17 cm steps, 21 deg tilt, 8 cm bumps
+
+algo:
+  config:
+    save_interval: 500

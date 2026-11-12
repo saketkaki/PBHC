@@ -111,6 +111,26 @@ class AttackBank:
         self.striker_pos = torch.as_tensor(striker, device=device)  # [N, T, 3]
         self.keypoint_ids = torch.tensor([idx(k) for k in keypoints], dtype=torch.long, device=device)
 
+        self.striker_is_shin = torch.tensor([m['striker'] == 'right_shin' for m in meta], dtype=torch.bool, device=device)
+        # foot contact (left, right) per frame, for keeping the attacker's feet planted (defense.attacker_feet)
+        contact = np.ones((N, T, 2), np.float32)
+        for i, m in enumerate(clips):
+            c = np.asarray(m['contact_mask'], np.float32)
+            contact[i, :len(c)], contact[i, len(c):] = c, c[-1]
+        self.contact = torch.as_tensor(contact, device=device)
+        # leg bodies per side (left, right): share of the foot's offset each gets (ankle links 1, knee 0.5, hip links 0)
+        self.foot_ids = torch.tensor([idx('left_ankle_roll_link'), idx('right_ankle_roll_link')], dtype=torch.long, device=device)
+        self.knee_ids = torch.tensor([idx('left_knee_link'), idx('right_knee_link')], dtype=torch.long, device=device)
+        self.ankle_pitch_ids = torch.tensor([idx('left_ankle_pitch_link'), idx('right_ankle_pitch_link')], dtype=torch.long, device=device)
+        self.hip_ids = torch.tensor([idx('left_hip_pitch_link'), idx('right_hip_pitch_link')], dtype=torch.long, device=device)
+        share = torch.zeros(2, len(self.body_names))
+        for side, prefix in enumerate(('left_', 'right_')):
+            for b, name in enumerate(self.body_names):
+                if name.startswith(prefix) and ('ankle' in name or 'knee' in name):
+                    share[side, b] = 1.0 if 'ankle' in name else 0.5
+        self.leg_share = share.to(device)  # [2, B]
+        self.thigh_links = [[b for b, n in enumerate(self.body_names) if n.startswith(p) and 'hip' in n] for p in ('left_', 'right_')]
+
         phase = np.zeros((N, T), np.int64)
         for i, m in enumerate(clips):
             phase[i, :len(m['phase'])], phase[i, len(m['phase']):] = m['phase'], m['phase'][-1]
@@ -190,6 +210,10 @@ class AttackBank:
         step_out = ((f - impact) / (recovered - impact).clamp(min=1.0)).clamp(0.0, 1.0)
         s = torch.where(f <= impact, step_in, step_out)
         return s * s * (3.0 - 2.0 * s)  # smoothstep: no jump in the attacker's velocity at the onset or recovery
+
+    def contact_at(self, ids, t):
+        """ Foot contact (left, right) [n, 2] bool at time t. """
+        return self.contact[ids, self.frame(ids, t).round().long()] > 0.5
 
     def phase_at(self, ids, t):
         return self.phase[ids, self.frame(ids, t).round().long()]

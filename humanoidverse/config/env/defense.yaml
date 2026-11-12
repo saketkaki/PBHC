@@ -42,3 +42,35 @@ env:
       outcome_marker_time: 1.0 # [s] how long the viewer shows where the last attack ended
       blind_actor: none # none, or for evaluation: freeze (the actor sees the attacker held in its guard before each strike) or zero
       attacker_actor: auto # draw the attacker as a G1 (visual-only actors, no collision); auto = only with a viewer
+      attacker_feet: # the attacker is a ghost without locomotion: keep its feet from sliding and floating
+        planted: True # feet stay where they stand while the clip has them in contact; the legs shear between the pelvis
+                      # (placed by the clip, `standoff` and the defender's position) and the feet; False = feet follow the clip
+        step_trigger: 0.3 # [m] a planted foot farther than this from where the clip has it is re-planted with a step
+        step_time: 0.3 # [s] duration of such a step
+        step_lift: 0.05 # [m] foot lift during the step
+        swing_decay: 0.08 # [s] a foot the clip lifts (calf kick) returns to the clip's path with this time constant
+        crouch_max: 0.2 # [m] on terrain each foot stands on the ground under it; the upper body is lowered by at most this
+        stretch_max: 0.05 # [m] or raised by at most this from the attacker's own ground to keep its strikes aimed at the defender
+      counter: # counterattacks: after a blocked or evaded attack the defender performs a kung-fu clip aimed at the attacker
+        enable: False
+        clip_dir: g1_attack_dataset/PBHC_attacks/motion_data/attacks/defender_counters # scripts/make_defense_counters.py
+        clips_all: [horse_stance_punch, hooks_punch, side_kick, roundhouse_kick] # order of the one-hot in `counter_command`
+        clips: [horse_stance_punch, hooks_punch, side_kick, roundhouse_kick] # the clips in use (a subset, for a curriculum)
+        prob: 0.7 # share of the defended attacks that are countered
+        hit_radius: 0.17 # [m] the defender's striking hand or foot to the attacker's trunk axis (pelvis to head): the trunk's surface
+        min_extension: 0.8 # the striker must also be this share of the clip's reach away from the defender's own root (a thrown strike)
+        hit_window: 0.4 # [s] around the clip's strike time in which the strike can land
+        proximity_sigma: 0.15 # [m] defense_counter_proximity reward
+        max_aim_yaw_deg: 100.0 # the clip is turned about its start by at most this to point its strike at the attacker
+        max_aim_shift: 0.4 # [m] and moved along the strike direction by at most this to reach it
+        aim_depth: 0.13 # [m] the strike is aimed this far short of the attacker's trunk axis (on its surface, the bodies apart)
+        leg_aim_depth: 0.06 # [m] the same for a strike at the attacker's leg (the calf kick)
+        leg_hit_radius: 0.12 # [m]
+        leg_reward_scale: 1.0 # defense_counter_hit and _proximity are multiplied by this for a strike at the leg
+        leg_proximity_sigma: 0.3 # [m] wider than proximity_sigma: a kick that is not thrown yet starts far from the leg
+        reanchor: 0.0 # [m] the reference stays stepped in until a counter ends, then the guard moves to the robot, at most this far (0: the robot steps back)
+        reanchor_total: 1.0 # [m] at most this far from the guard's place at the episode start
+        head_top: 0.1 # [m] the trunk axis ends this far above the head link's origin
+        guard_far_threshold: 0.6 # [m] drift cutoff while holding the guard; termination_motion_far_threshold (and its
+                                 # curriculum) then applies to the counter clips only. null = one cutoff for both
+        clip_far_threshold: {} # per clip, a fixed drift cutoff [m] on top of the env's, e.g. {horse_stance_punch: 0.7}

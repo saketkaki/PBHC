@@ -8,7 +8,8 @@ weights. Likewise a `ref_preview` with other preview times (env.config.terrain_a
 of the times present in both; new times get zero weights. The expanded network therefore computes exactly the same actions and values
 as the original until training changes the new weights. The Adam moments of the first layers are expanded the
 same way (zero for new terms), so the optimizer state can be loaded too (`algo.config.load_optimizer=True`);
-the iteration counter is kept.
+the iteration counter is kept. If the overrides add reward terms (rewards.reward_scales.<term>=<scale>), the multi-head
+critic gets a zero-initialised value head for each.
 
 usage (from the repo root, env `pbhc` active):
   python scripts/expand_checkpoint.py CKPT NEW_OBS_YAML OUT_CKPT [key=value ...]
@@ -90,19 +91,66 @@ old_times, new_times = preview_times(old_config), preview_times(new_config)
 old_slices, old_dims = obs_slices(old_config)
 new_slices, new_dims = obs_slices(new_config)
 
+def policy_input_slices(slices, obs_dim, extra):
+    """ Input layout of the policy MLP of an attack-conditioned actor (agents/modules/attack_modules.py): actor_obs
+    without the `attacker_keypoints` slice, then the latent and belief (`extra` values) the encoder makes from it. """
+    start, end = slices['attacker_keypoints']
+    layout = {key: (a, b) if b <= start else (a - (end - start), b - (end - start))
+              for key, (a, b) in slices.items() if key != 'attacker_keypoints'}
+    layout['_attack_latent_and_belief'] = (obs_dim - (end - start), obs_dim - (end - start) + extra)
+    return layout, obs_dim - (end - start) + extra
+
+
 state = torch.load(ckpt, map_location='cpu')
-for net, obs_key, model_key, layer in (('actor', 'actor_obs', 'actor_model_state_dict', 'actor_module.module.0.weight'),
+attack_actor = 'actor_module.policy.0.weight' in state['actor_model_state_dict']  # defense: the encoder is unchanged
+actor_layer = 'actor_module.policy.0.weight' if attack_actor else 'actor_module.module.0.weight'
+for net, obs_key, model_key, layer in (('actor', 'actor_obs', 'actor_model_state_dict', actor_layer),
                                        ('critic', 'critic_obs', 'critic_model_state_dict', 'critic_module.module.0.weight')):
     weight = state[model_key][layer]
-    assert weight.shape[1] == old_dims[obs_key], f'{net}: checkpoint input {weight.shape[1]} != config {old_dims[obs_key]}'
-    print(f'{net}: {old_dims[obs_key]} -> {new_dims[obs_key]} inputs')
-    state[model_key][layer] = expand_first_layer(weight, old_slices[obs_key], new_slices[obs_key], new_dims[obs_key])
+    old_layout, new_layout, old_dim, new_dim = old_slices[obs_key], new_slices[obs_key], old_dims[obs_key], new_dims[obs_key]
+    if net == 'actor' and attack_actor:
+        assert old_layout['attacker_keypoints'][1] - old_layout['attacker_keypoints'][0] == \
+            new_layout['attacker_keypoints'][1] - new_layout['attacker_keypoints'][0], 'attacker_keypoints: size changed'
+        extra = weight.shape[1] - (old_dim - (old_layout['attacker_keypoints'][1] - old_layout['attacker_keypoints'][0]))
+        old_layout, old_dim = policy_input_slices(old_layout, old_dim, extra)
+        new_layout, new_dim = policy_input_slices(new_layout, new_dim, extra)
+    assert weight.shape[1] == old_dim, f'{net}: checkpoint input {weight.shape[1]} != config {old_dim}'
+    print(f'{net}: {old_dim} -> {new_dim} inputs')
+    state[model_key][layer] = expand_first_layer(weight, old_layout, new_layout, new_dim)
     # optimizer state is indexed by parameter order, which is the order of the model state dict
     optimizer_state = state[f'{net}_optimizer_state_dict']['state'][list(state[model_key]).index(layer)]
     for moment in ('exp_avg', 'exp_avg_sq'):
         assert optimizer_state[moment].shape == weight.shape, f'{net} {moment}: shape {optimizer_state[moment].shape}'
-        optimizer_state[moment] = expand_first_layer(optimizer_state[moment], old_slices[obs_key], new_slices[obs_key],
-                                                     new_dims[obs_key], quiet=True)
+        optimizer_state[moment] = expand_first_layer(optimizer_state[moment], old_layout, new_layout, new_dim, quiet=True)
+
+# multi-head critic: one value per reward term (the non-zero reward scales in config order, `termination` last). New reward
+# terms (e.g. rewards.reward_scales.defense_counter_hit=250 among the overrides) get a zero-initialised value head.
+def reward_terms(config):
+    scales = config.rewards.reward_scales
+    return [k for k in scales if scales[k] != 0 and k != 'termination'] + (['termination'] if scales.get('termination', 0) != 0 else [])
+
+
+old_terms, new_terms = reward_terms(old_config), reward_terms(new_config)
+critic = state['critic_model_state_dict']
+last = max(int(k.split('.')[2]) for k in critic if k.startswith('critic_module.module.') and k.endswith('.weight'))
+weight_key, bias_key = f'critic_module.module.{last}.weight', f'critic_module.module.{last}.bias'
+if old_terms != new_terms and critic[weight_key].shape[0] == len(old_terms):
+    assert set(old_terms) <= set(new_terms), f'reward terms removed: {set(old_terms) - set(new_terms)}'
+    rows = [old_terms.index(k) if k in old_terms else None for k in new_terms]
+    print(f'critic value heads: {len(old_terms)} -> {len(new_terms)}, new (zero): {[k for k in new_terms if k not in old_terms]}')
+
+    def expand_rows(x):
+        new_x = torch.zeros(len(rows), *x.shape[1:], dtype=x.dtype)
+        for j, i in enumerate(rows):
+            if i is not None:
+                new_x[j] = x[i]
+        return new_x
+    optimizer = state['critic_optimizer_state_dict']['state']
+    for key in (weight_key, bias_key):
+        index = list(critic).index(key)
+        critic[key] = expand_rows(critic[key])
+        for moment in ('exp_avg', 'exp_avg_sq'):
+            optimizer[index][moment] = expand_rows(optimizer[index][moment])
 
 out.parent.mkdir(parents=True, exist_ok=True)
 torch.save(state, out)

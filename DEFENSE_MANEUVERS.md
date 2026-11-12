@@ -7,10 +7,10 @@ it sees of the attacker, in the same spirit as the terrain-aware work ([TERRAIN_
 - A **belief head** turns that embedding into a posterior over which attack is coming and when it lands.
 - The policy acts on the embedding and the belief.
 
-**Status (2026-11-04):**
+**Status (2026-11-11):**
 - The env, the attack-conditioned policy and the configs are implemented and verified (Section 6).
-- A 60-iteration smoke run trains without errors, and the belief head starts learning: attack-class accuracy goes from 12 % (chance) to 35 % in 40 iterations.
-- No full training run yet.
+- First full flat-ground run: 0 % hits after 3,000 iterations, against 54 % for a held guard (Section 9).
+- Defense on uneven terrain is implemented and in training (Section 9).
 
 ## 1. Setup
 
@@ -207,3 +207,54 @@ The console prints one line per attack in env 0, e.g. `cross: BLOCKED by the lef
 5. **Dataset:**
    - The clips are pickled with NumPy 2 (`numpy._core`), which `AttackBank` handles but PBHC's motion libraries cannot load under this env's NumPy 1.24.
    - The 90 MB `g1_attack_dataset/` is not committed.
+
+## 9. Results, and defense on uneven terrain
+
+Run details are in [LOG.md](LOG.md) (2026-11-11). All numbers: `scripts/defense_eval.py`, 256 episodes of 20 s, one training seed, one eval seed.
+
+**Dataset note.** `generate_attacks.py` rejects every body shot under the `pbhc` env's MuJoCo 3.2.3 (it reports more self-penetration than newer versions). Generate the clips in a separate env with a recent MuJoCo (`conda create -n attackgen python=3.12`, `pip install mujoco "numpy<2" scipy joblib`); 469 of the 480 clips then equal the committed `index.json`.
+
+**Flat ground (`def01_flat_s2`, the command of Section 7 with seed 2).**
+
+| | Do-nothing guard | 2,000 it | 3,000 it |
+|---|---|---|---|
+| Hit / blocked / evaded | 54 / 46 / 0 % | 0.1 / 85.7 / 14.2 % | 0.0 / 88.6 / 11.4 % |
+| Survived 20 s | – | 99.2 % | 100.0 % |
+| Guard body error | – | 85.8 mm | 56.2 mm |
+| Hit with the attacker hidden (`--blind freeze`) | – | 15.3 % | 32.7 % |
+
+- The policy stops being hit within 2,000 iterations (about 45 minutes) and does not fall or drift away.
+- It relies on seeing the attacker more as training goes on (hidden attacker: 15 % → 33 % hits), most of all for the calf kick.
+
+**Terrain: what changed.**
+
+| Piece | Change |
+|---|---|
+| Attacker height (`defense.py`) | With `terrain_aware.ground_relative_ref`, the clips stand on the support height of the defender's guard reference (the terrain under its feet), so strikes stay aimed at the guard on steps, tilts and bumps. The attacker is still a ghost: its own feet are not matched to the terrain under them |
+| Terrain curriculum (`defense.py`) | The guard is held, so there is no motion to complete: up one difficulty row after a survived episode, down after an episode that ended before half time |
+| Observations (`obs/defense/main_terrain`) | + height scan (11 × 11), foot scans; + the wide exact scan for the critic. Actor 978, critic 1,470 inputs |
+| Preset (`exp/defense_terrain`) | Defense env on `terrain_kungfu` with the ground-relative, re-centred guard, 0.15 m placement jitter, 24 columns, top rows of 17 cm steps, 21° tilt and 8 cm bumps |
+| Warm start (`scripts/expand_checkpoint.py`) | Handles the attack-conditioned actor: a flat defense checkpoint keeps its behaviour, the scans start with zero weights |
+| Evaluation (`scripts/defense_eval.py`) | `--terrain {flat,step,tilt,bumps} --difficulty D` |
+
+```bash
+python scripts/expand_checkpoint.py logs/Defense/<flat run>/model_2000.pt humanoidverse/config/obs/defense/main_terrain.yaml \
+    logs/warmstart/defense_terrain.pt "env.config.terrain_aware.height_scan.y_range=[-0.5,0.5]"
+python humanoidverse/train_agent.py +simulator=isaacgym +exp=defense_terrain +opt=wandb +device=cuda:0 headless=True \
+    seed=2 checkpoint=logs/warmstart/defense_terrain.pt experiment_name=<name>
+python scripts/defense_eval.py logs/Defense/<terrain run>/model_<it>.pt --name step_d1.0 --terrain step --difficulty 1.0
+```
+
+**Terrain (`def02_terrain_s2`, in training).** Survived 20 s / hit rate of resolved attacks:
+
+| Terrain | Flat policy, no terrain training | 500 it | 1,000 it |
+|---|---|---|---|
+| Flat | 98.0 / 0.1 % | 96.9 / 0.3 % | 98.8 / 0.2 % |
+| Steps 10 cm | 26.2 / 0.1 % | 55.1 / 1.0 % | 79.7 / 0.7 % |
+| Steps 17 cm | 28.9 / 0.4 % | 29.7 / 1.6 % | 63.7 / 1.8 % |
+| Tilt 18° | 0.0 / 28.6 % | 26.6 / 1.4 % | 42.2 / 2.6 % |
+| Bumps 8 cm | 7.4 / 1.0 % | 74.2 / 0.7 % | 83.2 / 0.1 % |
+
+- The flat policy cannot hold its position on terrain; episodes end because it moves more than 0.6 m from the guard.
+- With terrain training survival rises quickly while hits stay below 3 %. The guard is held loosely on terrain (150–210 mm body error).
+
