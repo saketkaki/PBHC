@@ -1592,3 +1592,46 @@ times as often (3 of 10 counters) and `counter.leg_reward_scale: 3.0` triples it
   step face is towards the camera.
 - def10 `model_10000` re-recorded: `videos_def10_it10000/def10_10000_{step,tilt}_fixed.mp4`, logged into `hi21mtti`
   (same keys, newer step). 10 cm steps: one drift end at 2.7 s, 4 of 5 counters land; 18 deg tilt: no episode end, 4 of 6 land.
+
+### 2026-11-12 — DEF-STRIKES: def11 results, def12
+- `def11_strikes_steps_s2` (W&B `3hh6zfuw`, from def10 `model_10000`, steps 40 % of tiles, `reanchor_total` 1.5) ran its
+  3,000 iterations. Its final weights (~13,000) were saved as `model_12500.pt` (overwriting the 12,500 checkpoint);
+  copy: `logs/warmstart/def11_13000_strikes.pt`.
+  Final, 256 episodes of 30 s, survived / attacker hits / counters landed: flat 100.0 / 0.1 / 96.6, steps 10 cm
+  82.0 / 0.5 / 94.8, steps 17 cm 71.9 / 0.9 / 91.8, tilt 18 deg 88.7 / 1.3 / 88.9, bumps 8 cm 99.2 / 0.6 / 95.2.
+  Survival flat/step10/step17/tilt/bumps: 10500 100/73.0/64.8/87.1/99.2; 11000 100/78.5/66.8/78.1/99.6;
+  12000 100/80.1/71.5/79.3/99.2.
+- Diagnosis on real 17 cm steps (`drift_diag2.py` with `terrain.curriculum=False`): drift ends at 1.3 / 2.5 / 8.3 s
+  (quartiles), 123 of 194 in guard, pelvis ~10 cm low, head farthest: the start of the episode on the edge, not the step-in.
+- Videos (flat, 10 and 17 cm steps, 18 deg tilt, 8 cm bumps; height scan; real difficulty): `logs/Defense/videos_def11_final/`,
+  logged into `3hh6zfuw`. 17 cm steps: one drift end at 2.6 s, then 6 counters land; no episode end on the others.
+- `def12_strikes_steps_s2` (W&B `7qff6nph`) continues from the def11 final weights, same settings (labels start at 12500).
+
+### 2026-11-12 — DEF-STRIKES: def12 plateau, guard follows after every attack (def13)
+- `def12_strikes_steps_s2` (W&B `7qff6nph`, from def11 final, same settings; labels start at 12500), stopped at ~14,875.
+  Survived / attacker hits / counters landed, file `model_13500`: flat 99.6/0.4/96.3, step10 78.9/1.0/95.8,
+  step17 66.8/1.3/94.0, tilt 77.0/2.1/92.4, bumps 97.3/0.3/95.6; file `model_14500`: flat 100/0.7/98.0,
+  step10 83.6/1.8/95.5, step17 69.1/1.2/93.5, tilt 91.4/1.7/88.9, bumps 99.6/1.0/96.0. Steps plateau (noise ±3–4 points).
+  No videos recorded for def12 (no change over def11).
+- Checks on `model_14500` (all at the real difficulty):
+  - drift cutoff off (`termination.terminate_when_motion_far=False`): step17 78.5 % survive, 21.5 % fall; step10 84.4 / 15.6.
+    The drift ends on steps are real falls.
+  - `start_diag.py`, step17: 19 % of episode starts end within 4 s; 25 % with a foot on the edge, 11 % feet on different
+    levels, 17 % both on one level; 4 % of envs hold a third of the early ends.
+  - `counter.prob=0`: step17 survival 32.8 %, drift 66.8 %, falls 0.4 %, guard error 250 mm: without counters nothing
+    re-anchors the guard and the robot wanders off it.
+- New `counter.reanchor_attacks`: the guard also moves to the robot when an attack ends (`_reanchor`). Without retraining:
+  step17 69.1 → 75.4, step10 83.6 → 80.5 (noise), tilt 91.4 → 97.3.
+- `def13_strikes_follow_s2` (W&B `b0jpzuex`) continues from def12 `model_14500` (copy `logs/warmstart/def12_14500_strikes.pt`)
+  with `reanchor_attacks: True`, 2,000 iterations.
+
+### 2026-11-12 — DEF-STRIKES: def13 (guard follows after every attack) stopped early
+- `def13_strikes_follow_s2` (W&B `b0jpzuex`, labels start at 14500) stopped at label ~15,625: training with the guard
+  following got worse after the first 500 iterations. Survived / fall / drift, 256 episodes of 30 s:
+  - file `model_15000`: flat 99.6/0.4/0.0, step10 84.8/1.6/13.7, step17 78.9/2.7/18.4, tilt 93.8/1.6/4.7, bumps 99.6/0.0/0.4.
+  - file `model_15500`: flat 94.5/0.0/5.5, step10 78.1/3.5/18.4, step17 76.6/2.3/21.1, tilt 78.5/3.9/17.6, bumps 98.0/0.0/2.0.
+- Check on `model_15500` with `counter.reanchor_total=100` (no cap on the follow): flat 100 % (the 5.5 % drift was the
+  1.5 m cap running out: with the guard following, nothing rewards staying in place, so the policy wanders);
+  tilt 80.9 % (16.4 % drift remains: more than 0.45 m of slip within one attack).
+- Best so far: def13 file `model_15000` (or def12 `model_14500` evaluated with `reanchor_attacks=True`: tilt 97.3).
+  Videos of `model_15000`: `logs/Defense/videos_def13_it15000/`.

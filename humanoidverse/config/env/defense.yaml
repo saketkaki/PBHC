@@ -69,6 +69,7 @@ env:
         leg_reward_scale: 1.0 # defense_counter_hit and _proximity are multiplied by this for a strike at the leg
         leg_proximity_sigma: 0.3 # [m] wider than proximity_sigma: a kick that is not thrown yet starts far from the leg
         reanchor: 0.0 # [m] the reference stays stepped in until a counter ends, then the guard moves to the robot, at most this far (0: the robot steps back)
+        reanchor_attacks: False # True: the guard also moves to the robot when an attack ends (not only when a counter ends)
         reanchor_total: 1.0 # [m] at most this far from the guard's place at the episode start
         head_top: 0.1 # [m] the trunk axis ends this far above the head link's origin
         guard_far_threshold: 0.6 # [m] drift cutoff while holding the guard; termination_motion_far_threshold (and its

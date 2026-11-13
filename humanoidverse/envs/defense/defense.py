@@ -207,6 +207,7 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         # clip is placed relative to the robot anyway
         self._counter_reanchor = float(cc.get('reanchor', 0.0)) if self._placement_jitter > 0 else 0.0
         self._counter_reanchor_total = float(cc.get('reanchor_total', 1.0))
+        self._counter_reanchor_attacks = bool(cc.get('reanchor_attacks', False))
         self._reanchor_sum = torch.zeros(N, 2, device=self.device)
         bank.hold_shift = self._counter_reanchor > 0  # the reference stays stepped in until the clip ends
         # per clip: a fixed drift cutoff instead of the env's (e.g. the punches keep 0.7 m while the kicks follow the curriculum)
@@ -268,6 +269,20 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
 
     def _motion_time_now(self):
         return (self.episode_length_buf + 1) * self.dt + self.motion_start_times  # as kick_motion_res
+
+    def _reanchor(self, ids, shift=None):
+        """ Move the guard reference of these robots to where they stand (counter.reanchor); shift [n, 2]: the aim
+        shift their reference still carries (at the end of a counter). """
+        if self._counter_reanchor <= 0 or len(ids) == 0:
+            return
+        move = self.simulator.robot_root_states[ids, :2] - self.ref_body_pos_extend[ids, 0, :2]
+        if shift is not None:
+            move = move + shift
+        move = move * (self._counter_reanchor / move.norm(dim=-1, keepdim=True).clamp(min=1e-6)).clamp(max=1.0)
+        total = self._reanchor_sum[ids] + move
+        total = total * (self._counter_reanchor_total / total.norm(dim=-1, keepdim=True).clamp(min=1e-6)).clamp(max=1.0)
+        self._placement_offset[ids] += total - self._reanchor_sum[ids]
+        self._reanchor_sum[ids] = total
 
     def _start_counters(self, env_ids):
         """ Start a counter clip for these robots (their attacker has just started its next clip and holds its guard). """
@@ -365,13 +380,7 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
                                             torch.ones(len(ids), device=self.device), accumulate=True)
             self._counter_totals[:, 2] += torch.bincount(clip[ids], minlength=bank.num_clips)
             self._counter_active[ids] = False
-            if self._counter_reanchor > 0:
-                move = self.simulator.robot_root_states[ids, :2] - self.ref_body_pos_extend[ids, 0, :2] + self._counter_aim_shift[ids]
-                move = move * (self._counter_reanchor / move.norm(dim=-1, keepdim=True).clamp(min=1e-6)).clamp(max=1.0)
-                total = self._reanchor_sum[ids] + move
-                total = total * (self._counter_reanchor_total / total.norm(dim=-1, keepdim=True).clamp(min=1e-6)).clamp(max=1.0)
-                self._placement_offset[ids] += total - self._reanchor_sum[ids]
-                self._reanchor_sum[ids] = total
+            self._reanchor(ids, self._counter_aim_shift[ids])
             self._start_attacks(ids, blend=True)  # the attacker's next attack
         counts = self._counter_counts
         self.log_dict['defense_counter_land_rate'] = counts[:, 0].sum() / counts.sum().clamp(min=1e-6)
@@ -604,6 +613,8 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         ended = (self._attack_t >= bank.duration(ids)).nonzero(as_tuple=False).flatten()
         defended = (self._attack_status[ended] == BLOCKED) | (self._attack_status[ended] == EVADED)
         self._start_attacks(ended, blend=True)
+        if self._counter_enabled and self._counter_reanchor_attacks:  # the guard follows the robot after every attack too
+            self._reanchor(ended)
         if self._counter_enabled and len(ended):  # counter some of the attacks that were blocked or evaded
             self._start_counters(ended[defended & (torch.rand(len(ended), device=self.device) < self._counter_prob)])
         if self._attacker_actor and len(ended) == 0:
