@@ -34,7 +34,7 @@ dc = config.env.config.defense
 
 
 def check_bank():
-    from humanoidverse.envs.defense.attack_bank import AttackBank, load_joblib_compat, point_segment_distance, sweep_segment_distance
+    from humanoidverse.envs.defense.attack_bank import AttackBank, load_joblib_compat, point_segment_distance, sweep_segment_closest
     from humanoidverse.utils.motion_lib.torch_humanoid_batch import Humanoid_Batch
     bank = AttackBank(dc.attack_file, config.robot.motion, 'cpu', attacks=dc.attacks, keypoints=dc.keypoints)
     data = load_joblib_compat(dc.attack_file)
@@ -75,7 +75,10 @@ def check_bank():
             if f < bank.onset_frame[i] or f - 1 > bank.recovered_frame[i]:
                 continue
             p0, p1 = striker[f - 1][None], striker[f][None]
-            if sweep_segment_distance(p0, p1, elbow, hands)[0] < dc.block_radius:
+            # as the env: per forearm, within block_radius of the path, with the contact within block_max_target_dist of the target
+            arms = [sweep_segment_closest(p0, p1, elbow[:, k:k + 1], hands[:, k:k + 1]) for k in range(2)]
+            max_dist = dc.get('block_max_target_dist', None)
+            if any(d[0] < dc.block_radius and (max_dist is None or (q[0] - target).norm() <= max_dist) for d, _, q in arms):
                 status = 2
             elif point_segment_distance(target, p0[0], p1[0]) < dc.hit_radius:
                 status = 1
@@ -84,7 +87,8 @@ def check_bank():
             if status:
                 break
         outcomes[bank.attack_names[i]][status] += 1
-    print(f"\nperfect static guard (hit_radius {dc.hit_radius}, block_radius {dc.block_radius}, standoff {dc.get('standoff', 0.0)}): "
+    print(f"\nperfect static guard (hit_radius {dc.hit_radius}, block_radius {dc.block_radius}, "
+          f"block_max_target_dist {dc.get('block_max_target_dist', None)}, standoff {dc.get('standoff', 0.0)}): "
           'share of clips, and the smallest gap between the guards before the onset [m]')
     print(f"{'attack':15s} {'hit':>6s} {'block':>6s} {'evade':>6s} {'gap':>6s}")
     total = np.zeros(4)
