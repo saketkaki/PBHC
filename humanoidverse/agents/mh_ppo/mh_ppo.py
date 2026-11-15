@@ -208,10 +208,13 @@ class MHPPO(BaseAlgo):
             logger.info(f"Loading checkpoint from {ckpt_path}")
             loaded_dict = torch.load(ckpt_path, map_location=self.device)
             self.actor.load_state_dict(loaded_dict["actor_model_state_dict"])
-            self.critic.load_state_dict(loaded_dict["critic_model_state_dict"])
+            critic_remapped = self._load_critic(loaded_dict, ckpt_path)
             if self.load_optimizer:
                 self.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
-                self.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
+                if critic_remapped:
+                    logger.info("Critic optimizer state not loaded: its value heads changed")
+                else:
+                    self.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
                 if self.load_optimizer_lr:
                     self.actor_learning_rate = loaded_dict['actor_optimizer_state_dict']['param_groups'][0]['lr']
                     self.critic_learning_rate = loaded_dict['critic_optimizer_state_dict']['param_groups'][0]['lr']
@@ -242,6 +245,33 @@ class MHPPO(BaseAlgo):
         self.env.env_origins[:] = self.env.terrain_origins[self.env.terrain_levels, self.env.terrain_types]
         logger.info(f"Terrain levels restored from the checkpoint (mean {self.env.terrain_levels.float().mean():.2f})")
 
+    def _load_critic(self, loaded_dict, ckpt_path):
+        """ Load the critic. If the reward terms changed (one value head per term, plus a last head), the heads are
+        matched by reward name, and new terms keep their initialization. Returns whether the heads were remapped. """
+        state, own = loaded_dict["critic_model_state_dict"], self.critic.state_dict()
+        changed = [k for k in state if k in own and state[k].shape != own[k].shape]
+        if not changed:
+            self.critic.load_state_dict(state)
+            return False
+        old_names = loaded_dict.get('reward_names')
+        if old_names is None:  # checkpoints before reward_names were saved: the non-zero reward scales of the run's config
+            from omegaconf import OmegaConf
+            scales = OmegaConf.load(os.path.join(os.path.dirname(ckpt_path), 'config.yaml')).rewards.reward_scales
+            old_names = [k for k, v in scales.items() if v != 0 and k != 'termination']
+        new_names = list(self.env.reward_names)
+        assert all(k.rsplit('.', 1)[0] == changed[0].rsplit('.', 1)[0] for k in changed) and \
+            state[changed[0]].shape[0] == len(old_names) + 1, f"critic mismatch beyond its value heads: {changed}"
+        rows = [(new_names.index(n), i) for i, n in enumerate(old_names) if n in new_names] + [(len(new_names), len(old_names))]
+        for k in changed:
+            merged = own[k].clone()
+            for new_row, old_row in rows:
+                merged[new_row] = state[k][old_row]
+            state = {**state, k: merged}
+        self.critic.load_state_dict(state)
+        logger.info(f"Critic value heads matched by reward name; new: {[n for n in new_names if n not in old_names]}, "
+                    f"dropped: {[n for n in old_names if n not in new_names]}")
+        return True
+
     def save(self, path, infos=None):
         logger.info(f"Saving checkpoint to {path}")
         torch.save({
@@ -251,6 +281,7 @@ class MHPPO(BaseAlgo):
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
             'iter': self.current_learning_iteration,
             'infos': infos,
+            'reward_names': list(self.env.reward_names),  # the critic's value heads, for loading after reward changes
             **({'terrain_levels': self.env.terrain_levels.cpu(), 'terrain_types': self.env.terrain_types.cpu()}
                if hasattr(self.env, 'terrain_levels') else {}),
         }, path)
