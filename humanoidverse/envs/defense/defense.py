@@ -3,7 +3,8 @@ import torch.nn.functional as F
 from loguru import logger
 
 from humanoidverse.envs.motion_tracking.motion_tracking import LeggedRobotMotionTracking
-from humanoidverse.envs.defense.attack_bank import ATTACKS, NUM_PHASES, AttackBank, closest_point_on_segment, sweep_segment_closest
+from humanoidverse.envs.defense.attack_bank import ATTACKS, NUM_PHASES, AttackBank, closest_point_on_segment, point_segment_distance, \
+    sweep_segment_closest
 from humanoidverse.envs.defense.counter_bank import CounterBank, SHIN, STRIKERS
 from humanoidverse.envs.env_utils.visualization import Point
 from isaac_utils.rotations import calc_heading_quat_inv, my_quat_rotate, quat_conjugate, quat_mul
@@ -34,7 +35,8 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
     simulated and never collides, so outcomes are scored geometrically from the swept path of its striking point between
     control steps:
       hit      the striker passes within hit_radius of the target point on the defender (target_link + offset)
-      blocked  the striker passes within block_radius of a defender forearm (elbow to hand) first
+      blocked  the striker passes within block_radius of a defender forearm (elbow to hand) first, with the contact
+               within block_max_target_dist of the target (a forearm far out in front does not protect it)
       evaded   neither by the attack's recovered frame
     Each clip is placed so that its canonical defender lands on the defender's root and heading when the clip starts;
     it then stays put, so moving the target away works. The attacker's pose blends over blend_time from the end of one
@@ -78,6 +80,8 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
             assert obs_dims['attacker_keypoints'] == K * 3 * self._kp_hist_len, \
                 f"obs_dims.attacker_keypoints must be {K} keypoints x 3 x {self._kp_hist_len} frames"
         self._hit_radius, self._block_radius = dc.hit_radius, dc.block_radius
+        self._block_max_target_dist = dc.get('block_max_target_dist', None)  # None: anywhere (checkpoints before this option)
+        self._overlap_margin = dc.get('overlap_margin', 0.05)
         self._blend_time = dc.blend_time
         self._threat_lead_frames = dc.threat_lead_time / bank.dt
         self._proximity_sigma = dc.proximity_sigma
@@ -144,9 +148,18 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._outcome_point = torch.zeros(N, 3, device=self.device)
         self._outcome_target = torch.zeros(N, 3, device=self.device)
         self._outcome_arm = torch.zeros(N, 2, 3, device=self.device)  # elbow and hand of the blocking forearm
+        self._outcome_arm_id = torch.zeros(N, dtype=torch.long, device=self.device)  # 0 left, 1 right
         self._outcome_age = torch.full((N,), float('inf'), device=self.device)  # [s] since the last outcome
         self._outcome_hold = dc.get('outcome_marker_time', 1.0)
         self._striker_trail = []  # env 0, for the viewer
+        # the attacker's bones (parent to child) and, per clip, those outside the striking limb, for the overlap penalty
+        bones = [(p, c) for c, p in enumerate(bank.body_parents) if p >= 0]
+        self._bone_parent = torch.tensor([p for p, _ in bones], device=self.device)
+        self._bone_child = torch.tensor([c for _, c in bones], device=self.device)
+        limb = {'hand': ('shoulder', 'elbow', 'wrist', 'hand'), 'shin': ('hip', 'knee', 'ankle')}
+        self._bone_off_limb = torch.tensor([[not (bank.body_names[c].startswith(s.split('_')[0]) and any(k in bank.body_names[c] for k in limb[s.split('_')[1]]))
+                                             for _, c in bones] for s in bank.striker_names], device=self.device)  # [clips, bones]
+        self._attacker_overlap = torch.zeros(N, device=self.device)
         if self._attacker_actor:  # the robot's bodies in the attack bank, their rotations and the blend between clips
             names = list(self.config.robot.body_names)
             self._actor_body_ids = torch.tensor([bank.body_names.index(n) for n in names], device=self.device)
@@ -593,8 +606,15 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         check = (self._attack_status == PENDING) & (frame >= onset) & (frame_prev <= recovered)
         path_point = closest_point_on_segment(self._target_pos, striker_prev, self._striker_pos)  # nearest the target
         d_target = (path_point - self._target_pos).norm(dim=-1)
-        d_block, block_arm, block_point = sweep_segment_closest(striker_prev, self._striker_pos, elbow, hand)
-        blocked = check & (d_block < self._block_radius)
+        # per forearm: closest approach of the striker's swept path and the contact point on the forearm
+        per_arm = [sweep_segment_closest(striker_prev, self._striker_pos, elbow[:, k:k + 1], hand[:, k:k + 1]) for k in range(2)]
+        arm_dist, arm_point = torch.stack([d for d, _, _ in per_arm], dim=1), torch.stack([q for _, _, q in per_arm], dim=1)
+        valid = arm_dist < self._block_radius
+        if self._block_max_target_dist is not None:
+            valid &= (arm_point - self._target_pos[:, None]).norm(dim=-1) <= self._block_max_target_dist
+        block_arm = torch.where(valid, arm_dist, torch.full_like(arm_dist, float('inf'))).argmin(dim=1)
+        block_point = arm_point[all_ids, block_arm]
+        blocked = check & valid.any(dim=1)
         hit = check & ~blocked & (d_target < self._hit_radius)
         closer = check & (d_target < self._closest_dist)
         self._closest_dist[closer], self._closest_point[closer] = d_target[closer], path_point[closer]
@@ -609,6 +629,16 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._striker_target_dist[:] = (self._striker_pos - self._target_pos).norm(dim=-1)
         self._attack_threat[:] = ((frame >= onset - self._threat_lead_frames) & (frame <= recovered)).float()
         self._log_defense_outcomes(bank.label[ids], event)
+
+        # defender forearms (5 points each) reaching into the attacker: depth inside overlap_margin of a bone outside
+        # the striking limb, 0 to 1 per forearm
+        s = torch.linspace(0.0, 1.0, 5, device=self.device)
+        arm = elbow[:, :, None] + s[None, None, :, None] * (hand - elbow)[:, :, None]  # [N, 2, 5, 3]
+        pos = self._attacker_body_pos
+        d = point_segment_distance(arm[:, :, :, None], pos[:, None, None, self._bone_parent], pos[:, None, None, self._bone_child])
+        d = torch.where(self._bone_off_limb[ids][:, None, None], d, torch.full_like(d, float('inf'))).flatten(2).min(dim=2)[0]
+        self._attacker_overlap[:] = ((self._overlap_margin - d) / self._overlap_margin).clamp(0.0, 1.0).sum(dim=1)
+        self.log_dict['defense_attacker_overlap'] = (self._attacker_overlap > 0).float().mean()
 
         ended = (self._attack_t >= bank.duration(ids)).nonzero(as_tuple=False).flatten()
         defended = (self._attack_status[ended] == BLOCKED) | (self._attack_status[ended] == EVADED)
@@ -640,6 +670,7 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._outcome_point[resolved] = point[resolved]
         self._outcome_target[resolved] = torch.where((event == EVADED)[:, None], self._closest_target, self._target_pos)[resolved]
         self._outcome_arm[resolved] = torch.stack([elbow[n, block_arm], hand[n, block_arm]], dim=1)[resolved]
+        self._outcome_arm_id[resolved] = block_arm[resolved]
         self._outcome_age[resolved] = 0.0
         if self.viewer is not None and resolved[0]:
             bank, i = self._attack_bank, int(self._attack_ids[0])
@@ -796,6 +827,10 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
 
     def _reward_defense_evade(self):
         return (self._defense_event == EVADED).float()
+
+    def _reward_defense_attacker_overlap(self):
+        # defender forearms inside overlap_margin of the attacker outside its striking limb (use a negative scale)
+        return self._attacker_overlap
 
     def _reward_defense_striker_proximity(self):
         # while a strike is live: closeness of the striking point to its target (use a negative scale)

@@ -149,6 +149,7 @@ class AttackBank:
         self.target_link = [m['target_link'] for m in meta]
         self.target_local = torch.tensor(np.stack([m['target_local_offset'] for m in meta]), dtype=torch.float32, device=device)
         self.attack_names = [m['attack'] for m in meta]
+        self.striker_names = [m['striker'] for m in meta]  # left_hand, right_hand or right_shin
 
         # balanced sampling: an attack class uniformly, then a clip of that class
         order = torch.argsort(self.label, stable=True)

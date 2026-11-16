@@ -5,6 +5,8 @@ Every env runs --episodes / --num-envs episodes of --episode-s seconds with the 
 more than the training threshold from the guard reference). Attacks are counted as the env scores them:
   hit / block / evade   the outcome rules of the env (hit_radius, block_radius)
   interrupted           the episode ended by a fall or drift after the attack's onset and before its outcome
+Blocks are also described by the contact's distance to the target and the share made with the left forearm, and every
+step by the share with a forearm inside the attacker (defense_attacker_overlap > 0).
 Rates are shares of the resolved attacks; interrupted attacks are reported separately, so a policy that falls instead of
 getting hit does not look better (check fall_rate and interrupted together).
 Counterattacks (env.config.defense.counter): per clip, the counters started, the share whose strike landed on the attacker
@@ -95,12 +97,16 @@ episodes_per_env = -(-args.episodes // N)
 episodes_done = torch.zeros(N, dtype=torch.long, device=dev)
 counted = torch.ones(N, dtype=torch.bool, device=dev)
 outcomes = torch.zeros(C, 4, device=dev)  # hit, block, evade, interrupted
+block_stats = torch.zeros(C, 2, device=dev)  # sum of contact-to-target distances, blocks with the left forearm
 
 # count the outcomes exactly as the env scores and logs them
 log_outcomes = env._log_defense_outcomes
 def count_outcomes(labels, event):
     resolved = (event > 0) & counted
     outcomes.index_put_((labels[resolved], event[resolved] - 1), torch.ones(int(resolved.sum()), device=dev), accumulate=True)
+    blocked = (event == 2) & counted  # _record_outcomes ran earlier in this step
+    stats = torch.stack([(env._outcome_point - env._outcome_target).norm(dim=-1), (env._outcome_arm_id == 0).float()], dim=1)
+    block_stats.index_add_(0, labels[blocked], stats[blocked])
     log_outcomes(labels, event)
 env._log_defense_outcomes = count_outcomes
 
@@ -117,6 +123,7 @@ env._reset_robot_states_callback = count_interrupted
 episode_counts = {'survived': 0, 'fall': 0, 'drift': 0}
 lengths = []
 body_err_sum, err_steps = 0., 0
+overlap_steps = 0.
 belief_correct = torch.zeros(NUM_PHASES, device=dev)  # class accuracy per attack phase
 belief_steps = torch.zeros(NUM_PHASES, device=dev)
 phase_correct, tti_abs_sum, tti_steps = 0., 0., 0
@@ -143,6 +150,7 @@ with torch.no_grad():
         if alive.any():
             body_err_sum += (env.ref_body_pos_extend[alive] - env._rigid_body_pos_extend[alive]).norm(dim=-1).mean(dim=-1).sum().item() * 1e3
             err_steps += int(alive.sum())
+            overlap_steps += float((env._attacker_overlap[alive] > 0).sum())
         by = env.reset_buf_terminate_by
         for i in torch.nonzero(dones & counted).flatten().tolist():
             if 'gravity' in by and bool(by['gravity'][i]):
@@ -160,7 +168,8 @@ for c in range(C):
     n = outcomes[c].tolist()
     resolved = max(sum(n[:3]), 1)
     per_class[ATTACKS[c]] = {'attacks': int(sum(n)), 'hit': n[0] / resolved, 'block': n[1] / resolved, 'evade': n[2] / resolved,
-                             'interrupted': n[3] / max(sum(n), 1)}
+                             'interrupted': n[3] / max(sum(n), 1),
+                             'block_target_dist_m': float(block_stats[c, 0]) / max(n[1], 1), 'block_left_arm': float(block_stats[c, 1]) / max(n[1], 1)}
 tot = outcomes.sum(dim=0).tolist()
 resolved = max(sum(tot[:3]), 1)
 result = {
@@ -172,6 +181,9 @@ result = {
     'guard_body_err_mm': body_err_sum / max(err_steps, 1),
     'attacks': int(sum(tot)), 'hit_rate': tot[0] / resolved, 'block_rate': tot[1] / resolved, 'evade_rate': tot[2] / resolved,
     'interrupted_rate': tot[3] / max(sum(tot), 1),
+    'block_target_dist_m': float(block_stats[:, 0].sum()) / max(tot[1], 1), 'block_left_arm': float(block_stats[:, 1].sum()) / max(tot[1], 1),
+    'attacker_overlap_rate': overlap_steps / max(err_steps, 1),
+    'block_max_target_dist': env._block_max_target_dist,
     'per_class': per_class,
 }
 counters = None
@@ -196,11 +208,14 @@ out.write_text(json.dumps(result, indent=1))
 
 print(f"\nRESULT {args.name} seed {args.seed}{'' if args.blind == 'none' else f' (blind: {args.blind})'}: {n_ep} episodes | survived {result['survival_rate']:.1%} | "
       f"fall {result['fall_rate']:.1%} | drift {result['drift_rate']:.1%} | mean length {result['mean_episode_s']:.1f} s | "
-      f"guard body err {result['guard_body_err_mm']:.1f} mm")
-print(f"{'attack':15s} {'n':>5s} {'hit':>6s} {'block':>6s} {'evade':>6s} {'interr':>7s}")
+      f"guard body err {result['guard_body_err_mm']:.1f} mm | forearm in the attacker {result['attacker_overlap_rate']:.1%} of steps")
+print(f"blocks count within {result['block_max_target_dist']} m of the target; blk dist = contact to target, L arm = share with the left forearm")
+print(f"{'attack':15s} {'n':>5s} {'hit':>6s} {'block':>6s} {'evade':>6s} {'interr':>7s} {'blk dist':>9s} {'L arm':>6s}")
 for name, r in list(per_class.items()) + [('all', {'attacks': result['attacks'], 'hit': result['hit_rate'], 'block': result['block_rate'],
-                                                   'evade': result['evade_rate'], 'interrupted': result['interrupted_rate']})]:
-    print(f"{name:15s} {r['attacks']:5d} {r['hit']:6.1%} {r['block']:6.1%} {r['evade']:6.1%} {r['interrupted']:7.1%}")
+                                                   'evade': result['evade_rate'], 'interrupted': result['interrupted_rate'],
+                                                   'block_target_dist_m': result['block_target_dist_m'], 'block_left_arm': result['block_left_arm']})]:
+    blk = f"{r['block_target_dist_m'] * 100:7.1f}cm {r['block_left_arm']:6.0%}" if r['block'] > 0 else f"{'-':>9s} {'-':>6s}"
+    print(f"{name:15s} {r['attacks']:5d} {r['hit']:6.1%} {r['block']:6.1%} {r['evade']:6.1%} {r['interrupted']:7.1%} {blk}")
 if counters:
     print(f"{'counter':20s} {'n':>5s} {'landed':>7s} {'finished':>9s}")
     for name, r in counters.items():

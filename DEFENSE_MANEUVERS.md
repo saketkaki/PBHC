@@ -36,7 +36,7 @@ it sees of the attacker, in the same spirit as the terrain-aware work ([TERRAIN_
 
 | Outcome | Rule |
 |---|---|
-| **blocked** | The striker's swept path passes within `block_radius` (7 cm) of a defender forearm axis (elbow to hand). Checked first |
+| **blocked** | The striker's swept path passes within `block_radius` (7 cm) of a defender forearm axis (elbow to hand), with the contact on the forearm within `block_max_target_dist` (20 cm) of the target. Checked first |
 | **hit** | The path passes within `hit_radius` (8 cm) of the target point, `target_link` + `target_local_offset` on the defender |
 | **evaded** | Neither, by the recovered frame |
 
@@ -50,6 +50,8 @@ it sees of the attacker, in the same spirit as the terrain-aware work ([TERRAIN_
 | hit, standoff 0.25 m | 0 % | 100 % | 38 % | 100 % | 97 % | 0 % | 0 % | 100 % | 54 % |
 | blocked, standoff 0.25 m | 100 % | 0 % | 62 % | 0 % | 3 % | 100 % | 100 % | 0 % | 46 % |
 | gap, standoff 0.25 m | 15.7 cm | 11.7 cm | 9.8 cm | 9.6 cm | 11.0 cm | 9.4 cm | 12.0 cm | 21.7 cm | |
+
+**Near-target block rule** (`block_max_target_dist`, 0.2 m). Without it, a forearm anywhere along the striker's path counted as a block. The v1 policy exploited this. It held its lead (left) forearm about 33 cm out in front, and lead hooks and uppercuts passed within 7 cm of it 34–41 cm short of the target: 95–100 % of them were "blocked" by the left arm, although they come in on the defender's right side. A block now counts only if the contact is within 20 cm of the target, so the forearm has to cover the target. With this rule, a held guard is hit by 87 % of attacks and blocks only body shots, whose target sits next to the guard's elbow (`defense_check.py bank`; 74 % at 0.25 m, 88 % at 0.15 m). The table above is without the rule.
 
 No attack is evaded by a static guard either way, so the step-in keeps every strike on target. With the standoff, a held guard blocks only strikes whose path crosses a forearm mid-flight (the jab, rear uppercut and body shot). It no longer blocks strikes that start against the forearm. At 0.2 m, 8 of the 480 clips (hooks and uppercuts, whose guards overlap sideways) still start within `block_radius`. With `block_radius=0` every attack must be evaded.
 
@@ -83,6 +85,7 @@ z --belief head--> class logits (8), phase logits (4), time to impact (1)
 | `defense_block` | +100 | +2 | |
 | `defense_evade` | +100 | +2 | |
 | `defense_striker_proximity` | −10 | up to −0.2 per step | exp(−(d/0.1)²) of the striker-to-target distance while a strike is live |
+| `defense_attacker_overlap` | −20 | up to −0.8 per step | For each forearm (5 points), its depth inside `overlap_margin` (5 cm) of an attacker bone outside the striking limb, from 0 to 1. Stops the defender from parking its arms inside the ghost attacker |
 
 Other reward settings:
 - `feet_air_time` is off.
@@ -99,7 +102,7 @@ Other reward settings:
 | `humanoidverse/envs/defense/defense.py` | `LeggedRobotDefense`: playback, outcomes, observations, rewards, logging, viewer drawing (attacker as a G1, striker, target) |
 | `humanoidverse/simulator/isaacgym/isaacgym.py` | `add_visual_link_actors`: visual-only actors per env; env ids are mapped to robot actor indices (identity with one actor per env) |
 | `humanoidverse/agents/modules/attack_modules.py` | `AttackEncoder`, `AttackConditionedPolicy`, `AttackAwareActor` (with `belief_loss`) |
-| `humanoidverse/agents/mh_ppo/mh_ppo.py` | Builds the actor when `attack_encoder` is configured; `belief_loss_coef` (default 0, other runs unchanged) |
+| `humanoidverse/agents/mh_ppo/mh_ppo.py` | Builds the actor when `attack_encoder` is configured; `belief_loss_coef` (default 0, other runs unchanged). Checkpoints store `reward_names`; when loading after the reward terms change, the critic's per-term value heads are matched by name (older checkpoints use their run's `config.yaml`) |
 | `humanoidverse/config/{env,exp}/defense.yaml`, `obs/defense/main.yaml`, `rewards/defense/main.yaml` | Configs |
 | `scripts/defense_check.py` | Checks (Section 6) |
 
@@ -115,6 +118,8 @@ Other reward settings:
 | `standoff` | 0.25 m | The attacker stands this much farther back in guard and steps in during the strike; 0 = the clips' spacing (checkpoints before this option) |
 | `blend_time` | 0.25 s | Pose blending between clips |
 | `hit_radius`, `block_radius` | 0.08, 0.07 m | Outcome rules; `block_radius=0` disables blocks |
+| `block_max_target_dist` | 0.2 m | A block counts only with the contact this close to the target; `null` = anywhere, which is also the default for checkpoints before this option |
+| `overlap_margin` | 0.05 m | Distance for `defense_attacker_overlap` |
 | `threat_lead_time`, `tracking_relax` | 0.1 s, 0.5 | Tracking relaxation during attacks |
 | `proximity_sigma`, `tti_clip` | 0.1 m, 1 s | Shaping reward width; time-to-impact clip |
 | `terminate_on_hit` | `False` | End the episode on a hit |
@@ -150,6 +155,8 @@ python humanoidverse/train_agent.py +simulator=isaacgym +exp=defense +terrain=te
 **Evaluation (`scripts/defense_eval.py`):**
 - Runs fixed 20 s episodes with the training terminations.
 - Reports hit, block and evade rates per attack class, attacks interrupted by a fall or drift, survival, guard tracking error and the belief head's accuracy by attack phase.
+- Describes blocks by the contact's distance to the target and the share made with the left forearm, and reports the share of steps with a forearm inside the attacker.
+- Uses the checkpoint's own rules. Runs from before `block_max_target_dist` default to the old rule, so to compare them under the new one, add `env.config.defense.block_max_target_dist=0.2`.
 - Takes `key=value` overrides for harder settings.
 - Writes JSON to `<run>/metrics/defense_eval/`.
 - `--blind freeze` hides the attacker from the actor: its keypoints are held at the last pre-strike guard frame, so the policy sees an attacker that never strikes. `--blind zero` feeds zeros instead, which the policy has never seen. Either way the scoring is unchanged. The flag sets the env option `blind_actor`, which also works in the viewer.
@@ -188,6 +195,22 @@ python scripts/defense_eval.py logs/Defense/<tracker run>/model_<last>.pt --env-
 | Thick blue line | The forearm that blocked |
 
 The console prints one line per attack in env 0, e.g. `cross: BLOCKED by the left forearm, 14 cm from its target`.
+
+**Results** (`defense_eval.py`, 256 episodes of 20 s, seed 0, all scored with the near-target block rule):
+
+| Policy | Hit | Block | Evade | Survived / fell | Guard err | Blk dist | L arm | Forearm in attacker |
+|---|---|---|---|---|---|---|---|---|
+| Held guard (`defense_check.py bank`) | 87 % | 13 % | 0 % | – | – | – | – | – |
+| PBHC tracker (`pbhc_guard_tracker`, 19000, `--env-from`) | 86.6 % | 13.3 % | 0.1 % | 99.2 / 0 % | 17 mm | 9.6 cm | 0 % | 6.7 % |
+| v1 (`defense_v1_standoff`, 24000, trained on the old rule) | 39.0 % | 31.0 % | 29.9 % | 100 / 0 % | 38 mm | 15.3 cm | 47 % | 1.6 % |
+| **v2 (`defense_v2_block_rule`, 27000)** | **0.0 %** | 88.7 % | 11.3 % | 100 / 0 % | 44 mm | 15.0 cm | 43 % | 0.0 % |
+| v2, 28000 (last saved) | 0.0 % | 90.1 % | 9.8 % | 89.8 / 7.0 % | 41 mm | 15.4 cm | 42 % | 0.0 % |
+| v2, 28000, `--blind freeze` | 72.8 % | 17.4 % | 9.8 % | 67.2 / 8.6 % | 65 mm | 12.4 cm | 0 % | 2.2 % |
+
+- **v2** is v1 fine-tuned for 4000 iterations with the block rule and `defense_attacker_overlap`.
+- **Arms:** v2 blocks jabs, crosses and rear hooks with the left forearm, and lead hooks, both uppercuts and body shots with the right. It evades every calf kick.
+- **Blinded, v2 is hit 73 % of the time,** close to the held guard, so its blocks are reactions to the attack it sees rather than a pose that covers every target.
+- **Use model_27000.** `model_28000` falls in 7 % of evaluation episodes, although its training episodes ran almost to full length.
 
 ## 8. Open problems and next steps
 

@@ -32,6 +32,8 @@ env:
       blend_time: 0.25 # [s] ease the attacker's pose from the end of one clip into the next (clips start with >= 0.35 s of guard)
       hit_radius: 0.08 # [m] striker path to the target point (fist radius ~4 cm)
       block_radius: 0.07 # [m] striker path to a defender forearm axis (elbow to hand); 0 disables blocks
+      block_max_target_dist: 0.2 # [m] a block counts only with the contact on the forearm this close to the target; null = anywhere
+      overlap_margin: 0.05 # [m] defense_attacker_overlap: defender forearms closer than this to the attacker (outside its striking limb)
       threat_lead_time: 0.1 # [s] the threat window starts this long before the onset and ends at the recovered frame
       tracking_relax: 0.5 # guard-tracking rewards are scaled by (1 - tracking_relax) in the threat window
       proximity_sigma: 0.1 # [m] defense_striker_proximity reward
