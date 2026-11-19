@@ -1635,3 +1635,60 @@ times as often (3 of 10 counters) and `counter.leg_reward_scale: 3.0` triples it
   tilt 80.9 % (16.4 % drift remains: more than 0.45 m of slip within one attack).
 - Best so far: def13 file `model_15000` (or def12 `model_14500` evaluated with `reanchor_attacks=True`: tilt 97.3).
   Videos of `model_15000`: `logs/Defense/videos_def13_it15000/`.
+
+### 2026-11-12 – 2026-11-16 — merge of the blocking fix; attacker legs solved
+- Merged `terrain-aware-tracking` (akhilghar's blocking fix, PR #3) into `terrain-aware-defense` (`a5b3c98`). Smoke test,
+  def13 `model_15000`, tilt 18°: survived 93.8 %, hit 0.6 %, counters landed 95.6 %; the run's config has no block
+  distance limit ("within None m"), blocks averaged 30.7 cm from the target, 92 % with the left forearm.
+- The ghost attacker stretched its legs and leaned back (planted feet + legs sheared to the clip's pelvis; a foot stepped
+  only 0.3 m off). `_ground_attackers` now solves each leg as a rigid thigh + shin (knee bending as in the clip; the body
+  crouches, up to `crouch_max`, when a planted foot is out of `leg_reach` = 0.98 of the leg), feet step at 0.12 m
+  (`step_time` 0.2 s, only while the other foot is down), and settle to the clip's place once it holds them still
+  (`settle_trigger` 0.03 m). Decided 2026-11-16: keep the ghost, no physical attacker.
+- def13 `model_15000` with the new attacker legs (no retraining), survived / fall / drift, hit, counters landed:
+  flat 99.6/0.0/0.4, 0.0 %, 96.3 % (unchanged); step10 80.5/2.0/17.6, 0.5 %, 96.6 % (was 84.8: within noise);
+  tilt 87.1/2.7/10.2, 1.8 %, 89.2 % (was 93.8 / 0.6 / 96.5: the policy has not seen the attacker crouching on slopes).
+  Videos: `logs/Defense/videos_def13_it15000_legfix/`, W&B `b0jpzuex` `videos/it15000_legfix_*`.
+
+### 2026-11-16 — DEF-STRIKES: def14 (new attacker legs, block limit, no guard following, level start)
+- `def14_legfix_level_s2` (W&B `cqyzaz18`; a first launch, `oapkopfr`, crashed at the first reset: the WJX motion
+  library only takes all envs at once) continues from def13 file `model_15000`, 2,000 iterations, with: the solved
+  attacker legs; `block_max_target_dist` 0.2 m and `defense_attacker_overlap` -20 (from the merged blocking fix);
+  `counter.reanchor_attacks: False`; new `terrain_aware.level_start` (training): the guard's placement is chosen among 16
+  so that no step edge lies under or around either foot (samples within 2 cm of a plane, so slopes pass; ~60 % of resets
+  find one). The run's last save overwrote file `model_16500` (copied to `model_final`).
+- Evals with level start off (same starts as def13), survived %, attacks hit %, honest blocks %, counters landed %:
+  | file | flat | step10 | step17 | tilt 18° | bumps 8 cm |
+  |---|---|---|---|---|---|
+  | `model_15500` | 100 / 0.7 / 30 / 94.4 | 78.9 / 1.7 / 30 / 92.6 | 75.4 / 1.8 / 26 / 92.2 | 93.8 / 2.1 / 20 / 87.3 | 99.6 / 0.7 / 30 / 92.1 |
+  | `model_16000` | 100 / 0.3 / 44 / 97.2 | 82.0 / 0.7 / 40 / 95.7 | 80.1 / 1.4 / 35 / 94.1 | 93.0 / 1.3 / 24 / 93.3 | 98.4 / 0.2 / 35 / 96.1 |
+  | `model_16500` (before overwrite) | 100 / 0.2 / 54 / 97.4 | 81.2 / 0.8 / 50 / 96.0 | 76.6 / 0.9 / 43 / 94.8 | 91.4 / 1.2 / 31 / 94.3 | 97.7 / 0.2 / 45 / 96.1 |
+  | `model_final` | 100 / 0.3 / 48 / 97.1 | 80.1 / 0.9 / 45 / 94.9 | 73.0 / 1.2 / 40 / 93.7 | 93.0 / 1.2 / 24 / 81.6 | 98.0 / 0.7 / 36 / 96.1 |
+  Blocks now land ~17 cm from the target (def13: ~30 cm); forearm in the attacker 0.5–1.8 % of steps (def13: 7–10 %).
+- Best: `model_16000`. Tilt recovered against the new attacker (87.1 → 93.0); steps unchanged (~80 %), losses mostly
+  drift ends (15–22 %). A 17 cm steps clip of `model_16000` shows them: feet across the step edge, balance lost after a
+  calf-kick exchange (fall at 8.3 s), not wandering off the guard.
+- Videos of `model_16000`: `logs/Defense/videos_def14_it16000/`, W&B `cqyzaz18` `videos/it16000_*`.
+
+### 2026-11-16 — DEF-STRIKES: def15a/b, practise straddling step edges (edge start), ± leg-IK guard
+- The level start (def14) avoided the hard case, against the point of the steps; it is off from here. New
+  `terrain_aware.edge_start.prob` (training only): that share of resets picks, among 24 placements, one with the guard's
+  feet on two levels ≥ 4 cm apart, each foot flat on its own (~70 % of step-tile resets find one). 0.5 in
+  `defense_terrain_strikes.yaml`.
+- Leg-IK guard (`leg_ik_ref=True`) on def14 `model_16000` without retraining: step10 77.7, step17 75.0 (rigid: 82.0 / 80.1).
+- Both from def14 `model_16000`, 1,000 iterations side by side: `def15a_edge_s2` (W&B `8voz8g7f`, edge start) and
+  `def15b_edge_legik_s2` (W&B `uif5p4ca`, edge start + leg-IK guard). The def15b +500 evals first ran out of GPU memory
+  (two trainings + two evals); rerun one at a time. Last saves overwrote file `model_16500`: copied to `model_mid`
+  (+500) before, `model_final` after.
+- Evals (ordinary starts), survived %, attacks hit %, honest blocks %, counters landed %:
+  | | flat | step10 | step17 | tilt 18° | bumps 8 cm |
+  |---|---|---|---|---|---|
+  | def14 `model_16000` | 100 / 0.3 / 44 / 97.2 | 82.0 / 0.7 / 40 / 95.7 | 80.1 / 1.4 / 35 / 94.1 | 93.0 / 1.3 / 24 / 93.3 | 98.4 / 0.2 / 35 / 96.1 |
+  | def15a mid | 99.6 / 0.4 / 41 / 96.4 | 85.2 / 0.7 / 35 / 95.7 | 77.7 / 0.8 / 35 / 95.4 | 90.2 / 1.9 / 24 / 93.8 | 100 / 0.5 / 32 / 96.0 |
+  | def15a final | 100 / 0.0 / 49 / 96.8 | 82.4 / 0.3 / 45 / 95.7 | 82.8 / 0.6 / 40 / 94.2 | 93.4 / 1.1 / 29 / 92.2 | 100 / 0.1 / 37 / 95.8 |
+  | def15b mid | 99.6 / 0.0 / 39 / 97.6 | 82.4 / 0.5 / 39 / 96.1 | 77.0 / 0.6 / 36 / 95.3 | 96.1 / 0.5 / 27 / 95.5 | 99.6 / 0.1 / 33 / 97.4 |
+  | def15b final | 100 / 0.0 / 34 / 97.1 | 86.3 / 0.4 / 36 / 95.2 | 82.0 / 0.5 / 32 / 94.7 | 93.4 / 0.5 / 26 / 90.1 | 98.8 / 0.2 / 30 / 95.2 |
+- Edge start helps a little everywhere (both finals ≥ def14 on every terrain; step17 drift 19 → 11–16 %). Leg IK vs rigid
+  guard is a tie within noise: def15b falls less on steps (0.4 / 2.3 % vs 2.3 / 5.9 %) and blocks less (honest blocks
+  -5 to -15 points). Kept: def15a final (default reference, more honest blocks). Videos: `logs/Defense/videos_def15a_final/`,
+  W&B `8voz8g7f` `videos/final_*`.

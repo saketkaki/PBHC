@@ -284,6 +284,17 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         # training: shift the motion by a random xy offset per episode, so one tile gives many layouts under the feet
         self._placement_jitter = float(ta.get('placement_jitter', 0.0))
         self._placement_offset = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
+        # pick the placement so that the reference feet start on even ground (not across a step edge): up to `tries` random
+        # placements, the first whose ground under both feet (+- `margin` around each) is within `tol` of a plane
+        ls = ta.get('level_start', None) or {}
+        self._level_start = bool(ls.get('enable', False)) and self._placement_jitter > 0 and self._ground_relative_ref
+        self._level_start_tries, self._level_start_margin, self._level_start_tol = int(ls.get('tries', 16)), float(ls.get('margin', 0.12)), float(ls.get('tol', 0.02))
+        # the opposite, for practice: with probability `prob` the placement puts the reference feet on two levels (a step
+        # edge between them, each foot flat on its own level); placements without such a spot keep the random one
+        es = ta.get('edge_start', None) or {}
+        self._edge_start_prob = float(es.get('prob', 0.0)) if self._placement_jitter > 0 and self._ground_relative_ref else 0.0
+        self._edge_start_tries, self._edge_start_min = int(es.get('tries', 24)), float(es.get('min_height', 0.04))
+        self._edge_start_foot_margin, self._edge_start_foot_tol = float(es.get('foot_margin', 0.06)), float(es.get('foot_tol', 0.01))
         self._custom_ref_offset = self._ground_relative_ref or self._recenter_motion_xy or self._placement_jitter > 0
         if self._ground_relative_ref:
             logger.info(colored(f"Terrain-aware tracking: ground-relative reference (recenter_motion_xy={self._recenter_motion_xy}, "
@@ -1042,12 +1053,75 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             self._early_started[env_ids] = False
             if self._early_start_prob > 0 and not self.is_evaluating:
                 self._sample_early_starts(env_ids)
+        if self._level_start:
+            self._place_on_level_ground(env_ids)
+        if self._edge_start_prob > 0 and not self.is_evaluating:
+            self._place_across_edge(env_ids)
         self._kick_motion_res_counter = -1
         # self.motion_start_times[env_ids] = self._motion_lib.sample_time(self.motion_ids[env_ids])
         # offset = self.env_origins
         # motion_times = (self.episode_length_buf ) * self.dt + self.motion_start_times # next frames so +1
         # # motion_res = self._get_state_from_motionlib_cache(self.motion_ids, motion_times, offset= offset)
         # motion_res = self._get_state_from_motionlib_cache_trimesh(self.motion_ids, motion_times, offset= offset)
+
+    def _place_on_level_ground(self, env_ids):
+        """ Choose each env's placement offset among `tries` random ones so that the reference feet at the start time
+        stand on even ground: no step edge under or around either foot (the samples deviate by at most tol from their
+        best-fit plane, so slopes and gentle bumps pass); the most even placement otherwise. """
+        env_ids = torch.as_tensor(env_ids, device=self.device).long()
+        n, K = len(env_ids), self._level_start_tries
+        state = self._motion_lib.get_motion_state(self.motion_ids, self.motion_start_times)  # the WJX library takes all envs at once
+        feet = state['rg_pos_t'][env_ids][:, self.feet_indices, :2]  # [n, 2, 2] clip frame
+        base = self.env_origins[env_ids, :2].clone()
+        if self._recenter_motion_xy:
+            base -= self._motion_start_xy[env_ids]
+        cand = (torch.rand(n, K, 2, device=self.device) * 2 - 1) * self._placement_jitter
+        cand[:, 0] = self._placement_offset[env_ids]
+        m = self._level_start_margin
+        around = torch.tensor([[0., 0.], [m, 0.], [-m, 0.], [0., m], [0., -m], [m, m], [m, -m], [-m, m], [-m, -m]], device=self.device)
+        pts = (base[:, None, None, None] + cand[:, :, None, None] + feet[:, None, :, None] + around)  # [n, K, 2, 9, 2]
+        xy = pts.reshape(n, K, -1, 2)
+        h = self._terrain_height_at(xy, self._ref_height_lookup)  # [n, K, 18]
+        # a step edge under the feet, not a slope: the largest deviation from the best-fit plane through the samples
+        A = torch.cat([xy - xy.mean(dim=-2, keepdim=True), torch.ones_like(xy[..., :1])], dim=-1)  # [n, K, 18, 3]
+        coef = torch.linalg.lstsq(A, h[..., None]).solution  # [n, K, 3, 1]
+        spread = (A @ coef)[..., 0].sub(h).abs().amax(dim=-1)
+        ok = spread <= self._level_start_tol
+        score = torch.where(ok, torch.arange(K, device=self.device, dtype=torch.float)[None].expand(n, K), 1e3 + spread)
+        best = score.argmin(dim=-1)
+        self._placement_offset[env_ids] = cand[torch.arange(n, device=self.device), best]
+        self.log_dict['level_start_ok'] = ok.any(dim=-1).float().mean()
+
+    def _start_feet_xy(self, env_ids):
+        """ World xy [n, 2, 2] of the reference feet at the start time without the placement offset. """
+        state = self._motion_lib.get_motion_state(self.motion_ids, self.motion_start_times)  # the WJX library takes all envs at once
+        feet = state['rg_pos_t'][env_ids][:, self.feet_indices, :2]
+        base = self.env_origins[env_ids, :2].clone()
+        if self._recenter_motion_xy:
+            base -= self._motion_start_xy[env_ids]
+        return feet + base[:, None]
+
+    def _place_across_edge(self, env_ids):
+        """ For a share edge_start.prob of these envs, choose the placement offset among `tries` random ones so that
+        the reference feet stand on two levels at least min_height apart, each foot flat on its own (its footprint
+        within foot_tol); envs without such a placement (flat, tilt, bumps tiles) keep theirs. """
+        env_ids = torch.as_tensor(env_ids, device=self.device).long()
+        env_ids = env_ids[torch.rand(len(env_ids), device=self.device) < self._edge_start_prob]
+        if len(env_ids) == 0:
+            return
+        n, K = len(env_ids), self._edge_start_tries
+        feet = self._start_feet_xy(env_ids)  # [n, 2, 2]
+        cand = (torch.rand(n, K, 2, device=self.device) * 2 - 1) * self._placement_jitter
+        m = self._edge_start_foot_margin
+        around = torch.tensor([[0., 0.], [m, 0.], [-m, 0.], [0., m], [0., -m]], device=self.device)
+        h = self._terrain_height_at(cand[:, :, None, None] + feet[:, None, :, None] + around, self._ref_height_lookup)  # [n, K, 2, 5]
+        flat = (h.amax(dim=-1) - h.amin(dim=-1) <= self._edge_start_foot_tol).all(dim=-1)
+        ok = flat & ((h[..., 0, 0] - h[..., 1, 0]).abs() >= self._edge_start_min)
+        has = ok.any(dim=-1)
+        best = ok.float().argmax(dim=-1)  # the first that qualifies
+        rows = torch.arange(n, device=self.device)
+        self._placement_offset[env_ids[has]] = cand[rows, best][has]
+        self.log_dict['edge_start_found'] = has.float().mean()
 
     def resample_motion(self):
         self._motion_lib.load_motions(random_sample=True)

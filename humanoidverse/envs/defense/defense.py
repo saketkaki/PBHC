@@ -121,16 +121,21 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         # the attacker's feet (attacker_feet): planted on the terrain under them while the clip has them in contact
         af = dc.get('attacker_feet', None) or {}
         self._feet_planted = bool(af.get('planted', False))
-        self._feet_step_trigger, self._feet_step_time = float(af.get('step_trigger', 0.3)), float(af.get('step_time', 0.3))
+        self._feet_step_trigger, self._feet_step_time = float(af.get('step_trigger', 0.12)), float(af.get('step_time', 0.2))
         self._feet_step_lift, self._feet_swing_decay = float(af.get('step_lift', 0.05)), float(af.get('swing_decay', 0.08))
         self._attacker_crouch_max, self._attacker_stretch_max = float(af.get('crouch_max', 0.2)), float(af.get('stretch_max', 0.05))
         self._foot_planted_xy = torch.zeros(N, 2, 2, device=self.device)  # [env, left/right, xy]
+        self._feet_settle_trigger, self._feet_settle_speed = float(af.get('settle_trigger', 0.03)), float(af.get('settle_speed', 0.1))
+        self._foot_nominal_prev = torch.zeros(N, 2, 2, device=self.device)
         self._foot_offset = torch.zeros(N, 2, 2, device=self.device)  # foot xy minus the clip's
         self._foot_step_t = torch.zeros(N, 2, device=self.device)  # > 0 while a foot is being re-planted (time left)
         self._foot_step_from = torch.zeros(N, 2, 2, device=self.device)
         self._foot_lift = torch.zeros(N, 2, device=self.device)
         self._attacker_leg_rot = torch.zeros(N, 2, 2, 4, device=self.device)  # [env, side, thigh/shin] extra rotation for the viewer
         self._attacker_leg_rot[..., 3] = 1.0
+        self._leg_reach = float(af.get('leg_reach', 0.98))  # share of thigh + shin an ankle may be from its hip
+        self._leg_links = [[[b for b, n in enumerate(bank.body_names) if n.startswith(p) and k in n] for k in ('hip', 'knee', 'ankle')]
+                           for p in ('left_', 'right_')]  # [side][thigh, shin, foot] bodies
         self._target_pos = torch.zeros(N, 3, device=self.device)
         self._striker_target_dist = torch.ones(N, device=self.device)
         self._strike_active = torch.zeros(N, device=self.device)
@@ -485,7 +490,13 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         stepping = self._foot_step_t > 0
         # a planted foot too far from where the clip has it starts a step (one foot at a time, the left first)
         offset = self._foot_planted_xy - nominal
-        want = contact & ~stepping & (offset.norm(dim=-1) > self._feet_step_trigger)
+        # ... or, once the clip holds the foot still (the attacker stands in its guard), farther than settle_trigger: the
+        # attacker then stands on its feet exactly as in the clip instead of staying off them by up to step_trigger
+        still = (nominal - self._foot_nominal_prev).norm(dim=-1) < self._feet_settle_speed * self.dt
+        self._foot_nominal_prev[:] = nominal
+        trigger = torch.where(still, torch.full_like(offset[..., 0], self._feet_settle_trigger), torch.full_like(offset[..., 0], self._feet_step_trigger))
+        want = contact & ~stepping & (offset.norm(dim=-1) > trigger)
+        want &= contact.flip(-1)  # a foot steps only while the other one is on the ground
         want[:, 1] &= ~(want[:, 0] | stepping[:, 0])
         want[:, 0] &= ~stepping[:, 1]
         self._foot_step_from[want] = offset[want]
@@ -507,16 +518,18 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
     def _ground_attackers(self):
         """ Put the attacker on the terrain (_attacker_body_pos, _striker_pos from the nominal clip placement): each foot
         on the ground under it, the pelvis and upper body at the height that keeps the strikes aimed at the defender,
-        limited to what the legs can do from the guard (crouch_max down, stretch_max up from the attacker's own ground),
-        the knees in between. With attacker_feet.planted the feet also keep their place (see _advance_attacker_feet) and
-        the legs shear between the pelvis and the feet (the step-in of `standoff` becomes a lunge). On flat ground
-        without planted feet this is the original placement. """
+        limited to what the legs can do from the guard (crouch_max down, stretch_max up from the attacker's own ground).
+        With attacker_feet.planted the feet also keep their place (see _advance_attacker_feet). The legs are solved as
+        two rigid links from the hip to the ankle (thigh and shin keep the clip's lengths, the knee bends the way it does
+        in the clip), and the body comes down when a planted foot would be out of reach, so a leg never stretches. With
+        the feet where the clip has them on flat ground this is the clip's own pose. """
         bank, nominal = self._attack_bank, self._attacker_nominal
         N = self.num_envs
         delta = self._attacker_delta
         delta[:] = 0.0
+        contact = bank.contact_at(self._attack_ids, self._attack_t)
         if self._feet_planted:  # planted feet stay put whatever the clip's placement has become (e.g. a new clip)
-            held = bank.contact_at(self._attack_ids, self._attack_t) & (self._foot_step_t <= 0)
+            held = contact & (self._foot_step_t <= 0)
             self._foot_offset[:] = torch.where(held[..., None], self._foot_planted_xy - nominal[:, bank.foot_ids, :2], self._foot_offset)
         foot_offset = self._foot_offset if self._feet_planted else torch.zeros_like(self._foot_offset)
         foot_xy = nominal[:, bank.foot_ids, :2] + foot_offset
@@ -527,24 +540,57 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
             h_body = h_own + (h_def - h_own).clamp(-self._attacker_crouch_max, self._attacker_stretch_max)
         else:
             h_foot, h_body = h_def[:, None].expand(N, 2), h_def
-        share = bank.leg_share  # [2, B]
-        leg = share.sum(dim=0)  # 1 ankle, 0.5 knee, 0 elsewhere
-        delta[..., 2] = (1.0 - leg)[None] * h_body[:, None] + ((h_foot + self._foot_lift) @ share)
-        delta[..., :2] = torch.einsum('nsx,sb->nbx', foot_offset, share)
+
+        hip_n, knee_n, ankle_n = nominal[:, bank.hip_ids], nominal[:, bank.knee_ids], nominal[:, bank.ankle_pitch_ids]  # [N, 2, 3]
+        thigh_len, shin_len = (knee_n - hip_n).norm(dim=-1), (ankle_n - knee_n).norm(dim=-1)  # [N, 2]
+        leg_n = ankle_n - hip_n
+        # the farthest an ankle may be from its hip: nearly straight, or as far as the clip itself has it
+        reach = torch.maximum(self._leg_reach * (thigh_len + shin_len), leg_n.norm(dim=-1)).clamp(max=0.9999 * (thigh_len + shin_len))
+        ankle = ankle_n.clone()
+        ankle[..., :2] += foot_offset
+        ankle[..., 2] += h_foot + self._foot_lift
+        hip = hip_n.clone()
+        hip[..., 2] += h_body[:, None]
+        # the body comes down (by at most crouch_max) until the feet on the ground are within reach
+        r = (ankle[..., :2] - hip[..., :2]).norm(dim=-1)
+        drop = (hip[..., 2] - ankle[..., 2] - (reach ** 2 - r ** 2).clamp(min=0.0).sqrt()).clamp(min=0.0)
+        drop = (drop * contact.float()).amax(dim=-1).clamp(max=self._attacker_crouch_max)
+        h_body = h_body - drop
+        hip[..., 2] -= drop[:, None]
+        # two-link leg: an ankle still out of reach is pulled in towards its hip; the knee bends as in the clip
+        leg = ankle - hip
+        dist = leg.norm(dim=-1)
+        direction = leg / dist.clamp(min=1e-6)[..., None]
+        dist = torch.minimum(dist, reach).clamp(min=(thigh_len - shin_len).abs() + 1e-3)
+        ankle = hip + direction * dist[..., None]
+        along = (thigh_len ** 2 - shin_len ** 2 + dist ** 2) / (2.0 * dist)
+        out = (thigh_len ** 2 - along ** 2).clamp(min=0.0).sqrt()
+        dir_n = F.normalize(leg_n, dim=-1)
+        bend = (knee_n - hip_n) - ((knee_n - hip_n) * dir_n).sum(dim=-1, keepdim=True) * dir_n
+        up = torch.zeros(N, 3, device=self.device)
+        up[:, 2] = 1.0
+        forward = torch.cross(hip_n[:, 0] - hip_n[:, 1], up, dim=-1)  # a straight leg bends forward
+        bend = bend + 1e-3 * F.normalize(forward, dim=-1)[:, None]
+        bend = F.normalize(bend - (bend * direction).sum(dim=-1, keepdim=True) * direction, dim=-1)
+        knee = hip + along[..., None] * direction + out[..., None] * bend
+
+        delta[..., 2] = h_body[:, None]
+        for side in range(2):
+            rot_thigh = _rotation_between(knee_n[:, side] - hip_n[:, side], knee[:, side] - hip[:, side])
+            rot_shin = _rotation_between(ankle_n[:, side] - knee_n[:, side], ankle[:, side] - knee[:, side])
+            self._attacker_leg_rot[:, side, 0], self._attacker_leg_rot[:, side, 1] = rot_thigh, rot_shin
+            for links, rot, joint_n, joint in ((self._leg_links[side][0], rot_thigh, hip_n[:, side], hip[:, side]),
+                                               (self._leg_links[side][1], rot_shin, knee_n[:, side], knee[:, side])):
+                for b in links:  # rigid with the thigh (hip links) or the shin (knee link)
+                    delta[:, b] = joint + my_quat_rotate(rot, nominal[:, b] - joint_n) - nominal[:, b]
+            delta[:, self._leg_links[side][2]] = (ankle[:, side] - ankle_n[:, side])[:, None]  # the foot keeps the clip's orientation
         self._attacker_body_pos[:] = nominal + delta
         # striking point: fists move with the upper body, the shin with its leg
         striker = self._striker_nominal.clone()
         striker[:, 2] += h_body
-        knee, ankle = self._attacker_body_pos[:, bank.knee_ids[1]], self._attacker_body_pos[:, bank.ankle_pitch_ids[1]]
         shin = bank.striker_is_shin[self._attack_ids]
-        striker[shin] = (knee + 0.75 * (ankle - knee))[shin]
+        striker[shin] = (knee[:, 1] + 0.75 * (ankle[:, 1] - knee[:, 1]))[shin]
         self._striker_pos[:] = striker
-        if self._attacker_actor:  # the viewer's thigh and shin links turn with the sheared legs
-            for side in range(2):
-                hip, knee_id, ankle_id = bank.hip_ids[side], bank.knee_ids[side], bank.ankle_pitch_ids[side]
-                for part, (a, b) in enumerate(((hip, knee_id), (knee_id, ankle_id))):
-                    self._attacker_leg_rot[:, side, part] = _rotation_between(nominal[:, b] - nominal[:, a],
-                                                                               self._attacker_body_pos[:, b] - self._attacker_body_pos[:, a])
 
     def _attacker_rots(self, env_ids):
         """ World rotations [n, num_bodies, 4] (xyzw) of the attacker's robot bodies at the current clip time, unblended. """

@@ -45,13 +45,16 @@ env:
       blind_actor: none # none, or for evaluation: freeze (the actor sees the attacker held in its guard before each strike) or zero
       attacker_actor: auto # draw the attacker as a G1 (visual-only actors, no collision); auto = only with a viewer
       attacker_feet: # the attacker is a ghost without locomotion: keep its feet from sliding and floating
-        planted: True # feet stay where they stand while the clip has them in contact; the legs shear between the pelvis
+        planted: True # feet stay where they stand while the clip has them in contact; the legs are solved (rigid thigh and shin) between the pelvis
                       # (placed by the clip, `standoff` and the defender's position) and the feet; False = feet follow the clip
-        step_trigger: 0.3 # [m] a planted foot farther than this from where the clip has it is re-planted with a step
-        step_time: 0.3 # [s] duration of such a step
+        step_trigger: 0.12 # [m] a planted foot farther than this from where the clip has it is re-planted with a step (0.3 let the body lean far off its feet)
+        step_time: 0.2 # [s] duration of such a step
+        settle_trigger: 0.03 # [m] ... and farther than this once the clip holds the foot still (slower than settle_speed): standing in
+        settle_speed: 0.1 # [m/s]  its guard, the attacker is on its feet as in the clip
         step_lift: 0.05 # [m] foot lift during the step
         swing_decay: 0.08 # [s] a foot the clip lifts (calf kick) returns to the clip's path with this time constant
         crouch_max: 0.2 # [m] on terrain each foot stands on the ground under it; the upper body is lowered by at most this
+        leg_reach: 0.98 # an ankle is at most this share of thigh + shin from its hip (or as far as the clip has it): the body comes down instead
         stretch_max: 0.05 # [m] or raised by at most this from the attacker's own ground to keep its strikes aimed at the defender
       counter: # counterattacks: after a blocked or evaded attack the defender performs a kung-fu clip aimed at the attacker
         enable: False

@@ -40,6 +40,10 @@ env:
       height_lookup: exact
       ref_height_lookup: exact
       placement_jitter: 0.15 # [m] random xy shift of the guard per episode: each tile's features are met at many offsets
+      level_start: # True (def14): the guard's feet start on level ground, never across a step edge. Off: it avoided the hard case
+        enable: False
+      edge_start: # practice the hard case instead: on step tiles half the episodes start with the guard's feet on two levels
+        prob: 0.5
       early_start:
         prob: 0.0 # the guard has no opening move
       swing_clearance: True # a lifted reference foot of a counter clip clears a riser next to it
@@ -53,7 +57,7 @@ env:
         clips: [jab, cross, lead_hook, rear_hook, lead_uppercut, rear_uppercut, body_shot, calf_kick, calf_kick, calf_kick]
         leg_reward_scale: 3.0
         reanchor: 0.45 # the robot stays where it stepped in for the strike: the guard moves there when the counter ends
-        reanchor_attacks: True # the guard follows the robot after every attack: without it the robot wanders off its guard spot between counters
+        reanchor_attacks: False # True (def13): the guard followed the robot after every attack, but nothing then rewards staying put and the policy wandered
         reanchor_total: 1.5 # 1.0 was reached late in 30 s episodes (the robot then has to step back again)
         # the punches keep a fixed 0.7 m drift cutoff; the calf kick follows the curriculum below (a robot that cannot
         # kick yet is far from the reference leg and would be cut off at every kick)

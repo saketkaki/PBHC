@@ -299,6 +299,7 @@ class MHPPO(BaseAlgo):
         num_learning_iterations = self.num_learning_iterations
 
         tot_iter = self.current_learning_iteration + num_learning_iterations
+        self._tot_iter = tot_iter
         
         # do not use track, because it will confict with motion loading bar
         # for it in track(range(self.current_learning_iteration, tot_iter), description="Learning Iterations"):
@@ -332,7 +333,10 @@ class MHPPO(BaseAlgo):
             self.ep_infos.clear()
         
         
-        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+        # the last iteration done is tot_iter - 1: save under tot_iter, so the final weights never overwrite the last
+        # periodic checkpoint (which they did under its label before)
+        self.current_learning_iteration = tot_iter
+        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(tot_iter)))
 
     def _actor_rollout_step(self, obs_dict, policy_state_dict):
         actions = self._actor_act_step(obs_dict)
@@ -657,7 +661,7 @@ class MHPPO(BaseAlgo):
             # Calculate mean standard deviation and frames per second (FPS)
             mean_std = self.actor.std.mean()
             fps = int(self.num_steps_per_env * self.env.num_envs / iteration_time)
-            str = f" \033[1m Learning iteration {log_dict['it']}/{self.current_learning_iteration + log_dict['num_learning_iterations']} \033[0m "
+            str = f" \033[1m Learning iteration {log_dict['it']}/{getattr(self, '_tot_iter', self.current_learning_iteration + log_dict['num_learning_iterations'])} \033[0m "
             
             return (f"""{str.center(width, ' ')}\n\n"""
                     f"""{'Computation:':>{pad}} {fps:.0f} steps/s\n"""
