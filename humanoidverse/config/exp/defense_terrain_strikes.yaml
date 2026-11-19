@@ -50,6 +50,15 @@ env:
       support_lift_gain: 4
     max_episode_length_s: 30 # an attack and its counter take about 5 s
     defense:
+      placement_noise: # a less predictable attacker: angle, distance and speed of each strike
+        yaw_deg: 10.0
+        range: 0.05
+        speed: [0.85, 1.15]
+      footwork: # a robot foot across a step edge in the guard: the guard reference steps it to flat ground nearby
+        enable: True
+      impact_push: # the ghost attacker applies no force: a block pushes the robot along the strike, a landed counter recoils it
+        block: [0.15, 0.45] # [m/s] added to the root velocity
+        counter: [0.05, 0.2]
       counter:
         enable: True
         clips_all: [jab, cross, lead_hook, rear_hook, lead_uppercut, rear_uppercut, body_shot, calf_kick]
@@ -77,6 +86,11 @@ terrain:
   max_init_terrain_level: 1
   curriculum_graduate_rows: 2
   curriculum_max_difficulty_by_type: {step: 2.0, tilt: 1.75, bumps: 2.0} # top rows: 17 cm steps, 21 deg tilt, 8 cm bumps
+
+rewards:
+  reward_scales:
+    feet_on_one_level: -2.0 # a foot on the ground across a step edge (0 to 1 per foot): stand on one level
+    defense_block: 150.0 # more than an evade (100): a block costs an impact push, and it should still pay to block
 
 algo:
   config:

@@ -1692,3 +1692,53 @@ times as often (3 of 10 counters) and `counter.leg_reward_scale: 3.0` triples it
   guard is a tie within noise: def15b falls less on steps (0.4 / 2.3 % vs 2.3 / 5.9 %) and blocks less (honest blocks
   -5 to -15 points). Kept: def15a final (default reference, more honest blocks). Videos: `logs/Defense/videos_def15a_final/`,
   W&B `8voz8g7f` `videos/final_*`.
+
+### 2026-11-18/19 — DEF-STRIKES: 1,024-episode evals, def16 (impact pushes + foot placement), step-failure diagnosis
+- Evals now 1,024 episodes per terrain (`--episodes 1024 --num-envs 1024`; ±2–2.5 points at 80 %, 95 % interval);
+  `scripts/summarize_defense_eval.py` tabulates the result JSONs. Default protocol: no impact pushes, no attacker variability
+  (override them for checkpoints trained with them; the def16 +1,000 eval below still had its pushes on).
+- `mh_ppo`: the final save is `model_<last iteration + 1>` (before, it overwrote the last periodic checkpoint).
+- Baseline def15a final (1,024 episodes), survived / hit / honest blocks / counters landed: flat 100 / 0.0 / 48 / 96.6,
+  step10 82.5±2.4 / 0.4 / 45 / 95.2, step17 79.6±2.5 / 0.4 / 39 / 94.2, tilt 92.7±1.6 / 1.2 / 25 / 92.2, bumps 99.6 / 0.1 / 38 / 96.2.
+- `def16_push_feet_s2` (W&B `04qnfh8l`, from def15a final, 2,000 it): `defense.impact_push` (a block adds 0.15–0.45 m/s to the
+  root along the strike, a landed counter 0.05–0.2 m/s back) and reward `feet_on_one_level` -2 (a foot in contact whose sole
+  spans a step edge: deviation of 5 sole points from their plane, 1 cm → 0, 8 cm → 1). Final `model_18500`, default protocol:
+  flat 99.9 / 0.3 / 13 / 96.7, step10 **88.1±2.0** / 0.8 / 12 / 95.9, step17 **87.0±2.1** / 1.1 / 12 / 95.2,
+  tilt **95.0±1.4** / 1.0 / 7 / 95.2, bumps 99.7 / 0.5 / 13 / 96.5. Steps +5.6 / +7.4, tilt +2.3; blocks fall to 7–13 %:
+  a block costs a push and pays the same as an evade (100), so the policy evades.
+- Step failures (def15a final, 17 cm steps, 512 episodes, `defense_eval.py --diag`): half the early ends come in the first
+  4 s (≈7× the later rate) while the attacker is still in guard; feet on two levels at the start is not over-represented
+  (56 % of all starts, 50–55 % of failures); a foot across an edge in the first 0.2 s (48 % of starts) about doubles the
+  early-failure risk (13 vs 7 %); about half of all early ends come during the robot's own counter (calf kick 20 %).
+  Without retraining: holding the first attack 1.5 s (`defense.first_attack_delay`) changes nothing (80.5 %); spawning
+  with leg IK (`terrain_aware.spawn_leg_ik`) is worse (79.1 %, 63 vs 42 early ends); guard footwork 82.6 % (noise).
+- New options (off by default): `defense.footwork` (a robot foot across an edge for 0.2 s in the guard makes the guard
+  reference step that foot, by leg IK, to the nearest spot within 6–14 cm where its sole is flat), `placement_noise.speed`
+  (strike playback rate), `defense.shin_check` (a lifted shin blocks a leg kick; unused: an evade pays the same),
+  `first_attack_delay`, `spawn_leg_ik`.
+- `def17_footwork_s2` (W&B `5195sj0j`; a first launch, `ejpniru6`, crashed on a float log value) from def15a final, 2,000 it:
+  def16's pushes and foot reward + footwork + attacker variability (yaw ±10°, range ±5 cm, speed 0.85–1.15) +
+  `defense_block` 150 (evade 100).
+- def16 final, robustness protocol (impact pushes on, attacker yaw ±10°, range ±5 cm, speed 0.85–1.15): flat 99.7,
+  step10 85.8±2.2, step17 86.0±2.2, tilt 94.2±1.5, bumps 99.7 (baseline def15a final: 99.8 / 80.1 / 77.9 / 93.3 / 97.5).
+- def17 (`5195sj0j`), default protocol, survived / hit / honest blocks / counters landed:
+  `model_17500` (+1,000): flat 100 / 0.1 / 70 / 97.2, step10 81.2 / 0.3 / 68 / 95.7, step17 82.1 / 0.5 / 63 / 95.8,
+  tilt 93.1 / 0.7 / 32 / 95.8, bumps 99.7 / 0.2 / 64 / 96.8;
+  `model_18500` (final): flat 100 / 0.1 / 74 / 96.2, step10 83.5±2.3 / 0.7 / 71 / 95.0, step17 85.6±2.2 / 0.9 / 65 / 93.7,
+  tilt 94.9±1.4 / 1.1 / 34 / 86.9, bumps 99.2 / 0.2 / 63 / 96.2. The block bonus brings honest blocks back (34–74 %, the
+  most of any run) with def16's survival on 17 cm steps, tilt and bumps; 10 cm steps (83.5 vs def16 88.1) and counters
+  on tilt (86.9) lag. Still rising on steps → `def18_footwork_cont_s2` (W&B `zrison3f`): def17 continued, same settings, 2,000 it.
+- def17 final, robustness protocol: flat 100 / 0.2 / 72, step10 81.3±2.4 / 0.7 / 70, step17 81.3±2.4 / 0.7 / 65,
+  tilt 91.3±1.8 / 1.1 / 35, bumps 98.1 / 0.4 / 62 (survived / hit / honest blocks). With impact pushes on, blocking means
+  being pushed: def17 blocks 65–70 % on steps and survives ~5 points less there than def16 (85.8 / 86.0), which evades.
+  Same hit rates. def16 = safest, def17 = most realistic blocker. Videos: `logs/Defense/videos_def16_final/` (W&B `04qnfh8l`),
+  `logs/Defense/videos_def17_final/` (W&B `5195sj0j`), `videos/final_*`.
+- def18 (`zrison3f`, def17 continued 2,000 it), default / robustness protocol, survived / hit / honest blocks / counters:
+  `model_19500`: step10 86.4 / 0.6 / 81, step17 82.5 / 1.2 / 75, tilt 91.5 / 1.2 / 39 / 93.0, flat 100, bumps 99.9.
+  `model_20500` (final), default: flat 100 / 0.1 / 83, step10 84.6±2.3 / 0.5 / 81, step17 81.4±2.4 / 0.9 / 75,
+  tilt 89.7±1.9 / 1.6 / 39 / 92.8, bumps 99.5 / 0.3 / 77; robustness: flat 100, step10 85.1±2.2, step17 81.7±2.4,
+  tilt 93.4±1.6 (counters 93.4), bumps 99.4. Under the robustness protocol def18 ≥ def17 everywhere and blocks the most
+  (40–83 %); def16 still survives 1–4 points better on steps. Videos: `logs/Defense/videos_def18_final/` (1 fall on step10,
+  2 on step17 in the clips).
+- `def19_from16_block_s2` (W&B `vdzsroun`): def16 final + def17's settings (footwork, block bonus, attacker variability),
+  1,500 it — def16's balance with def17's blocking?

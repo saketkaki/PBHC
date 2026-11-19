@@ -7,7 +7,8 @@ from humanoidverse.envs.defense.attack_bank import ATTACKS, NUM_PHASES, AttackBa
     sweep_segment_closest
 from humanoidverse.envs.defense.counter_bank import CounterBank, SHIN, STRIKERS
 from humanoidverse.envs.env_utils.visualization import Point
-from isaac_utils.rotations import calc_heading_quat_inv, my_quat_rotate, quat_conjugate, quat_mul
+from isaac_utils.rotations import calc_heading_quat_inv, matrix_to_quaternion, my_quat_rotate, quat_conjugate, quat_mul, \
+    quaternion_to_matrix, wxyz_to_xyzw, xyzw_to_wxyz
 
 PENDING, HIT, BLOCKED, EVADED = 0, 1, 2, 3
 BLIND_SKELETON = [('pelvis', 'head_link'), ('left_elbow_link', 'left_hand_link'), ('right_elbow_link', 'right_hand_link'),
@@ -82,6 +83,39 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._hit_radius, self._block_radius = dc.hit_radius, dc.block_radius
         self._block_max_target_dist = dc.get('block_max_target_dist', None)  # None: anywhere (checkpoints before this option)
         self._overlap_margin = dc.get('overlap_margin', 0.05)
+        # impact pushes (defense.impact_push): the ghost attacker applies no force, so a block pushes the robot along the
+        # strike (block: [min, max] m/s added to the root velocity) and a landed counter recoils it (counter: [min, max])
+        ip = dc.get('impact_push', None) or {}
+        self._push_block = tuple(ip.get('block', (0.0, 0.0)))
+        self._push_counter = tuple(ip.get('counter', (0.0, 0.0)))
+        # feet_on_one_level reward: sole points per foot in the foot's yaw frame, relative to the ankle roll link
+        fp = dc.get('foot_placement', None) or {}
+        sx, sy = fp.get('sole_x', (-0.05, 0.12)), float(fp.get('sole_half_width', 0.035))
+        self._sole_points = torch.tensor([[sx[0], -sy], [sx[0], sy], [sx[1], -sy], [sx[1], sy], [0.5 * (sx[0] + sx[1]), 0.0]],
+                                         device=self.device)
+        self._foot_step_tol, self._foot_step_full = float(fp.get('tol', 0.01)), float(fp.get('full', 0.08))
+        self._feet_off_level = torch.zeros(N, device=self.device)
+        self._feet_off = torch.zeros(N, 2, device=self.device)  # per foot, 0 to 1
+        self._foot_yaw = torch.zeros(N, 2, device=self.device)
+        # guard footwork (defense.footwork): a robot foot that stays across a step edge in the guard makes the guard
+        # reference step that foot to the nearest flat spot (leg IK on the reference), so the policy learns footwork
+        fw = dc.get('footwork', None) or {}
+        self._fw_enable = bool(fw.get('enable', False))
+        self._fw_trigger, self._fw_wait = float(fw.get('trigger', 0.3)), float(fw.get('wait', 0.2))
+        self._fw_step_time, self._fw_lift = float(fw.get('step_time', 0.4)), float(fw.get('lift', 0.06))
+        self._fw_max, self._fw_cooldown = float(fw.get('max_shift', 0.25)), float(fw.get('cooldown', 0.5))
+        reach = [float(r) for r in fw.get('reach', (0.06, 0.1, 0.14))]
+        dirs = torch.tensor([[1., 0.], [-1., 0.], [0., 1.], [0., -1.], [0.7071, 0.7071], [0.7071, -0.7071],
+                             [-0.7071, 0.7071], [-0.7071, -0.7071]], device=self.device)
+        cand = torch.cat([r * dirs for r in reach])  # nearest first
+        self._fw_cand = cand[cand.norm(dim=-1).argsort()]  # [C, 2] in the foot's yaw frame
+        self._fw_shift = torch.zeros(N, 2, 2, device=self.device)  # world xy shift of each reference foot
+        self._fw_from = torch.zeros(N, 2, 2, device=self.device)
+        self._fw_to = torch.zeros(N, 2, 2, device=self.device)
+        self._fw_t = torch.zeros(N, 2, device=self.device)  # > 0 while stepping (time left)
+        self._fw_lift_now = torch.zeros(N, 2, device=self.device)
+        self._fw_bad = torch.zeros(N, 2, device=self.device)  # [s] the robot foot has been across an edge
+        self._fw_cool = torch.zeros(N, device=self.device)
         self._blend_time = dc.blend_time
         self._threat_lead_frames = dc.threat_lead_time / bank.dt
         self._proximity_sigma = dc.proximity_sigma
@@ -89,6 +123,7 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._outcome_log_decay = dc.outcome_log_decay
         self._yaw_noise = torch.pi / 180 * dc.placement_noise.yaw_deg
         self._range_noise = dc.placement_noise.range
+        self._speed_range = tuple(dc.placement_noise.get('speed', (1.0, 1.0)))  # playback rate of each strike clip
         self._standoff = dc.get('standoff', 0.0)
         self._defense_debug_draw = dc.debug_draw
         self._blind_actor = dc.get('blind_actor', 'none')
@@ -102,11 +137,19 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         body = self.simulator._body_list.index
         self._clip_target_body = torch.tensor([body(link) for link in bank.target_link], dtype=torch.long, device=self.device)
         self._elbow_ids = torch.tensor([body('left_elbow_link'), body('right_elbow_link')], dtype=torch.long, device=self.device)
+        # shin check (defense.shin_check): a strike at the leg is also blocked by a lifted shin across its path
+        sc = dc.get('shin_check', None) or {}
+        self._shin_check = bool(sc.get('enable', False))
+        self._def_knee_ids = torch.tensor([body('left_knee_link'), body('right_knee_link')], dtype=torch.long, device=self.device)
+        self._def_ankle_ids = torch.tensor([body('left_ankle_pitch_link'), body('right_ankle_pitch_link')], dtype=torch.long, device=self.device)
         hands = {e['joint_name']: e['pos'] for e in self.config.robot.motion.extend_config}
         self._hand_offset = torch.tensor([hands['left_hand_link'], hands['right_hand_link']], dtype=torch.float, device=self.device)
 
         self._attack_ids = bank.sample(N)
         self._attack_t = torch.zeros(N, device=self.device)
+        self._attack_rate = torch.ones(N, device=self.device)  # clip seconds per second (placement_noise.speed)
+        self._first_attack_delay = float(dc.get('first_attack_delay', 0.0))  # [s] the attacker holds its guard after a reset
+        self._attack_hold = torch.zeros(N, device=self.device)
         self._attack_anchor = torch.zeros(N, 3, device=self.device)
         self._attack_anchor_yaw = torch.zeros(N, device=self.device)
         self._attack_shift = torch.zeros(N, 3, device=self.device)  # clip frame; -x moves the attacker back
@@ -270,20 +313,102 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
 
 
     def _hook_counter_reference(self):
-        """ The reference of robots that are countering comes from their clip (called once the motion library exists). """
-        if not self._counter_enabled:
+        """ The reference of robots that are countering comes from their clip (called once the motion library exists);
+        with footwork, the guard reference's feet are moved by _fw_shift. """
+        if not self._counter_enabled and not self._fw_enable:
             return
-        bank = self._counter_bank
+        bank = self._counter_bank if self._counter_enabled else None
         guard_state = self._motion_lib.get_motion_state
         def get_motion_state(motion_ids, motion_times, offset=None):
             res = guard_state(motion_ids, motion_times, offset=offset)
-            active = self._counter_active[motion_ids]
-            if active.any():
-                env = motion_ids[active]
-                bank.write_states(res, active, self._counter_clip[env], motion_times[active] - self._counter_t0[env],
-                                  None if offset is None else offset[active], self._counter_yaw[env], self._counter_aim_shift[env])
+            if bank is not None:
+                active = self._counter_active[motion_ids]
+                if active.any():
+                    env = motion_ids[active]
+                    bank.write_states(res, active, self._counter_clip[env], motion_times[active] - self._counter_t0[env],
+                                      None if offset is None else offset[active], self._counter_yaw[env], self._counter_aim_shift[env])
+            if self._fw_enable and len(motion_ids) == self.num_envs:
+                self._apply_footwork(res)
             return res
         self._motion_lib.get_motion_state = get_motion_state
+
+    def _apply_footwork(self, res):
+        """ Move the reference feet of robots in their guard by _fw_shift (world xy) and _fw_lift_now (z): leg IK
+        relative to the pelvis, before the ground-relative heights are added. """
+        rows = ((self._fw_shift.abs().sum(dim=(1, 2)) > 0) | (self._fw_lift_now.sum(dim=1) > 0)) & ~self._counter_active
+        if not rows.any():
+            return
+        ids = rows.nonzero(as_tuple=False).flatten()
+        world = torch.cat([self._fw_shift[ids], self._fw_lift_now[ids, :, None]], dim=-1)  # [n, 2, 3]
+        q_ref = res['dof_pos'][ids][:, self._leg_dof_ids]  # [n, 2, 6]
+        pelvis_R = quaternion_to_matrix(xyzw_to_wxyz(res['root_rot'][ids]))  # world from pelvis
+        shift = (world[:, :, None, :] @ pelvis_R[:, None]).squeeze(-2)  # pelvis frame: R^T v
+        q = self._leg_ik(q_ref, shift)
+        pos_ref, rot_ref = self._leg_fk(q_ref)
+        pos, rot = self._leg_fk(q)
+        R0 = pelvis_R[:, None, None]
+        dp = (R0 @ (pos - pos_ref)[..., None]).squeeze(-1)  # [n, 2, 6, 3]
+        dR = R0 @ rot @ rot_ref.transpose(-1, -2) @ R0.transpose(-1, -2)
+        dquat = wxyz_to_xyzw(matrix_to_quaternion(dR)).flatten(1, 2)
+        dof_ids, body_ids = self._leg_dof_ids.flatten(), self._leg_body_ids.flatten()
+        dq = (q - q_ref).flatten(1)
+        res['dof_pos'][ids[:, None], dof_ids] += dq
+        res['rg_pos'][ids[:, None], body_ids] += dp.flatten(1, 2)
+        if res['rg_pos_t'] is not res['rg_pos']:
+            res['rg_pos_t'][ids[:, None], body_ids] += dp.flatten(1, 2)
+        for key in ['rb_rot', 'rg_rot_t']:
+            if key == 'rg_rot_t' and res[key] is res['rb_rot']:
+                continue
+            res[key][ids[:, None], body_ids] = quat_mul(dquat, res[key][ids[:, None], body_ids].contiguous(), w_last=True)
+
+    def _step_footwork(self):
+        """ Once per control step: advance the guard steps, and start one for a robot foot that has stayed across a step
+        edge for `wait` while the robot is in its guard (no counter, no strike on its way), to the nearest spot within
+        `reach` where the reference foot's sole would be flat. """
+        if not self._fw_enable:
+            return
+        bank = self._attack_bank
+        stepping = self._fw_t > 0
+        self._fw_t[stepping] -= self.dt
+        frac = (1.0 - self._fw_t / self._fw_step_time).clamp(0.0, 1.0)
+        ease = frac * frac * (3.0 - 2.0 * frac)
+        self._fw_shift[:] = torch.where(stepping[..., None], self._fw_from + (self._fw_to - self._fw_from) * ease[..., None], self._fw_shift)
+        self._fw_lift_now[:] = torch.where(stepping, self._fw_lift * torch.sin(torch.pi * frac), torch.zeros_like(frac))
+        self._fw_cool -= self.dt
+        guard = ~self._counter_active & (bank.phase_at(self._attack_ids, self._attack_t) != 1)
+        bad = (self._feet_off > self._fw_trigger) & guard[:, None]
+        self._fw_bad[:] = torch.where(bad, self._fw_bad + self.dt, torch.zeros_like(self._fw_bad))
+        stepping = self._fw_t > 0
+        want = (self._fw_bad >= self._fw_wait) & ~stepping.any(dim=1, keepdim=True) & (self._fw_cool <= 0)[:, None]
+        want[:, 1] &= ~want[:, 0]  # one foot at a time
+        if not want.any():
+            return
+        env, foot = want.nonzero(as_tuple=True)
+        ref_xy = self.ref_body_pos_extend[env, self.feet_indices[foot], :2]  # where the reference foot is now
+        yaw = self._foot_yaw[env, foot]
+        c, s_ = torch.cos(yaw)[:, None], torch.sin(yaw)[:, None]
+        C = self._fw_cand
+        off = torch.stack([c * C[None, :, 0] - s_ * C[None, :, 1], s_ * C[None, :, 0] + c * C[None, :, 1]], dim=-1)  # [m, C, 2]
+        px, py = self._sole_points[:, 0], self._sole_points[:, 1]
+        sole = torch.stack([c[..., None] * px - s_[..., None] * py, s_[..., None] * px + c[..., None] * py], dim=-1)  # [m, 1, 5, 2]
+        xy = ref_xy[:, None, None] + off[:, :, None] + sole  # [m, C, 5, 2]
+        h = self._terrain_height_at(xy)
+        A = torch.cat([xy - xy.mean(dim=-2, keepdim=True), torch.ones_like(xy[..., :1])], dim=-1)
+        coef = torch.linalg.lstsq(A, h[..., None]).solution
+        flat = (A @ coef)[..., 0].sub(h).abs().amax(dim=-1) <= self._foot_step_tol  # [m, C]
+        new_shift = self._fw_shift[env, foot][:, None] + off  # [m, C, 2]
+        other = self.ref_body_pos_extend[env, self.feet_indices[1 - foot], :2]
+        gap = (ref_xy[:, None] + off - other[:, None]).norm(dim=-1)
+        ok = flat & (new_shift.norm(dim=-1) <= self._fw_max) & (gap >= 0.15) & (gap <= 0.6)
+        has = ok.any(dim=1)
+        k = ok.float().argmax(dim=1)  # the nearest that qualifies
+        env, foot, k = env[has], foot[has], k[has]
+        self._fw_from[env, foot] = self._fw_shift[env, foot]
+        self._fw_to[env, foot] = new_shift[has][torch.arange(len(env), device=self.device), k]
+        self._fw_t[env, foot] = self._fw_step_time
+        self._fw_cool[env] = self._fw_cooldown + self._fw_step_time
+        self._fw_bad[env, foot] = 0.0
+        self.log_dict['footwork_steps'] = torch.tensor(float(len(env)) / self.num_envs, device=self.device)
 
     def _motion_time_now(self):
         return (self.episode_length_buf + 1) * self.dt + self.motion_start_times  # as kick_motion_res
@@ -300,6 +425,8 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         total = self._reanchor_sum[ids] + move
         total = total * (self._counter_reanchor_total / total.norm(dim=-1, keepdim=True).clamp(min=1e-6)).clamp(max=1.0)
         self._placement_offset[ids] += total - self._reanchor_sum[ids]
+        if self._fw_enable:  # the guard moves to where the robot stands: its feet start afresh
+            self._fw_shift[ids], self._fw_t[ids], self._fw_lift_now[ids] = 0.0, 0.0, 0.0
         self._reanchor_sum[ids] = total
 
     def _start_counters(self, env_ids):
@@ -336,6 +463,38 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._counter_yaw[env_ids] = yaw
         self._counter_aim_shift[env_ids] = reach[:, None] * torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
         self._counter_striker_prev[env_ids] = self._defender_strikers()[env_ids, bank.striker[clip]]
+
+    def _impact_push(self, mask, direction, speed_range):
+        """ Add a velocity of speed_range (uniform) along the horizontal direction [N, 3] to the roots of robots in mask. """
+        ids = mask.nonzero(as_tuple=False).flatten()
+        d = direction[ids, :2]
+        d = d / d.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        lo, hi = speed_range
+        v = lo + (hi - lo) * torch.rand(len(ids), 1, device=self.device)
+        self.simulator.robot_root_states[ids, 7:9] += v * d
+        self.need_to_refresh_envs[ids] = True
+
+    def _measure_feet_on_level(self):
+        """ _feet_off_level [N]: per foot on the ground, how far its sole spans a step edge (largest deviation of the ground
+        under 5 sole points from their best-fit plane, so slopes give ~0), 0 below tol to 1 at full, summed over feet. """
+        pos = self.simulator._rigid_body_pos[:, self.feet_indices]  # [N, 2, 3]
+        yaw = _heading_yaw(self.simulator._rigid_body_rot[:, self.feet_indices].reshape(-1, 4)).view(-1, 2)
+        c, s_ = torch.cos(yaw)[..., None], torch.sin(yaw)[..., None]
+        px, py = self._sole_points[:, 0], self._sole_points[:, 1]
+        xy = torch.stack([pos[..., None, 0] + c * px - s_ * py, pos[..., None, 1] + s_ * px + c * py], dim=-1)  # [N, 2, 5, 2]
+        h = self._terrain_height_at(xy)
+        A = torch.cat([xy - xy.mean(dim=-2, keepdim=True), torch.ones_like(xy[..., :1])], dim=-1)
+        coef = torch.linalg.lstsq(A, h[..., None]).solution
+        dev = (A @ coef)[..., 0].sub(h).abs().amax(dim=-1)  # [N, 2]
+        on_ground = self.simulator.contact_forces[:, self.feet_indices, 2] > 5.0
+        off = ((dev - self._foot_step_tol) / (self._foot_step_full - self._foot_step_tol)).clamp(0.0, 1.0) * on_ground.float()
+        self._feet_off_level[:] = off.sum(dim=-1)
+        self._feet_off[:], self._foot_yaw[:] = off, yaw
+        self.log_dict['feet_off_level'] = (off > 0).float().mean()
+
+    def _reward_feet_on_one_level(self):
+        # a foot on the ground across a step edge (use a negative scale): stand on one level, not on the edge
+        return self._feet_off_level
 
     def _attacker_trunk(self):
         """ The attacker's trunk axis: pelvis [N, 3] and the top of the head [N, 3]. """
@@ -380,6 +539,8 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         extended = (striker[:, :2] - self.simulator.robot_root_states[:, :2]).norm(dim=-1) >= self._counter_min_extension * bank.extension[clip]
         landed = window & ~self._counter_landed & (d_sweep < self._counter_clip_radius[clip]) & extended
         self._counter_landed |= landed
+        if self._push_counter[1] > 0 and landed.any():  # recoil: against the direction of the robot's own strike
+            self._impact_push(landed, self._counter_striker_prev - striker, self._push_counter)
         self._counter_totals[:, 1] += torch.bincount(clip[landed], minlength=bank.num_clips)
         self._counter_event[:] = landed.float()
         self._counter_gain[:] = self._counter_clip_gain[clip]
@@ -448,6 +609,8 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._attack_anchor[env_ids] = torch.cat([root[:, :2], self._defender_ground_height()[env_ids, None]], dim=1)
         self._attack_anchor_yaw[env_ids] = _heading_yaw(root[:, 3:7]) + (torch.rand(n, device=self.device) * 2 - 1) * self._yaw_noise
         self._attack_shift[env_ids, 0] = -(torch.rand(n, device=self.device) * 2 - 1) * self._range_noise
+        lo, hi = self._speed_range
+        self._attack_rate[env_ids] = lo + (hi - lo) * torch.rand(n, device=self.device)
         self._attack_status[env_ids] = PENDING
         self._closest_dist[env_ids] = float('inf')
         ids = self._attack_ids[env_ids]
@@ -635,7 +798,9 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         ids = self._attack_ids
         frame_prev = bank.frame(ids, self._attack_t)
         striker_prev = self._striker_pos.clone()
-        self._attack_t += self.dt * (~self._counter_active).float()  # the attacker holds its guard during a counter
+        holding = self._attack_hold > 0
+        self._attack_hold -= self.dt
+        self._attack_t += self.dt * self._attack_rate * (~self._counter_active & ~holding).float()  # the attacker holds its guard during a counter and after a reset
         frame = bank.frame(ids, self._attack_t)
         self._attacker_nominal[:], self._striker_nominal[:] = self._attacker_world(all_ids)
         self._advance_attacker_feet()
@@ -661,6 +826,18 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         block_arm = torch.where(valid, arm_dist, torch.full_like(arm_dist, float('inf'))).argmin(dim=1)
         block_point = arm_point[all_ids, block_arm]
         blocked = check & valid.any(dim=1)
+        if self._shin_check:  # a leg kick met by a shin whose foot is off the ground
+            knee, ankle = rb_pos[:, self._def_knee_ids], rb_pos[:, self._def_ankle_ids]
+            per_leg = [sweep_segment_closest(striker_prev, self._striker_pos, knee[:, k:k + 1], ankle[:, k:k + 1]) for k in range(2)]
+            leg_dist = torch.stack([d for d, _, _ in per_leg], dim=1)
+            leg_point = torch.stack([q for _, _, q in per_leg], dim=1)
+            lifted = self.simulator.contact_forces[:, self.feet_indices, 2] < 1.0  # [N, 2], same order as the knees
+            leg_ok = (leg_dist < self._block_radius) & lifted & bank.striker_is_shin[ids][:, None]
+            shin_block = check & ~blocked & leg_ok.any(dim=1)
+            leg = torch.where(leg_ok, leg_dist, torch.full_like(leg_dist, float('inf'))).argmin(dim=1)
+            block_point = torch.where(shin_block[:, None], leg_point[all_ids, leg], block_point)
+            blocked = blocked | shin_block
+            self.log_dict['defense_shin_check'] = shin_block.float().sum() / bank.striker_is_shin[ids].float().sum().clamp(min=1.0)
         hit = check & ~blocked & (d_target < self._hit_radius)
         closer = check & (d_target < self._closest_dist)
         self._closest_dist[closer], self._closest_point[closer] = d_target[closer], path_point[closer]
@@ -669,6 +846,8 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         event = torch.zeros_like(self._attack_status)
         event[hit], event[blocked], event[evaded] = HIT, BLOCKED, EVADED
         self._defense_event[:] = event
+        if self._push_block[1] > 0 and blocked.any():
+            self._impact_push(blocked, self._striker_pos - striker_prev, self._push_block)
         self._record_outcomes(event, block_point, block_arm, elbow, hand, path_point)
         self._attack_status[:] = torch.where(event > 0, event, self._attack_status)
         self._strike_active[:] = check.float()
@@ -754,6 +933,8 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         super()._pre_compute_observations_callback()
         self._step_counters()
         self._step_attacks()
+        self._measure_feet_on_level()
+        self._step_footwork()
 
     def _reset_tasks_callback(self, env_ids):
         if len(env_ids):  # before the reference of the new episode is read: back to the guard
@@ -766,6 +947,10 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
     def _reset_robot_states_callback(self, env_ids, target_states=None):
         super()._reset_robot_states_callback(env_ids, target_states)
         self._start_attacks(env_ids, blend=False)
+        self._attack_hold[env_ids] = self._first_attack_delay
+        if self._fw_enable:
+            for buf in (self._fw_shift, self._fw_from, self._fw_to, self._fw_t, self._fw_lift_now, self._fw_bad):
+                buf[env_ids] = 0.0
         self._defense_event[env_ids] = 0
         self._outcome_age[env_ids] = float('inf')
         self._kp_buffer[env_ids] = self._local_keypoints(env_ids)[:, None]
@@ -829,7 +1014,8 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         bank = self._attack_bank
         ids, t = self._attack_ids, self._attack_t
         root = self.simulator.robot_root_states
-        time_to_impact = ((bank.impact_frame[ids] - bank.frame(ids, t)) * bank.dt).clamp(-self._tti_clip, self._tti_clip)
+        # real seconds to impact: clip seconds over the playback rate
+        time_to_impact = ((bank.impact_frame[ids] - bank.frame(ids, t)) * bank.dt / self._attack_rate).clamp(-self._tti_clip, self._tti_clip)
         striker_to_target = my_quat_rotate(calc_heading_quat_inv(root[:, 3:7].clone(), w_last=True), self._target_pos - self._striker_pos)
         return torch.cat([F.one_hot(bank.label[ids], bank.num_classes).float(),
                           F.one_hot(bank.phase_at(ids, t), NUM_PHASES).float(),

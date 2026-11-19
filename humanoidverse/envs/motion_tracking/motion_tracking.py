@@ -280,6 +280,9 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self._leg_ik_ref = bool(ta.get('leg_ik_ref', False))
         self._leg_ik_iterations = int(ta.get('leg_ik_iterations', 6))
         self._leg_ik_support_ratio = float(ta.get('leg_ik_support_ratio', 0.0))
+        # spawn the robot with each foot on its own ground (leg IK on the start pose), also with a rigid reference: with
+        # the feet across a step edge the rigid reference keeps the lower foot in the air, and spawning in it drops the robot
+        self._spawn_leg_ik = bool(ta.get('spawn_leg_ik', False))
         assert not (self._leg_ik_ref and self._per_foot_ref), 'leg_ik_ref replaces per_foot_ref'
         # training: shift the motion by a random xy offset per episode, so one tile gives many layouts under the feet
         self._placement_jitter = float(ta.get('placement_jitter', 0.0))
@@ -1231,9 +1234,7 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             # motion_times = (self.episode_length_buf) * self.dt + self.motion_start_times # next frames so +1
             # offset = self.env_origins
             # motion_res = self._motion_lib.get_motion_state(self.motion_ids, motion_times, offset=offset)
-            motion_res = self.kick_motion_res()
-
-
+            motion_res = self._spawn_motion_res()
 
             root_pos_noise = self.config.init_noise_scale.root_pos * self.config.noise_to_initial_level
             root_rot_noise = self.config.init_noise_scale.root_rot * 3.14 / 180 * self.config.noise_to_initial_level
@@ -1292,7 +1293,7 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         # motion_times = (self.episode_length_buf) * self.dt + self.motion_start_times # next frames so +1
         # offset = self.env_origins
         # motion_res = self._motion_lib.get_motion_state(self.motion_ids, motion_times, offset=offset)
-        motion_res = self.kick_motion_res()
+        motion_res = self._spawn_motion_res()
 
         dof_pos_noise = self.config.init_noise_scale.dof_pos * self.config.noise_to_initial_level
         dof_vel_noise = self.config.init_noise_scale.dof_vel * self.config.noise_to_initial_level
@@ -1301,6 +1302,27 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self.simulator.dof_pos[env_ids] = dof_pos + torch.randn_like(dof_pos) * dof_pos_noise
         self.simulator.dof_vel[env_ids] = dof_vel + torch.randn_like(dof_vel) * dof_vel_noise
 
+
+    def _spawn_motion_res(self):
+        """ The reference state of kick_motion_res with the legs solved so each foot stands on its own ground
+        (terrain_aware.spawn_leg_ik); the reference itself stays as configured. """
+        res = self.kick_motion_res()
+        if not (self._spawn_leg_ik and self._ground_relative_ref) or self._leg_ik_ref:
+            return res
+        key = (self.common_step_counter, id(res))
+        if getattr(self, '_spawn_cache_key', None) == key:
+            return self._spawn_cache
+        motion_times = (self.episode_length_buf + 1) * self.dt + self.motion_start_times
+        fit = self._motion_lib.get_motion_state(self.motion_ids, motion_times, offset=self._ref_offset())
+        self._leg_ik_ref = True
+        try:
+            self._apply_ground_relative_ref(fit)
+        finally:
+            self._leg_ik_ref = False
+        out = dict(res)
+        out['root_pos'], out['dof_pos'] = fit['root_pos'], fit['dof_pos']
+        self._spawn_cache_key, self._spawn_cache = key, out
+        return out
 
     _kick_motion_res_counter = -1
     _kick_motion_res_buffer: Optional[Dict[str, torch.Tensor]] = None

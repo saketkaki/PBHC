@@ -46,6 +46,7 @@ parser.add_argument('--blind', choices=['none', 'freeze', 'zero'], default='none
 parser.add_argument('--env-from', default=None)
 parser.add_argument('--terrain', default=None)  # flat, step, tilt or bumps: one terrain type for all envs (terrain runs)
 parser.add_argument('--difficulty', type=float, default=1.0)  # with --terrain: 1 = 10 cm steps, 12 deg tilt, 4 cm bumps
+parser.add_argument('--diag', action='store_true')  # what was happening just before each fall or drift end
 args, overrides = parser.parse_known_args()
 
 import numpy as np  # noqa: E402
@@ -121,6 +122,18 @@ def count_interrupted(env_ids, target_states=None):
 env._reset_robot_states_callback = count_interrupted
 
 episode_counts = {'survived': 0, 'fall': 0, 'drift': 0}
+diag = {'n': 0, 'counter': {}, 'phase': [0] * NUM_PHASES, 'two_levels_end': 0, 'two_levels_start': 0,
+        'time': [0, 0, 0, 0], 'attack': {}, 'early': 0, 'early_two_start': 0, 'early_counter': 0, 'starts': 0, 'starts_two': 0, 'early_overhang': 0, 'starts_overhang': 0}
+last = {}
+start_two = torch.zeros(env.num_envs, dtype=torch.bool, device=dev)
+start_overhang = torch.zeros(env.num_envs, dtype=torch.bool, device=dev)  # a foot across an edge in the first 0.2 s
+
+
+def feet_two_levels():
+    """ [N] bool: the robot's feet stand on ground more than 3 cm apart in height (across a step edge). """
+    feet = env.simulator._rigid_body_pos[:, env.feet_indices, :2]
+    h = env._terrain_height_at(feet)
+    return (h[:, 0] - h[:, 1]).abs() > 0.03
 lengths = []
 body_err_sum, err_steps = 0., 0
 overlap_steps = 0.
@@ -144,6 +157,19 @@ with torch.no_grad():
             tti_abs_sum += (belief[striking, C + P] - critic[striking, actor.tti_index]).abs().sum().item()
             tti_steps += int(striking.sum())
 
+        if args.diag:
+            bank = env._attack_bank
+            last = {'counter': env._counter_active.clone() if env._counter_enabled else torch.zeros_like(counted),
+                    'clip': env._counter_clip.clone() if env._counter_enabled else torch.zeros_like(episodes_done),
+                    'phase': bank.phase_at(env._attack_ids, env._attack_t), 'label': bank.label[env._attack_ids],
+                    'two': feet_two_levels(), 't': env.episode_length_buf.clone()}
+            start_two = torch.where(env.episode_length_buf <= 1, last['two'], start_two)
+            start_overhang = torch.where(env.episode_length_buf <= 1, torch.zeros_like(start_overhang), start_overhang)
+            start_overhang |= (env.episode_length_buf <= 10) & (env._feet_off_level > 0)
+            new = (env.episode_length_buf == 1) & counted
+            diag['starts'] += int(new.sum()); diag['starts_two'] += int((new & last['two']).sum())
+            at10 = (env.episode_length_buf == 10) & counted
+            diag['starts_overhang'] += int((at10 & start_overhang).sum()); diag['starts10'] = diag.get('starts10', 0) + int(at10.sum())
         obs, _, dones, _ = env.step({'actions': policy(obs['actor_obs'])})
         dones = dones.bool()
         alive = ~dones & counted  # terminal states are reset already
@@ -159,6 +185,20 @@ with torch.no_grad():
                 episode_counts['survived'] += 1
             else:
                 episode_counts['drift'] += 1
+            if args.diag and not bool(env.time_out_buf[i]):
+                diag['n'] += 1
+                name = env.config.defense.counter.clips_all[int(last['clip'][i])] if bool(last['counter'][i]) else 'none'
+                diag['counter'][name] = diag['counter'].get(name, 0) + 1
+                diag['phase'][int(last['phase'][i])] += 1
+                a = ATTACKS[int(last['label'][i])]
+                diag['attack'][a] = diag['attack'].get(a, 0) + 1
+                diag['two_levels_end'] += int(last['two'][i])
+                diag['two_levels_start'] += int(start_two[i])
+                t = float(last['t'][i]) * env.dt
+                diag['time'][0 if t < 4 else 1 if t < 10 else 2 if t < 20 else 3] += 1
+                if t < 4:
+                    diag['early'] += 1; diag['early_two_start'] += int(start_two[i]); diag['early_counter'] += int(bool(last['counter'][i]))
+                    diag['early_overhang'] += int(start_overhang[i])
             lengths.append(int(env.last_episode_length_buf[i]) * env.dt)
         episodes_done += (dones & counted).long()
 
@@ -206,6 +246,21 @@ out = ckpt.parent / 'metrics' / 'defense_eval' / ckpt.stem / f'{args.name}_seed{
 out.parent.mkdir(parents=True, exist_ok=True)
 out.write_text(json.dumps(result, indent=1))
 
+if args.diag and diag['n']:
+    n = diag['n']
+    pct = lambda k: f"{100 * k / n:.0f}%"
+    print(f"DIAG {n} early ends: during a counter {pct(n - diag['counter'].get('none', 0))} "
+          f"({', '.join(f'{k} {pct(v)}' for k, v in sorted(diag['counter'].items(), key=lambda kv: -kv[1]) if k != 'none')})")
+    print(f"DIAG attack phase at the end (guard/strike/retract/guard): {' / '.join(pct(v) for v in diag['phase'])}; "
+          f"attack class: {', '.join(f'{k} {pct(v)}' for k, v in sorted(diag['attack'].items(), key=lambda kv: -kv[1]))}")
+    print(f"DIAG feet on two levels: at the end {pct(diag['two_levels_end'])}, at the episode start {pct(diag['two_levels_start'])}; "
+          f"ended at 0-4 / 4-10 / 10-20 / 20-30 s: {' / '.join(pct(v) for v in diag['time'])}")
+    e = max(diag['early'], 1)
+    print(f"DIAG all episode starts on two levels: {100 * diag['starts_two'] / max(diag['starts'], 1):.0f}% of {diag['starts']}; "
+          f"ends in the first 4 s: {diag['early']}, of them started on two levels {100 * diag['early_two_start'] / e:.0f}%, "
+          f"during a counter {100 * diag['early_counter'] / e:.0f}%")
+    print(f"DIAG a foot across an edge in the first 0.2 s: {100 * diag['starts_overhang'] / max(diag.get('starts10', 0), 1):.0f}% of all "
+          f"episodes, {100 * diag['early_overhang'] / e:.0f}% of the ends in the first 4 s")
 print(f"\nRESULT {args.name} seed {args.seed}{'' if args.blind == 'none' else f' (blind: {args.blind})'}: {n_ep} episodes | survived {result['survival_rate']:.1%} | "
       f"fall {result['fall_rate']:.1%} | drift {result['drift_rate']:.1%} | mean length {result['mean_episode_s']:.1f} s | "
       f"guard body err {result['guard_body_err_mm']:.1f} mm | forearm in the attacker {result['attacker_overlap_rate']:.1%} of steps")
