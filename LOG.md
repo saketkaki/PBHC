@@ -1742,3 +1742,10 @@ times as often (3 of 10 counters) and `counter.leg_reward_scale: 3.0` triples it
   2 on step17 in the clips).
 - `def19_from16_block_s2` (W&B `vdzsroun`): def16 final + def17's settings (footwork, block bonus, attacker variability),
   1,500 it — def16's balance with def17's blocking?
+- Sensor robustness, def16 final, 17 cm steps, 512 episodes, default protocol, survived (±2.6–3): none 90.0, height-scan
+  point noise 2 cm 88.1, scan bias 2 cm 88.7, scan dropout 30 % 89.5, scan delay 2 steps 86.9, **control delay 3 steps
+  (60 ms; training 0–2) 70.9**, friction 0.3 89.8, link mass ×1.2 87.3. Robust to perception errors, friction and mass;
+  not to control delay beyond the trained range → train with a wider `domain_rand.ctrl_delay_step_range` before hardware.
+- def19 stopped on request at label ~19,530 (+1,030 of 1,500; it had slowed from 5.7 to ~30 s/iteration with other GPU
+  jobs running). Checkpoints `model_19000` (+500) and `model_19500` (+1,000), not evaluated; its +1,000 eval was stopped too.
+  Training metrics at +600: blocks 36 %, hits 2.0 %, mean episode length 1,123 steps, counters landed 99.4 %.
