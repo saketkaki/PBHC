@@ -1880,3 +1880,26 @@ times as often (3 of 10 counters) and `counter.leg_reward_scale: 3.0` triples it
   W&B `c8yw55qy`; saves `reward_penalty_scale` 1.0). Videos (five terrains, 30 s, height scan, default protocol; no falls):
   `logs/Defense/videos_def24_final/` as `videos/final_*`, and side by side with def21 final (left) in
   `logs/Defense/videos_def21_vs_def24/` as `videos/vs_def21_*`, both in `c8yw55qy`.
+
+### 2026-11-22 — Where the remaining leg/waist jitter comes from: the injected torque noise, not the policy
+- def24 final, 256 episodes of 20 s, default protocol, with the eval-time noise sources switched off one by one
+  (`domain_rand.randomize_torque_rfi`: uniform torque noise of ±5 % × [0.5, 1.5] of the torque limit at every 5 ms sim step;
+  `use_rao`: a constant random torque offset; `push_robots`; control delay):
+  | flat / step17 | survived | action rate / jerk | joint acc (ref ~24.5) | power | legs / waist / arms above 4 Hz, rad/s (ref 0.41 / 0.26 / 0.50) |
+  |---|---|---|---|---|---|
+  | default | 100 / 83.6* | 0.136 / 0.134, 0.151 / 0.148 | 44.0 / 47.7 | 106 / 123 W | 0.74 / 0.61 / 0.52, 0.81 / 0.64 / 0.55 |
+  | no torque noise | 100 / 86.7 | 0.134 / 0.133, 0.148 / 0.145 | 28.8 / 33.6 | 76 / 94 W | 0.56 / 0.31 / 0.42, 0.64 / 0.36 / 0.46 |
+  | + no offset | 100 / 85.5 | 0.134 / 0.132, 0.237 / 0.220 | 28.8 / 33.1 | 76 / 90 W | 0.56 / 0.31 / 0.41, 0.62 / 0.35 / 0.44 |
+  | + no pushes, no delay | 100 / 89.1 | 0.133 / 0.133, 0.145 / 0.144 | 28.5 / 32.9 | 71 / 87 W | 0.55 / 0.31 / 0.42, 0.63 / 0.36 / 0.46 |
+  (*step17 default from the 256-episode smoothness run: 83.6; 1,024 episodes: 84.9.)
+- Reading: the policy's actions are the same in every row (action rate and jerk unchanged), but switching off the torque
+  noise alone halves the waist's fast motion (0.61 → 0.31 rad/s, 1.2× the reference), cuts the legs' by a quarter
+  (0.74 → 0.56, 1.35×), puts the arms below the reference, and brings joint acceleration to 1.15–1.35× the reference
+  (28.8 vs 24.5) and power down 28 %. The offset, pushes and delay add nothing measurable. So the "jitter" the smoothness
+  metric showed since def22 is mostly the simulator shaking the joints with white torque noise, which the stiff waist
+  (kp 400, kd 5) passes straight to its velocity; the policy itself now moves close to the reference.
+- Consequences: lowering PD gains would let the same noise move the joints more, and a low-pass filter on the actions
+  cannot touch noise added after the PD controller, so neither was trained. Smoothness should be judged with
+  `domain_rand.randomize_torque_rfi=False` (the policy's own motion); survival keeps the default protocol (noise on).
+  Whether ±5–7.5 % white torque noise at 200 Hz is more than the real G1's actuators show is a sim-to-real question,
+  not a policy one.
