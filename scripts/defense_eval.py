@@ -14,6 +14,9 @@ and the share performed to the end (the rest ended with the episode: a fall, dri
 Belief head (actor's encoder on the observed keypoints, against the privileged labels), over all steps of all episodes:
   class accuracy per attack phase (0 guard, 1 strike, 2 retract, 3 guard), phase accuracy, time-to-impact MAE during
   the strike phase.
+Smoothness (class Smoothness): action rate and jerk, joint acceleration and the share of joint-velocity power above 4 Hz
+(legs, waist, arms), each next to the same numbers for the reference the robot tracks, plus the raw sums the penalty
+rewards use, to size their scales.
 --blind sets env.config.defense.blind_actor, hiding the attacker from the actor (an unconditioned test of a conditioned policy; the critic, rewards and scoring
 are unchanged, and the belief metrics are computed on what the actor sees):
   freeze  the attacker_keypoints the actor sees are held from the last step at which the attacker stood in guard (more
@@ -99,6 +102,7 @@ episodes_done = torch.zeros(N, dtype=torch.long, device=dev)
 counted = torch.ones(N, dtype=torch.bool, device=dev)
 outcomes = torch.zeros(C, 4, device=dev)  # hit, block, evade, interrupted
 block_stats = torch.zeros(C, 2, device=dev)  # sum of contact-to-target distances, blocks with the left forearm
+combo_outcomes = torch.zeros(3, device=dev)  # hit, block, evade of the second strikes of combos (defense.combo)
 
 # count the outcomes exactly as the env scores and logs them
 log_outcomes = env._log_defense_outcomes
@@ -108,6 +112,8 @@ def count_outcomes(labels, event):
     blocked = (event == 2) & counted  # _record_outcomes ran earlier in this step
     stats = torch.stack([(env._outcome_point - env._outcome_target).norm(dim=-1), (env._outcome_arm_id == 0).float()], dim=1)
     block_stats.index_add_(0, labels[blocked], stats[blocked])
+    second = resolved & getattr(env, '_combo_second', torch.zeros_like(resolved))
+    combo_outcomes.index_put_((event[second] - 1,), torch.ones(int(second.sum()), device=dev), accumulate=True)
     log_outcomes(labels, event)
 env._log_defense_outcomes = count_outcomes
 
@@ -134,6 +140,89 @@ def feet_two_levels():
     feet = env.simulator._rigid_body_pos[:, env.feet_indices, :2]
     h = env._terrain_height_at(feet)
     return (h[:, 0] - h[:, 1]).abs() > 0.03
+
+
+class Smoothness:
+    """ Jitter of the robot's joints next to the reference it tracks (the guard and counter clips), over the alive steps
+    of counted episodes from SKIP steps after a reset on. Per joint, RMS over steps and joints:
+      action rate / jerk   first / second difference of the policy action per control step (action units)
+      joint acc            change of joint velocity per control step / dt (rad/s^2), robot and reference
+      HF share             share of the joint-velocity power (1 s Hann windows, 1 Hz bins, DC left out) above HF_HZ,
+                           robot and reference, for the legs, the waist and the arms
+    plus the raw per-step sums the penalty rewards use (sum of squares over joints: action_rate, dof_acc, torques) and the
+    mean mechanical power sum |tau * qdot| (W). """
+    W, HF_HZ, SKIP = 50, 4.0, 5
+
+    def __init__(self):
+        D = env.num_dof
+        self.dt = env.dt
+        self.prev = {k: torch.zeros(N, D, device=dev) for k in ('a1', 'a2', 'v1', 'r1')}
+        self.age = torch.zeros(N, dtype=torch.long, device=dev)
+        self.buf = torch.zeros(2, self.W, N, D, device=dev)  # robot / reference joint velocity, last W steps
+        self.t = 0
+        self.s = {k: 0. for k in ('n', 'n2', 'act_rate', 'act_jerk', 'acc', 'ref_acc', 'vel', 'ref_vel', 'pen_action_rate',
+                                  'pen_dof_acc', 'pen_torques', 'power')}
+        names = list(env.dof_names)
+        self.groups = {g: torch.tensor([i for i, n in enumerate(names) if any(k in n for k in keys)], device=dev)
+                       for g, keys in (('legs', ('hip', 'knee', 'ankle')), ('waist', ('waist', 'torso')),
+                                       ('arms', ('shoulder', 'elbow', 'wrist')))}
+        f = torch.fft.rfftfreq(self.W, self.dt).to(dev)
+        self.band, self.hf = f > 0.5, f > self.HF_HZ
+        self.window = torch.hann_window(self.W, periodic=False, device=dev).view(self.W, 1, 1)
+        self.power = {g: torch.zeros(2, 2, device=dev) for g in self.groups}  # [robot, ref] x [HF, all]
+        self.series = {g: 0 for g in self.groups}  # windows x joints summed into self.power
+
+    def step(self, alive):
+        a, v = env.actions, env.simulator.dof_vel
+        r = env.dif_joint_velocities + v  # the reference joint velocity
+        self.age = torch.where(alive, self.age + 1, torch.zeros_like(self.age))
+        ok, ok2 = alive & (self.age > self.SKIP), alive & (self.age > self.SKIP + 1)
+        p, s, n = self.prev, self.s, int(ok.sum())
+        if n:
+            da, acc, racc = (a - p['a1'])[ok], ((v - p['v1']) / self.dt)[ok], ((r - p['r1']) / self.dt)[ok]
+            s['n'] += n
+            s['act_rate'] += da.square().mean(dim=1).sum().item()
+            s['acc'] += acc.square().mean(dim=1).sum().item()
+            s['ref_acc'] += racc.square().mean(dim=1).sum().item()
+            s['vel'] += v[ok].square().mean(dim=1).sum().item()
+            s['ref_vel'] += r[ok].square().mean(dim=1).sum().item()
+            s['pen_action_rate'] += da.square().sum(dim=1).sum().item()
+            s['pen_dof_acc'] += acc.square().sum(dim=1).sum().item()
+            s['pen_torques'] += env.torques[ok].square().sum(dim=1).sum().item()
+            s['power'] += (env.torques[ok] * v[ok]).abs().sum(dim=1).sum().item()
+        if ok2.any():
+            s['n2'] += int(ok2.sum())
+            s['act_jerk'] += (a - 2 * p['a1'] + p['a2'])[ok2].square().mean(dim=1).sum().item()
+        self.buf[0, self.t % self.W], self.buf[1, self.t % self.W] = v, r
+        self.t += 1
+        if self.t % self.W == 0:
+            full = self.age > self.SKIP + self.W  # alive through the whole window
+            if full.any():
+                x = self.buf[:, :, full]  # [2, W, n, D]
+                X = torch.fft.rfft((x - x.mean(dim=1, keepdim=True)) * self.window, dim=1).abs().square()  # [2, F, n, D]
+                for g, idx in self.groups.items():
+                    Pg = X[..., idx].sum(dim=(2, 3))  # [2, F]
+                    self.power[g] += torch.stack([Pg[:, self.hf].sum(dim=1), Pg[:, self.band].sum(dim=1)], dim=1)
+                    self.series[g] += int(full.sum()) * len(idx)
+        p['a2'], p['a1'], p['v1'], p['r1'] = p['a1'], a.clone(), v.clone(), r.clone()
+
+    def result(self):
+        s, n = self.s, max(self.s['n'], 1)
+        rms = lambda k, m=n: (s[k] / m) ** 0.5
+        out = {'action_rate_rms': rms('act_rate'), 'action_jerk_rms': rms('act_jerk', max(s['n2'], 1)),
+               'dof_acc_rms': rms('acc'), 'ref_dof_acc_rms': rms('ref_acc'), 'dof_vel_rms': rms('vel'), 'ref_dof_vel_rms': rms('ref_vel'),
+               'penalty_action_rate_raw': s['pen_action_rate'] / n, 'penalty_dof_acc_raw': s['pen_dof_acc'] / n,
+               'penalty_torques_raw': s['pen_torques'] / n, 'mech_power_w': s['power'] / n, 'steps': s['n']}
+        norm = self.W ** 2 * float(self.window.square().mean()) / 2  # one-sided Parseval, undoing the Hann window
+        for g, P in self.power.items():
+            hf = (P[:, 0] / P[:, 1].clamp(min=1e-9)).tolist()
+            out[f'hf_share_{g}'], out[f'ref_hf_share_{g}'] = hf
+            rms = (P[:, 0] / max(self.series[g], 1) / norm).sqrt().tolist()  # RMS joint speed above HF_HZ (rad/s)
+            out[f'hf_vel_rms_{g}'], out[f'ref_hf_vel_rms_{g}'] = rms
+        return out
+
+
+smooth = Smoothness()
 lengths = []
 body_err_sum, err_steps = 0., 0
 overlap_steps = 0.
@@ -173,6 +262,7 @@ with torch.no_grad():
         obs, _, dones, _ = env.step({'actions': policy(obs['actor_obs'])})
         dones = dones.bool()
         alive = ~dones & counted  # terminal states are reset already
+        smooth.step(alive)
         if alive.any():
             body_err_sum += (env.ref_body_pos_extend[alive] - env._rigid_body_pos_extend[alive]).norm(dim=-1).mean(dim=-1).sum().item() * 1e3
             err_steps += int(alive.sum())
@@ -225,7 +315,11 @@ result = {
     'attacker_overlap_rate': overlap_steps / max(err_steps, 1),
     'block_max_target_dist': env._block_max_target_dist,
     'per_class': per_class,
+    'smoothness': smooth.result(),
 }
+if combo_outcomes.sum() > 0:
+    n = combo_outcomes.tolist()
+    result['combo_second'] = {'attacks': int(sum(n)), 'hit': n[0] / sum(n), 'block': n[1] / sum(n), 'evade': n[2] / sum(n)}
 counters = None
 if getattr(env, '_counter_enabled', False):  # counterattacks: started, landed on the attacker, performed to the end
     totals = env._counter_totals.tolist()
@@ -271,10 +365,23 @@ for name, r in list(per_class.items()) + [('all', {'attacks': result['attacks'],
                                                    'block_target_dist_m': result['block_target_dist_m'], 'block_left_arm': result['block_left_arm']})]:
     blk = f"{r['block_target_dist_m'] * 100:7.1f}cm {r['block_left_arm']:6.0%}" if r['block'] > 0 else f"{'-':>9s} {'-':>6s}"
     print(f"{name:15s} {r['attacks']:5d} {r['hit']:6.1%} {r['block']:6.1%} {r['evade']:6.1%} {r['interrupted']:7.1%} {blk}")
+if 'combo_second' in result:
+    r = result['combo_second']
+    print(f"{'combo 2nd':15s} {r['attacks']:5d} {r['hit']:6.1%} {r['block']:6.1%} {r['evade']:6.1%}")
 if counters:
     print(f"{'counter':20s} {'n':>5s} {'landed':>7s} {'finished':>9s}")
     for name, r in counters.items():
         print(f"{name:20s} {r['started']:5d} {r['landed']:7.1%} {r['finished']:9.1%}")
+m = result['smoothness']
+print(f"smoothness (robot / reference): action rate {m['action_rate_rms']:.3f}, jerk {m['action_jerk_rms']:.3f} | "
+      f"joint acc {m['dof_acc_rms']:.1f} / {m['ref_dof_acc_rms']:.1f} rad/s^2 | joint vel {m['dof_vel_rms']:.2f} / {m['ref_dof_vel_rms']:.2f} rad/s | "
+      f"power >{Smoothness.HF_HZ:.0f} Hz legs {m['hf_share_legs']:.0%} / {m['ref_hf_share_legs']:.0%}, "
+      f"waist {m['hf_share_waist']:.0%} / {m['ref_hf_share_waist']:.0%}, arms {m['hf_share_arms']:.0%} / {m['ref_hf_share_arms']:.0%} | "
+      f"mech power {m['mech_power_w']:.0f} W")
+print(f"joint speed RMS above {Smoothness.HF_HZ:.0f} Hz (rad/s, robot / reference): legs {m['hf_vel_rms_legs']:.3f} / {m['ref_hf_vel_rms_legs']:.3f}, "
+      f"waist {m['hf_vel_rms_waist']:.3f} / {m['ref_hf_vel_rms_waist']:.3f}, arms {m['hf_vel_rms_arms']:.3f} / {m['ref_hf_vel_rms_arms']:.3f}")
+print(f"penalty raw sums per step: action_rate {m['penalty_action_rate_raw']:.3g}, dof_acc {m['penalty_dof_acc_raw']:.3g}, "
+      f"torques {m['penalty_torques_raw']:.3g}")
 if has_belief:
     b = result['belief']
     print(f"belief: class acc {b['class_acc']:.1%} (by phase guard/strike/retract/guard: "

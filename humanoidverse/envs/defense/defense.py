@@ -150,6 +150,13 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._attack_rate = torch.ones(N, device=self.device)  # clip seconds per second (placement_noise.speed)
         self._first_attack_delay = float(dc.get('first_attack_delay', 0.0))  # [s] the attacker holds its guard after a reset
         self._attack_hold = torch.zeros(N, device=self.device)
+        # two-strike combos (defense.combo): with probability prob an attack is followed straight away by a second one,
+        # cut in at its recovered frame and starting `lead` seconds before the next strike's onset (no counter between)
+        cb = dc.get('combo', None) or {}
+        self._combo_prob, self._combo_lead = float(cb.get('prob', 0.0)), float(cb.get('lead', 0.15))
+        self._combo = torch.zeros(N, dtype=torch.bool, device=self.device)  # the current attack is followed by a second
+        self._combo_second = torch.zeros(N, dtype=torch.bool, device=self.device)  # the current attack is a combo's second
+        self._attack_t0 = torch.zeros(N, device=self.device)  # clip time the current clip started at (blending)
         self._attack_anchor = torch.zeros(N, 3, device=self.device)
         self._attack_anchor_yaw = torch.zeros(N, device=self.device)
         self._attack_shift = torch.zeros(N, 3, device=self.device)  # clip frame; -x moves the attacker back
@@ -593,18 +600,27 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         bodies = bank.to_world(bank.bodies(ids, t) + shift[:, None], ids, anchor, yaw)
         striker = bank.to_world(bank.striker(ids, t) + shift, ids, anchor, yaw)
         if blend and self._blend_time > 0:
-            bodies = bodies + (1.0 - t / self._blend_time).clamp(min=0.0)[:, None, None] * self._attack_blend[env_ids]
+            bodies = bodies + (1.0 - (t - self._attack_t0[env_ids]) / self._blend_time).clamp(min=0.0)[:, None, None] * self._attack_blend[env_ids]
         return bodies, striker
 
-    def _start_attacks(self, env_ids, blend):
+    def _start_attacks(self, env_ids, blend, combo_second=False):
         """ Start a new clip, placed at the defender's current root and heading; blend=True eases the attacker's pose
-        from where the previous clip ended. """
+        from where the previous clip ended. combo_second: the second strike of a combo, started `combo.lead` seconds
+        before its onset instead of at the clip start. """
         if len(env_ids) == 0:
             return
         n = len(env_ids)
         old_bodies = self._attacker_nominal[env_ids].clone()
         self._attack_ids[env_ids] = self._attack_bank.sample(n)
-        self._attack_t[env_ids] = 0.0
+        if combo_second:
+            ids = self._attack_ids[env_ids]
+            t0 = (self._attack_bank.onset_frame[ids].float() * self._attack_bank.dt - self._combo_lead).clamp(min=0.0)
+        else:
+            t0 = torch.zeros(n, device=self.device)
+        self._attack_t[env_ids] = t0
+        self._attack_t0[env_ids] = t0
+        self._combo_second[env_ids] = combo_second
+        self._combo[env_ids] = False if combo_second else (torch.rand(n, device=self.device) < self._combo_prob)
         root = self.simulator.robot_root_states[env_ids]
         self._attack_anchor[env_ids] = torch.cat([root[:, :2], self._defender_ground_height()[env_ids, None]], dim=1)
         self._attack_anchor_yaw[env_ids] = _heading_yaw(root[:, 3:7]) + (torch.rand(n, device=self.device) * 2 - 1) * self._yaw_noise
@@ -766,7 +782,7 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         rot = self._attacker_rots(slice(None))
         pos = self._attacker_nominal[:, self._actor_body_ids]
         if self._blend_time > 0:
-            w = (1.0 - self._attack_t / self._blend_time).clamp(min=0.0)[:, None, None]
+            w = (1.0 - (self._attack_t - self._attack_t0) / self._blend_time).clamp(min=0.0)[:, None, None]
             identity = torch.zeros_like(rot)
             identity[..., 3] = 1.0
             delta = w * self._attack_blend_rot + (1.0 - w) * identity
@@ -865,6 +881,11 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._attacker_overlap[:] = ((self._overlap_margin - d) / self._overlap_margin).clamp(0.0, 1.0).sum(dim=1)
         self.log_dict['defense_attacker_overlap'] = (self._attacker_overlap > 0).float().mean()
 
+        if self._combo_prob > 0:  # a combo's first strike, resolved and recovered: the second follows without a counter
+            cut = (self._combo & (frame >= recovered.float()) & (self._attack_status != PENDING)).nonzero(as_tuple=False).flatten()
+            self._start_attacks(cut, blend=True, combo_second=True)
+            self.log_dict['defense_combo_second'] = self._combo_second.float().mean()
+        ids = self._attack_ids
         ended = (self._attack_t >= bank.duration(ids)).nonzero(as_tuple=False).flatten()
         defended = (self._attack_status[ended] == BLOCKED) | (self._attack_status[ended] == EVADED)
         self._start_attacks(ended, blend=True)

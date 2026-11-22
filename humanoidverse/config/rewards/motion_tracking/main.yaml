@@ -74,6 +74,7 @@ rewards:
   reward_penalty_level_down_threshold: 40
   reward_penalty_level_up_threshold: 42 
   reward_penalty_degree: 0.00001 # 0.00001
+  reward_penalty_carry_over: False # True: a run started from a checkpoint continues at its saved penalty scale
   num_compute_average_epl: 10000
 
   reward_limit:
@@ -111,6 +112,7 @@ rewards:
     "penalty_dof_acc",
     "penalty_dof_vel",
     "penalty_action_rate",
+    "penalty_action_jerk",
     "limits_dof_pos",
     "limits_dof_vel",
     "limits_torque",

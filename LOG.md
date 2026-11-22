@@ -1749,3 +1749,134 @@ times as often (3 of 10 counters) and `counter.leg_reward_scale: 3.0` triples it
 - def19 stopped on request at label ~19,530 (+1,030 of 1,500; it had slowed from 5.7 to ~30 s/iteration with other GPU
   jobs running). Checkpoints `model_19000` (+500) and `model_19500` (+1,000), not evaluated; its +1,000 eval was stopped too.
   Training metrics at +600: blocks 36 %, hits 2.0 %, mean episode length 1,123 steps, counters landed 99.4 %.
+
+### 2026-11-20 — DEF-STRIKES: two-strike combos, wider control delay (def20 / def21)
+- New option `defense.combo` (`prob`, `lead`; off by default): with probability `prob` an attack is followed straight
+  away by a second one, cut in at the first's recovered frame and `lead` (0.15 s) before the second strike's onset, so
+  ~0.3–0.5 s between impacts instead of ~1.3 s, with no counter between (the counter follows the second strike). The
+  pose blend between clips now runs from the clip time a clip started at. `defense_eval.py` reports the second strikes
+  separately (`combo 2nd`). Check on def16 final, flat, 64 episodes, prob 0.5: second strikes hit 3.6 % (all 1.3 %).
+- Eval protocols from here on also fix `domain_rand.ctrl_delay_step_range=[0,2]` and `combo.prob=0` (as trained up to
+  def19), so the numbers stay comparable. Extra tests (`eval_extra`): combos at prob 0.5 (flat, step17, tilt) and a
+  control delay of 3 steps (flat, step17).
+- From def18 final (`model_20500`, the best honest blocker), 1,500 it each, side by side:
+  `def20_delay3_s2` (W&B `qydfi4ei`): `domain_rand.ctrl_delay_step_range=[0,3]` (the def16 sensor check: 3 steps → 70.9 %);
+  `def21_delay3_combo_s2` (W&B `cnveoa6z`; a first launch, `sd9tueol`, ran out of GPU memory next to an eval): the same + `defense.combo.prob=0.3`.
+- def19 `model_19500` (+1,000), default protocol, survived / hit / honest blocks / counters landed: flat 100 / 0.2 / 59 / 97.1,
+  step10 82.5 / 0.4 / 57 / 96.2, step17 87.9 / 0.6 / 50 / 95.6, tilt 89.9 / 1.2 / 24 / 88.1 (bumps and robustness not run:
+  stopped to free GPU memory for def20/21). The block bonus costs def16's step survival again; def19 dropped.
+- Evals with 512 envs while two trainings run (2 × 12.4 GB + 6 GB of 32.6 GB; at 1,024 envs one ran out of memory and was
+  rerun), 1,024 episodes each. Default protocol, survived / hit / honest blocks / counters landed:
+  | | flat | step10 | step17 | tilt 18° | bumps 8 cm |
+  |---|---|---|---|---|---|
+  | def18 final (base) | 100 / 0.1 / 83 / – | 84.6 / 0.5 / 81 | 81.4 / 0.9 / 75 | 89.7 / 1.6 / 39 / 92.8 | 99.5 / 0.3 / 77 |
+  | def20 +1,000 (`model_21500`) | 99.9 / 0.2 / 85 / 96.7 | 87.3 / 0.4 / 82 / 96.5 | 86.3 / 0.6 / 75 / 95.4 | 92.1 / 1.3 / 40 / 91.8 | 99.8 / 0.5 / 79 / 96.7 |
+  | def20 final (`model_22000`) | 99.9 / 0.5 / 85 / 96.9 | 84.4 / 1.0 / 83 / 96.2 | **87.9** / 1.3 / 77 / 95.8 | 86.5 / 2.3 / 45 / 94.7 | 99.0 / 0.7 / 79 / 96.8 |
+  | def21 +1,000 | 100 / 0.1 / 85 / 96.0 | 83.3 / 0.5 / 82 / 95.1 | 81.2 / 0.7 / 77 / 93.7 | 85.2 / 1.3 / 43 / 83.1 | 99.5 / 0.2 / 78 / 94.4 |
+  | def21 final (`model_22000`) | 100 / 0.1 / 83 / 96.4 | 84.1 / 0.4 / 81 / 95.9 | 84.2 / 0.7 / 75 / 95.1 | **92.4** / 1.1 / 40 / 93.5 | 99.7 / 0.2 / 75 / 96.3 |
+  Combos (prob 0.5), survived (second strikes hit): def18 flat 99.7 (0.9), step17 79.2 (1.5), tilt 78.3 (4.2);
+  def20 +1,000 99.2 (0.8) / 83.7 (1.2) / 74.5 (2.5); def20 final 99.6 (1.7) / 82.4 (1.9) / 74.7 (4.8);
+  def21 +1,000 100 (0.1) / 79.9 (0.5) / 64.3 (1.9, drift 35 %); def21 final 99.8 (**0.0**) / 83.3 (**0.3**) / **85.4** (1.2).
+  Control delay 3 steps, survived flat / step17: def18 98.0 / 64.5; def20 +1,000 99.5 / 70.5; def20 final 99.6 / **72.9**;
+  def21 +1,000 99.7 / 60.4; def21 final 99.4 / 69.1.
+  Robustness protocol, survived flat / step10 / step17 / tilt / bumps: def20 final 99.9 / 85.6 / 86.0 / 86.2 / 98.9;
+  def21 final 100 / 85.1 / 84.0 / **93.0** / 99.2 (def18 final: 100 / 85.1 / 81.7 / 93.4 / 99.4; def16: 99.7 / 85.8 / 86.0 / 94.2 / 99.7).
+- Reading: def21 final is the best all-rounder: blocks like def18 (40–83 %), ≥ def18 on every terrain, and the only
+  policy that holds up against combos (tilt 85.4 vs 74–78; second strikes almost never land). def20 final is best on
+  17 cm steps and under a 3-step delay but weak on tilt (86.5; 92.1 at +1,000). The wider delay range helps only partly:
+  a 3-step delay on 17 cm steps still costs ~15 points (def16 70.9, def18 64.5 → def20 72.9, def21 69.1).
+- Smoothness: `reward_penalty_curriculum` restarts at 0.10 in every run and grows by ×(1 + 1e-5) per env step (~9,600
+  iterations to 1.0), so every defense fine-tune trained its smoothness penalties (action rate -0.5, torques -1e-6,
+  limits) at ~0.10–0.15 of their scale (def20 log: penalty_scale 0.106 at +325); `penalty_dof_acc` and `penalty_dof_vel` are off.
+
+### 2026-11-21 — Default policy: def21 final; SMOOTH: jitter metrics, penalty curriculum, joint-acceleration penalty (def22 / def23)
+- **Default defense policy from here on: def21 final** (`logs/Defense/20261120_223717-def21_delay3_combo_s2-*/model_22000.pt`,
+  W&B `cnveoa6z`). Videos (five terrains, 30 s, height scan, default protocol; no falls in any clip):
+  `logs/Defense/videos_def21_final/`, logged into `cnveoa6z` as `videos/final_*`.
+- `defense_eval.py` now reports smoothness (class `Smoothness`, JSON key `smoothness`): action rate and jerk (first / second
+  difference per control step), joint acceleration RMS and the share of joint-velocity power above 4 Hz (1 s Hann windows;
+  legs, waist, arms), each next to the reference the robot tracks (guard + counter clips), plus the raw per-step sums the
+  penalty rewards use.
+- def21 final, 256 episodes per terrain, default protocol, robot / reference:
+  | | flat | step10 | step17 | tilt | bumps |
+  |---|---|---|---|---|---|
+  | joint acc RMS (rad/s²) | 62 / 25 | 66 / 24 | 69 / 25 | 70 / 24 | 64 / 24 |
+  | power > 4 Hz, legs | 50 / 30 % | 52 / 30 % | 52 / 30 % | 51 / 30 % | 55 / 30 % |
+  | power > 4 Hz, arms | 37 / 19 % | 37 / 19 % | 37 / 18 % | 37 / 19 % | 38 / 18 % |
+  | action rate / jerk | 0.26 / 0.34 | 0.28 / 0.36 | 0.29 / 0.36 | 0.30 / 0.36 | 0.28 / 0.35 |
+  Jerk > rate: consecutive actions alternate direction (step-to-step chatter); a smooth action has jerk ≪ rate. Raw sums
+  per step: action_rate ~1.6–2.0, dof_acc ~0.9–1.1e5, torques ~3.3–4.0e3, so `penalty_dof_acc` at -2.5e-7 would weigh ~3 %
+  of `penalty_action_rate` (-0.5); -2.5e-6 ~30 %.
+- New option `rewards.reward_penalty_carry_over` (default False): checkpoints now save `reward_penalty_scale`, and a run
+  started from one continues the penalty curriculum at that scale (older checkpoints have none: unchanged).
+- From def21 final, 1,500 it each, def21's settings (control delay 0–3, combos 0.3), penalty curriculum from 0.25 with
+  degree 1e-4 (full scale after ~580 it instead of staying at ~0.1), carry-over on:
+  `def22_smooth_acc_s2` (W&B `wvayt8nl`): + `penalty_dof_acc` -2.5e-6;
+  `def23_smooth_curr_s2` (W&B `7q9wt7tp`): curriculum only (control).
+- def22 / def23 results (1,024 episodes of 30 s each; def21 final's smoothness from 256 episodes of 20 s). Default protocol,
+  survived / hit / honest blocks / counters landed:
+  | | flat | step10 | step17 | tilt 18° | bumps 8 cm |
+  |---|---|---|---|---|---|
+  | def21 final | 100 / 0.1 / 83 / 96.4 | 84.1 / 0.4 / 81 / 95.9 | 84.2 / 0.7 / 75 / 95.1 | 92.4 / 1.1 / 40 / 93.5 | 99.7 / 0.2 / 75 / 96.3 |
+  | def22 +1,000 | 100 / 0.1 / 86 / 97.5 | 83.1 / 0.8 / 83 / 94.9 | 81.7 / 0.9 / 77 / 93.9 | 97.5 / 0.7 / 56 / 95.5 | 98.8 / 0.4 / 83 / 96.0 |
+  | def22 final (`model_23500`) | 99.9 / 0.1 / 86 / 96.7 | 80.4 / 0.7 / 83 / 94.8 | 81.8 / 0.9 / 80 / 94.3 | **96.7** / 0.6 / 56 / 95.1 | 99.5 / 0.5 / 83 / 95.4 |
+  | def23 +1,000 | 100 / 0.3 / 87 / 96.9 | 84.5 / 0.6 / 84 / 95.9 | 84.2 / 1.0 / 78 / 95.2 | 94.4 / 1.2 / 54 / 95.1 | 99.2 / 0.6 / 81 / 96.0 |
+  | def23 final (`model_23500`) | 100 / 0.2 / 87 / 96.5 | 82.8 / 0.8 / 84 / 95.8 | **85.8** / 1.0 / 78 / 95.2 | 93.7 / 1.6 / 57 / 95.3 | 99.1 / 0.7 / 83 / 96.3 |
+  Smoothness, def21 final → def22 final / def23 final (range over the five terrains): action rate 0.26–0.30 → 0.15–0.17 /
+  0.15–0.18, jerk 0.34–0.36 → 0.16–0.19 / 0.17–0.20 (now ≈ rate: the step-to-step chatter is mostly gone), joint acc
+  62–70 → 40–43 / 43–47 rad/s² (reference 24), joint vel 1.6–2.0 → 0.93–1.03 / 0.97–1.07 rad/s (reference 0.92),
+  mechanical power 238–333 → 103–120 / 103–119 W. Joint speed above 4 Hz, rad/s (reference legs 0.41, waist 0.26,
+  arms 0.50): legs 1.08–1.25 → 0.66–0.72 / 0.74–0.81, waist 0.88–0.97 → 0.59–0.63 / 0.60–0.63, arms 0.75–0.88 →
+  0.48–0.51 / 0.51–0.56 (arms now at the reference; legs and waist still 1.6–2.4×).
+  Combos (prob 0.5), survived (second strikes hit): def22 final flat 99.8 (0.2), step17 82.2 (0.6), tilt **95.8** (0.6);
+  def23 final 99.7 (0.1) / **85.0** (0.7) / 89.2 (1.1) (def21 final 99.8 / 83.3 / 85.4).
+  Control delay 3 steps, flat / step17: def22 final 99.7 / 68.7; def23 final 100 / **74.3** (def21 final 99.4 / 69.1).
+  Robustness protocol, flat / step10 / step17 / tilt / bumps: def22 final 99.9 / 79.5 / 81.2 / **97.1** / 98.4;
+  def23 final 100 / 82.0 / 83.6 / 94.4 / 97.9 (def21 final 100 / 85.1 / 84.0 / 93.0 / 99.2).
+- Reading: running the existing penalties at full scale (the curriculum fix) does most of the smoothing; the joint-acceleration
+  penalty adds ~10 % (joint acc 40–43 vs 43–47, leg HF 0.66–0.72 vs 0.74–0.81) and the best tilt (96.7, combos 95.8,
+  robustness 97.1) but costs 2–4 points on steps (def22 80–82 vs def21 84). def23 final keeps def21's step survival (17 cm
+  85.8, 3-step delay 74.3: the best yet) with ~30 % less joint acceleration, ~half the jerk and power, and more blocks
+  (54–87 %); 10 cm steps 82.8 (−1.3) and robustness step10 82.0 (−3.1) are its weak spots. Both checkpoints save
+  `reward_penalty_scale` 1.0, so fine-tunes from them with `rewards.reward_penalty_carry_over=True` stay at full scale.
+- Videos (five terrains, 30 s, no falls in any clip): `logs/Defense/videos_def22_final/` (W&B `wvayt8nl`),
+  `logs/Defense/videos_def23_final/` (W&B `7q9wt7tp`), as `videos/final_*`.
+
+### 2026-11-21 — SMOOTH-2: action-jerk penalty from def23 final (def24 / def25); penalty curriculum defaults for defense; default policy: def24 final
+- `rewards/defense/main.yaml` now sets the fixed curriculum for every defense config (`reward_initial_penalty_scale` 0.25,
+  `reward_penalty_degree` 1e-4) and `reward_penalty_carry_over: True`: a fine-tune continues at its checkpoint's penalty scale.
+- New `penalty_action_jerk` (`legged_robot_base.py`): sum of squared second differences of the actions,
+  a_t − 2a_{t−1} + a_{t−2} (new buffer `last_last_actions`), in the penalty curriculum list. It charges step-to-step
+  chatter only, not a steady fast move (which `penalty_action_rate` and `penalty_dof_acc` also charge, and which the step
+  balance needs: def22's joint-acceleration penalty cost 2–4 points on steps). Target: the leg and waist joint speed above
+  4 Hz, still 1.6–2.4× the reference in def23 final.
+- Runs from def23 final (`model_23500`, penalty scale 1.0 carried over), 1,000 iterations, seed 2, def23's settings (control
+  delay [0,3], combos 0.3): `def24_jerk02_s2` (W&B `c8yw55qy`): jerk -0.2; `def25_jerk05_s2` (W&B `129rxrl2`): jerk -0.5.
+- Halfway (+500, 256 episodes): both on par with def23 final; def25 (-0.5) cost 2–3 points on steps (10 cm 80.1, 17 cm
+  81.2) for no extra joint-level smoothness at its final checkpoint, so its 1,024-episode evals were skipped.
+  def25 final, 256 episodes: survived 100 / 80.1 / 78.1 / 98.8 / 99.2 (flat / step10 / step17 / tilt / bumps), action rate
+  0.130–0.147, jerk 0.120–0.134, joint acc 44–48.5 rad/s², joint speed above 4 Hz legs 0.75–0.83, waist 0.61–0.64.
+- def24 final (`model_24500`), 1,024 episodes of 30 s, default protocol, survived / hit / honest blocks / counters landed:
+  | | flat | step10 | step17 | tilt 18° | bumps 8 cm |
+  |---|---|---|---|---|---|
+  | def21 final | 100 / 0.1 / 83 / 96.4 | 84.1 / 0.4 / 81 / 95.9 | 84.2 / 0.7 / 75 / 95.1 | 92.4 / 1.1 / 40 / 93.5 | 99.7 / 0.2 / 75 / 96.3 |
+  | def23 final | 100 / 0.2 / 87 / 96.5 | 82.8 / 0.8 / 84 / 95.8 | 85.8 / 1.0 / 78 / 95.2 | 93.7 / 1.6 / 57 / 95.3 | 99.1 / 0.7 / 83 / 96.3 |
+  | **def24 final** | 100 / 0.1 / 86 / 96.7 | 83.6 / 0.4 / 85 / 95.9 | 84.9 / 0.9 / 85 / 95.2 | **98.2** / 1.0 / **85** / 96.1 | 98.6 / 0.5 / 85 / 96.1 |
+  Combos (prob 0.5), survived (second strikes hit): flat 99.9 (0.2), step17 **85.5** (0.6), tilt **96.5** (0.8): the best on
+  steps and tilt (def23 85.0 / 89.2, def22 82.2 / 95.8). Control delay 3 steps: flat 99.7, step17 72.6 (def23 74.3, def21 69.1).
+  Robustness protocol, flat / step10 / step17 / tilt / bumps: 100 / 81.6 / 82.6 / **97.4** / 99.1 (def21 100 / 85.1 / 84.0 /
+  93.0 / 99.2; def23 100 / 82.0 / 83.6 / 94.4 / 97.9).
+  Smoothness (range over the five terrains; def23 final in brackets): action rate 0.136–0.197 (0.153–0.181), jerk
+  0.134–0.187 (0.173–0.196): jerk ≤ rate on every terrain, the step-to-step chatter is gone; joint acc 43.6–46.4 (43–47)
+  rad/s², mech power 102–117 W (103–119 W); joint speed above 4 Hz, rad/s: legs 0.74–0.78 (0.74–0.81), waist 0.60–0.63
+  (0.60–0.63), arms 0.52–0.54 (0.51–0.56).
+- Reading: the jerk penalty removes the remaining action chatter but leaves the joint-level fast motion of the legs and
+  waist where it was (still ~1.9× and ~2.3× the reference above 4 Hz): that motion is not step-to-step action flipping but
+  fast corrections (or the PD response to them), which neither jerk nor (def22) joint acceleration penalties remove
+  without costing step balance. Its side effect is the gain: tilt survival 93.7 → 98.2 with honest blocks 57 → 85 %
+  (now the same on every terrain), tilt combos 89.2 → 96.5, robustness tilt 94.4 → 97.4, at def21/def23's level on steps
+  (within ~1 point; robustness step10 81.6 stays ~3.5 below def21).
+- **Default defense policy from here on: def24 final** (`logs/Defense/20261121_224831-def24_jerk02_s2-*/model_24500.pt`,
+  W&B `c8yw55qy`; saves `reward_penalty_scale` 1.0). Videos (five terrains, 30 s, height scan, default protocol; no falls):
+  `logs/Defense/videos_def24_final/` as `videos/final_*`, and side by side with def21 final (left) in
+  `logs/Defense/videos_def21_vs_def24/` as `videos/vs_def21_*`, both in `c8yw55qy`.

@@ -16,5 +16,11 @@ rewards:
     defense_striker_proximity: -10.0
     defense_attacker_overlap: -20.0 # up to -0.8 per step with both forearms deep inside the attacker
 
+  # smoothness penalties at full strength within ~580 iterations (motion_tracking/main: 0.10 and 1e-5, ~9,600 iterations,
+  # so earlier defense fine-tunes trained them at 0.10-0.15), and a fine-tune continues at its checkpoint's scale (LOG.md, SMOOTH)
+  reward_initial_penalty_scale: 0.25
+  reward_penalty_degree: 0.0001
+  reward_penalty_carry_over: True
+
   adaptive_tracking_sigma:
     enable: False # a static reference would shrink sigma until any defensive move loses all tracking reward

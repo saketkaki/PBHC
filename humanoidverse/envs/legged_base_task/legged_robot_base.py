@@ -57,6 +57,7 @@ class LeggedRobotBase(BaseTask):
         self.actions = torch.zeros(self.num_envs, self.dim_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.actions_after_delay = torch.zeros(self.num_envs, self.dim_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_actions = torch.zeros(self.num_envs, self.dim_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        self.last_last_actions = torch.zeros_like(self.last_actions) # two steps back, for penalty_action_jerk
         self.last_dof_pos = torch.zeros_like(self.simulator.dof_pos)
         self.last_dof_vel = torch.zeros_like(self.simulator.dof_vel)
         self.last_root_vel = torch.zeros_like(self.simulator.robot_root_states[:, 7:13])
@@ -396,6 +397,7 @@ class LeggedRobotBase(BaseTask):
         
 
     def _post_compute_observations_callback(self):
+        self.last_last_actions[:] = self.last_actions[:]
         self.last_actions[:] = self.actions[:]
         self.last_dof_pos[:] = self.simulator.dof_pos[:]
         self.last_dof_vel[:] = self.simulator.dof_vel[:]
@@ -660,6 +662,7 @@ class LeggedRobotBase(BaseTask):
         else:
             self.actions[env_ids] = 0.
             self.last_actions[env_ids] = 0.
+            self.last_last_actions[env_ids] = 0.
             self.actions_after_delay[env_ids] = 0.
             self.last_dof_pos[env_ids] = 0.
             self.last_dof_vel[env_ids] = 0.
@@ -955,6 +958,11 @@ class LeggedRobotBase(BaseTask):
     def _reward_penalty_action_rate(self):
         # Penalize changes in actions
         return torch.sum(torch.square(self.last_actions - self.actions), dim=1)
+
+    def _reward_penalty_action_jerk(self):
+        # Penalize the second difference of actions: step-to-step chatter (an action that flips direction every step),
+        # not a steady fast move, which penalty_action_rate also charges
+        return torch.sum(torch.square(self.actions - 2 * self.last_actions + self.last_last_actions), dim=1)
 
     def _reward_penalty_orientation(self):
         # Penalize non flat base orientation

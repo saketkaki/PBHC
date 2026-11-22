@@ -229,7 +229,18 @@ class MHPPO(BaseAlgo):
                 logger.info(f"Critic Learning rate: {self.critic_learning_rate}")
             self.current_learning_iteration = loaded_dict["iter"]
             self._restore_terrain_levels(loaded_dict)
+            self._restore_penalty_scale(loaded_dict)
             return loaded_dict["infos"]
+
+    def _restore_penalty_scale(self, loaded_dict):
+        """ With rewards.reward_penalty_carry_over, continue the penalty curriculum at the checkpoint's scale instead of
+        restarting at reward_initial_penalty_scale (checkpoints saved before this option have no scale: unchanged). """
+        rewards = self.env.config.rewards
+        if 'reward_penalty_scale' in loaded_dict and getattr(self.env, 'use_reward_penalty_curriculum', False) \
+                and rewards.get('reward_penalty_carry_over', False):
+            self.env.reward_penalty_scale = min(max(float(loaded_dict['reward_penalty_scale']), rewards.reward_min_penalty_scale),
+                                                rewards.reward_max_penalty_scale)
+            logger.info(f"Penalty curriculum continues at the checkpoint's scale {self.env.reward_penalty_scale:.3f}")
 
     def _restore_terrain_levels(self, loaded_dict):
         """ Continue the terrain curriculum where the checkpoint's run left it (same envs on the same terrain columns);
@@ -282,6 +293,7 @@ class MHPPO(BaseAlgo):
             'iter': self.current_learning_iteration,
             'infos': infos,
             'reward_names': list(self.env.reward_names),  # the critic's value heads, for loading after reward changes
+            **({'reward_penalty_scale': float(self.env.reward_penalty_scale)} if hasattr(self.env, 'reward_penalty_scale') else {}),
             **({'terrain_levels': self.env.terrain_levels.cpu(), 'terrain_types': self.env.terrain_types.cpu()}
                if hasattr(self.env, 'terrain_levels') else {}),
         }, path)
