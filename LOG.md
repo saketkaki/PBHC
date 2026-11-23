@@ -1903,3 +1903,98 @@ times as often (3 of 10 counters) and `counter.leg_reward_scale: 3.0` triples it
   `domain_rand.randomize_torque_rfi=False` (the policy's own motion); survival keeps the default protocol (noise on).
   Whether ±5–7.5 % white torque noise at 200 Hz is more than the real G1's actuators show is a sim-to-real question,
   not a policy one.
+
+### 2026-11-22 — COUNTER-SPEED: the counters are slow; striking-limb velocity reward and arm/waist acceleration penalty (def26 / def27)
+- `defense_eval.py` now reports counter quality (class `CounterQuality`, JSON key `counter_quality`, lines `cq <clip>`), per clip
+  over counters performed to their end: peak speed of the striking hand / foot / shin within the hit window, robot / reference
+  clip; RMS jerk of the striker path over the clip; RMS joint speed of the striking limb (arm: shoulder, elbow; leg: hip,
+  knee, ankle), robot / reference, and its RMS error.
+- Flat, 256 episodes of 20 s, default protocol (torque noise on / off), peak speed robot / reference [m/s]:
+  | | jab | cross | lead hook | rear hook | lead upper. | rear upper. | body shot | calf kick | all: jerk rob / ref | limb vel rob / ref |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | reference | 2.89 | 5.62 | 3.93 | 3.82 | 3.25 | 4.62 | 3.56 | 3.80 | – / 1,160 | – / 2.13 |
+  | def21 final (off) | 1.18 | 2.21 | 1.17 | 3.05 | 1.18 | 2.67 | 1.12 | 3.60 | 902 | 1.78 |
+  | def24 final (on) | 0.79 | 2.13 | 0.91 | 2.52 | 0.92 | 2.36 | 0.91 | 1.71 | 579 | 1.41 |
+  | def24 final (off) | 0.73 | 2.08 | 0.90 | 2.50 | 0.92 | 2.36 | 0.91 | 1.71 | 529 | 1.32 |
+- Reading: the counters are thrown at 25–65 % of the clip's speed (lead hand 0.7–0.9 m/s against 2.9–3.9), yet 96 % "land":
+  the landing test (striker within 0.17 m of the trunk axis, 80 % extended) passes a hand pushed slowly onto the target.
+  The smoothing runs (penalties at full scale) slowed them further: the calf kick 3.6 → 1.7 m/s, the lead hand 1.2 → 0.9.
+  The striker path jerk stays at ~400–800 m/s³ however slowly the strike moves, so relative to its motion a def24 strike
+  is 2–4× as jagged as the clip (a jab: jerk 454 at 0.79 m/s, the clip 429 at 2.89).
+- New terms: `defense_counter_limb_vel` (during a counter, exp(−mean squared joint-velocity error of the striking limb /
+  `counter.limb_vel_sigma` 4.0 rad²/s²); `teleop_joint_velocity` averages all 23 joints with σ 3.3 and barely sees one arm)
+  and `penalty_upper_dof_acc` (squared joint acceleration of the waist and arms only; def22's whole-body one cost 2–4 points
+  on steps), in the penalty curriculum list.
+- Runs from def24 final (`model_24500`), 1,000 iterations, seed 2, def24's settings (jerk -0.2, delay [0,3], combos 0.3):
+  `def26_cvel_s2` (W&B `g00uml5f`): + `defense_counter_limb_vel` 3.0; `def27_cvel_acc_s2` (W&B `vjejbw4n`): + the same
+  and `penalty_upper_dof_acc` -2.5e-6 (≈ 20 % of the action-rate penalty at the start).
+- def26 stopped at +500: no faster (peak 1.44–1.55 m/s, def24 1.55–1.61). The absolute kernel exp(−err/4) is ~0 during the
+  strike itself (error ≫ 4 rad²/s² at either half speed or none), so it only paid for the slow wind-up the robot already
+  matched. Replaced by `def28_cvelrel_s2` (W&B `b3u8j7vx`): `counter.limb_vel_relative: True` (kernel exp(−err/(σ+ref²)),
+  steps weighted by ref²/(ref²+σ)), scale 10. At +500 no faster either (1.44–1.53 m/s), though its strikes peak closer to
+  the clip's time (lag −51 to −93 ms, def24 −230 to −280).
+- def27 final (`model_25500`): strike jerk −9 to −13 % against def24 (476–571 m/s³), speed 1.44–1.60 m/s, but on steps,
+  1,024 episodes of 30 s: survived flat / step10 / step17 / tilt / bumps 99.8 / 80.2 / 80.8 / 96.3 / 98.7 (def24 100 / 83.6 /
+  84.9 / 98.2 / 98.6), falls 4.0–4.2 % on steps. The waist in the acceleration penalty (it balances on steps) is the suspect;
+  `defense.upper_acc_joints` now sets its joints.
+- Why the counters stay slow: not the torque limits (striking limb above the soft torque limit on 0.1 % of joint-steps in
+  def21, 0 % in def24) but the action-rate penalty: action rate 0.258 (def21, penalty scale ~0.1) vs 0.134 (def24, full
+  scale), strike peak 2.40 vs 1.53 m/s. A fast strike needs large action changes; jaggedness is what jerk / acceleration
+  penalties charge. New `counter.limb_action_rate_scale`: `penalty_action_rate` on the striking limb during a counter.
+- Also new (off by default): `robot.control.action_filter` {alpha, joints}: first-order low-pass of the PD targets of the
+  named joints.
+- Next, from def24 final (seed 2, 1,000 iterations, jerk −0.2, delay [0,3], combos 0.3): relative limb-velocity reward 10,
+  `limb_action_rate_scale` 0.2, `penalty_upper_dof_acc` −2.5e-6 on the arms only; `def29_speedsmooth_lownoise_s2` with the
+  training torque noise `domain_rand.rfi_lim` 0.05 → 0.02, `def30_speedsmooth_s2` with it unchanged.
+- def28 final (`model_25500`, relative limb-velocity reward alone), 1,024 episodes of 30 s: survived 100 / 79.2 / 84.0 / 98.8 /
+  99.5; combos step17 / tilt 84.6 / 97.9; delay 3 steps step17 73.6; robustness 100 / 79.0 / 83.6 / 98.3 / 98.6; strike peak
+  1.57–1.68 m/s (def24 1.55–1.61). def27 final: combos 80.7 / 94.9, delay3 step17 67.4, robustness 100 / 81.2 / 81.2 / 96.6 / 98.4.
+  The 10 cm steps lose ~4 points in both (79–80 vs 83.6): common to the limb-velocity reward, not the waist penalty.
+- def29 (W&B `d77bft7b`) at +500: strike peak 1.73–1.79 m/s (+11–14 %); final (`model_25500`): 1.65–1.66 m/s, punches
+  10–20 % faster than def24 (lead hand 0.94–1.05 m/s) and ~20 % less jerk (352–390 vs 434–478), the calf kick 1.82 m/s.
+  def30 (W&B `vx3hshq6`, the same at the default torque noise) at +500: 1.66–1.67 m/s.
+- **Why the counters are slow (the main cause): `defense_counter_proximity`** pays by the striker's distance to the target on
+  every step of the ±0.4 s hit window. def29 final holds the striker within the landing radius for 674 ms of the 800 ms window
+  and collects a proximity kernel sum of 38 per counter (× 5.0 × dt = 3.8, against 5 for the landing itself): the policy is paid
+  to push the hand onto the target and hold it, not to strike and retract. Counters land 99 %, so the shaping term is no longer
+  needed. `defense_eval.py` reports this as `counter dwell` (`dwell_s`, `proximity_kernel_sum`).
+- Next: `def31_noprox_s2` from def29 final with def29's settings and `defense_counter_proximity` 0.
+- Eval caveat: `defense_eval.py` loads the run's config, so a run trained with `domain_rand.rfi_lim` 0.02 (def29, def31) is
+  evaluated at 0.02 unless the override is passed. def29's default-protocol numbers above are at 0.02 (milder than def24's
+  0.05); def31's evals pass `domain_rand.rfi_lim=0.05`.
+- def30 final (`model_25500`, def29's recipe at the default torque noise), 1,024 episodes of 30 s: survived 100 / 84.1 / 83.4 /
+  97.8 / 99.2; combos step17 / tilt 85.1 / 96.3; delay3 step17 **74.9** (best); robustness 99.9 / 82.7 / 83.9 / 97.4 / 98.2:
+  def24's level everywhere, but the strikes no faster (1.55–1.59 m/s): both def29 and def30 peaked faster at +500 (1.66–1.79)
+  and fell back, the proximity reward pulling them to push-and-hold again. Training at 0.02 noise (def29) cost ~2 points on
+  steps and bought no smoothness.
+- **def31 (`def31_noprox_s2`, W&B `sam59b7g`) at +500, torque noise 0.05:** strike peak 2.07–2.16 m/s (def24 1.55–1.61, +33 %),
+  lead-hand punches 1.36–1.51 m/s (+60 %), calf kick 2.74 m/s (3.80 in the clip), punch jerk 319–367 (−25 %), the striker
+  within the landing radius 397 ms of the 800 ms window (674 ms in def29); survived 17 cm steps 87.1 / 87.9 % (noise on / off),
+  counters land 95.5 %, hit 0.2 %; arm joint-velocity power above 4 Hz 20 % (the clip 19 %).
+- Started `def32_noprox_s2` (W&B `sbw5ttra`): def30 final + `defense_counter_proximity` 0, the default torque noise.
+- def31 final (`model_26500`), every eval at torque noise 0.05: strike peak 2.05–2.11 m/s, jerk 459–560 (def24 1.55–1.61,
+  532–628); 1,024 episodes: survived 100 / 81.1 / 83.8 / **99.5** / **99.7**; combos step17 / tilt 84.6 / **98.5**; delay3 step17
+  69.6; robustness 100 / 78.3 / 81.2 / **99.3** / 99.4. Like def29 (also trained at 0.02), 1–3 points short on steps.
+- **def32 final (`model_26500`, W&B `sbw5ttra`): def30 final + `defense_counter_proximity` 0, the default torque noise.**
+  Counters: strike peak 1.88–1.97 m/s (def24 1.55–1.61, +22 %), striker jerk 451–541 (−14 %), the strike peaks near the clip's
+  time (lag −106 to −154 ms; def24 −230 to −280). 1,024 episodes of 30 s at torque noise 0.05:
+  | | flat | step10 | step17 | tilt 18° | bumps 8 cm |
+  |---|---|---|---|---|---|
+  | def24 final | 100 | 83.6 | 84.9 | 98.2 | 98.6 |
+  | **def32 final** | 100 | **87.0** | **86.0** | 97.0 | 99.4 |
+  Combos flat / step17 / tilt 99.9 / **86.3** / 96.9 (second strikes hit 0.1 / 0.5 / 0.9 %); delay 3 steps flat / step17 99.6 /
+  **77.2** (best; def24 72.6); robustness 100 / **86.9** / **86.1** / 98.2 / 99.2 (def24 100 / 81.6 / 82.6 / 97.4 / 98.6): the
+  best step and robustness numbers of any defense run. Guard body error on flat 72.8 mm (def24 77).
+- Reading: the slow counters came from two terms at once: `penalty_action_rate` at full scale capped the strike speed, and
+  `defense_counter_proximity` paid for holding the hand on the target. Relieving the first on the striking limb during a
+  counter (`limb_action_rate_scale` 0.2) and dropping the second gives faster *and* smoother strikes (jerk is charged by
+  `penalty_action_jerk` and `penalty_upper_dof_acc` on the arms), and the policy that no longer holds a pose at the target
+  balances better on steps. Lower training torque noise (0.02, def29 / def31) cost 1–4 points on steps and bought nothing.
+- **Default defense policy from here on: def32 final** (`logs/Defense/20261123_093347-def32_noprox_s2-*/model_26500.pt`).
+  Recipe (from def24 final, through def30): `+rewards.reward_scales.penalty_action_jerk=-0.2
+  +rewards.reward_scales.defense_counter_limb_vel=10.0 env.config.defense.counter.limb_vel_relative=True
+  env.config.defense.counter.limb_action_rate_scale=0.2 +rewards.reward_scales.penalty_upper_dof_acc=-2.5e-6
+  "env.config.defense.upper_acc_joints=[shoulder,elbow,wrist]" rewards.reward_scales.defense_counter_proximity=0.0`,
+  delay [0,3], combos 0.3. Videos (five terrains, 30 s, torque noise 0.05) in `logs/Defense/videos_def32_final/` and side by
+  side with def24 (left) in `logs/Defense/videos_def24_vs_def32/`, in `sbw5ttra`; def31's likewise in `sam59b7g` (one fall
+  in its 17 cm step clip).

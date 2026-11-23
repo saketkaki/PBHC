@@ -284,6 +284,18 @@ class LeggedRobotBase(BaseTask):
         else:
             self.actions_after_delay = self.actions.clone()
 
+        af = self.config.robot.control.get('action_filter', None)
+        if af is not None and float(af.get('alpha', 1.0)) < 1.0:
+            # first-order low-pass of the commands sent to the PD controller, on the joints named in action_filter.joints
+            # only (e.g. the arms; the legs keep their full bandwidth for balance): y = alpha * a + (1 - alpha) * y_prev
+            if not hasattr(self, '_action_filter_mask'):
+                self._action_filter_mask = torch.tensor([float(any(j in n for j in af.joints)) for n in self.dof_names], device=self.device)
+                self._actions_filtered = torch.zeros_like(self.actions_after_delay)
+                self._action_filter_alpha = float(af.alpha)
+            m, al = self._action_filter_mask, self._action_filter_alpha
+            self._actions_filtered = m * (al * self.actions_after_delay + (1 - al) * self._actions_filtered) + (1 - m) * self.actions_after_delay
+            self.actions_after_delay = self._actions_filtered.clone()
+
 
     def _physics_step(self):
         self.render()
@@ -663,6 +675,8 @@ class LeggedRobotBase(BaseTask):
             self.actions[env_ids] = 0.
             self.last_actions[env_ids] = 0.
             self.last_last_actions[env_ids] = 0.
+            if hasattr(self, '_actions_filtered'):
+                self._actions_filtered[env_ids] = 0.
             self.actions_after_delay[env_ids] = 0.
             self.last_dof_pos[env_ids] = 0.
             self.last_dof_vel[env_ids] = 0.

@@ -69,6 +69,8 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         super()._init_buffers()
         self._init_defense()
         self._init_counterattacks()
+        acc_joints = tuple(self.config.defense.get('upper_acc_joints', ['waist', 'shoulder', 'elbow', 'wrist']))  # penalty_upper_dof_acc
+        self._upper_dof_mask = torch.tensor([float(any(q in n for q in acc_joints)) for n in self.dof_names], device=self.device)
 
     def _init_defense(self):
         dc = self.config.defense
@@ -306,6 +308,15 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
         self._counter_clip_gain = torch.where(leg, torch.full_like(bank.duration, float(cc.get('leg_reward_scale', 1.0))), torch.ones_like(bank.duration))
         self._counter_clip_radius = torch.where(leg, torch.full_like(bank.duration, float(cc.get('leg_hit_radius', 0.12))),
                                                 torch.full_like(bank.duration, self._counter_hit_radius))
+        # the striking limb's joints per striker (counter_bank.STRIKERS order), for defense_counter_limb_vel
+        arm, leg_parts = ('shoulder', 'elbow', 'wrist'), ('hip', 'knee', 'ankle')
+        limb = lambda side, parts: [i for i, n in enumerate(self.dof_names) if n.startswith(side) and any(q in n for q in parts)]
+        self._striker_dof_mask = torch.zeros(len(STRIKERS), self.num_dof, device=self.device)
+        for k, name in enumerate(STRIKERS):
+            self._striker_dof_mask[k, limb(name.split('_')[0], arm if 'hand' in name else leg_parts)] = 1.0
+        self._counter_limb_vel_sigma = float(cc.get('limb_vel_sigma', 4.0))
+        self._counter_limb_vel_relative = bool(cc.get('limb_vel_relative', False))
+        self._counter_limb_action_rate_scale = float(cc.get('limb_action_rate_scale', 1.0))
         # target on the attacker per clip: the body whose height in guard is nearest the strike height
         ab = self._attack_bank
         candidates = [ab.body_names.index(n) for n in ('pelvis', 'torso_link', 'head_link') if n in ab.body_names]
@@ -1067,6 +1078,40 @@ class LeggedRobotDefense(LeggedRobotMotionTracking):
     ###########################################################################
     def _reward_defense_counter_hit(self):
         return self._counter_event * self._counter_gain
+
+    def _reward_defense_counter_limb_vel(self):
+        # during a counter: the striking limb's joint velocities follow the clip's (exp of the mean squared error over the
+        # limb's joints / counter.limb_vel_sigma [rad^2/s^2]); a slow strike that only reaches the target earns little
+        if not self._counter_enabled:
+            return torch.zeros(self.num_envs, device=self.device)
+        m = self._striker_dof_mask[self._counter_bank.striker[self._counter_clip]]
+        n = m.sum(dim=-1).clamp(min=1.0)
+        err = (self.dif_joint_velocities.square() * m).sum(dim=-1) / n
+        sigma = self._counter_limb_vel_sigma
+        if self._counter_limb_vel_relative:
+            # relative to the clip's own speed: the kernel widens with it (a strike at half speed still earns more than
+            # none: the absolute kernel is ~0 for both), and each step counts by how fast the clip moves there (the strike
+            # itself, not the slow wind-up the robot already matches)
+            ref = ((self.dif_joint_velocities + self.simulator.dof_vel).square() * m).sum(dim=-1) / n
+            return self._counter_active.float() * ref / (ref + sigma) * torch.exp(-err / (sigma + ref))
+        return self._counter_active.float() * torch.exp(-err / sigma)
+
+    def _reward_penalty_action_rate(self):
+        # as the base term, but during a counter the striking limb's joints count by counter.limb_action_rate_scale: a fast
+        # strike needs large action changes, and at full penalty scale this term caps the strike speed (def21 at ~0.1 of the
+        # scale threw them ~1.6x as fast); its jaggedness is left to penalty_action_jerk / penalty_upper_dof_acc
+        d = (self.last_actions - self.actions).square()
+        scale = getattr(self, '_counter_limb_action_rate_scale', 1.0)
+        if self._counter_enabled and scale != 1.0:
+            m = self._striker_dof_mask[self._counter_bank.striker[self._counter_clip]] * self._counter_active.float()[:, None]
+            d = d * (1.0 - (1.0 - scale) * m)
+        return d.sum(dim=1)
+
+    def _reward_penalty_upper_dof_acc(self):
+        # joint acceleration of the joints in defense.upper_acc_joints only (default waist and arms; the legs keep their
+        # freedom for balance on steps. def27: with the waist in, steps lost 3-4 points)
+        acc = ((self.last_dof_vel - self.simulator.dof_vel) / self.dt).square()
+        return (acc * self._upper_dof_mask).sum(dim=-1)
 
     def _reward_defense_counter_proximity(self):
         return self._counter_gain * self._counter_window * torch.exp(-((self._counter_dist - self._counter_depth).clamp(min=0.0) / self._counter_sigma_now) ** 2) if self._counter_enabled \

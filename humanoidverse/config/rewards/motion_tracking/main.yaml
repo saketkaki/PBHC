@@ -110,6 +110,7 @@ rewards:
   reward_penalty_reward_names : [
     "penalty_torques",
     "penalty_dof_acc",
+    "penalty_upper_dof_acc",
     "penalty_dof_vel",
     "penalty_action_rate",
     "penalty_action_jerk",

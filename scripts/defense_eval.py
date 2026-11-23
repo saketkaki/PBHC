@@ -61,6 +61,7 @@ import humanoidverse.utils.config_utils  # noqa: F401,E402  (registers the `eval
 from humanoidverse.utils.helpers import pre_process_config  # noqa: E402
 from humanoidverse.envs.defense.attack_bank import ATTACKS, NUM_PHASES  # noqa: E402
 from humanoidverse.envs.defense.defense import PENDING  # noqa: E402
+from humanoidverse.envs.defense.counter_bank import SHIN, STRIKERS  # noqa: E402
 
 ckpt = Path(args.ckpt)
 config = OmegaConf.load(ckpt.parent / 'config.yaml')
@@ -222,6 +223,134 @@ class Smoothness:
         return out
 
 
+class CounterQuality:
+    """ How fast and how clean the counters are, per clip, over the counters performed to their end in counted episodes
+    (robot next to its reference clip):
+      peak speed   of the striking hand / foot / shin within hit_window of the clip's strike time [m/s]
+      lag          time of the robot's peak minus the reference's [s] (> 0: the strike comes late)
+      jerk         RMS third time derivative of the striker's path over the clip [m/s^3] (a jagged strike is high)
+      joint vel    RMS speed of the striking limb's joints (arm: shoulder, elbow; leg: hip, knee, ankle), robot / reference,
+                   and the RMS error between them [rad/s] """
+    def __init__(self):
+        self.on = bool(getattr(env, '_counter_enabled', False))
+        if not self.on:
+            return
+        self.bank = bank = env._counter_bank
+        self.T = int(float(bank.duration.max()) / env.dt) + 4
+        self.pos = torch.zeros(2, N, self.T, 3, device=dev)  # robot, reference
+        self.jv = torch.zeros(3, N, self.T, device=dev)  # per step, over the limb's joints: sum v^2, ref^2, error^2
+        self.cost = torch.zeros(5, N, self.T, device=dev)  # per step, the limb's: torque-limit penalty raw, steps near the limit, action rate^2
+        self.idx = torch.zeros(N, dtype=torch.long, device=dev)
+        self.prev_active = torch.zeros(N, dtype=torch.bool, device=dev)
+        self.prev_act = torch.zeros(N, env.num_dof, device=dev)  # the policy action of the previous step (env.last_actions is updated before we see it)
+        names = list(env.dof_names)
+        limb = lambda side, parts: [i for i, n in enumerate(names) if n.startswith(side) and any(p in n for p in parts)]
+        arm, leg = ('shoulder', 'elbow', 'wrist'), ('hip', 'knee', 'ankle')
+        masks = {'left_hand_link': limb('left', arm), 'right_hand_link': limb('right', arm),
+                 'left_ankle_roll_link': limb('left', leg), 'right_ankle_roll_link': limb('right', leg),
+                 'left_shin': limb('left', leg), 'right_shin': limb('right', leg)}
+        self.mask = torch.zeros(len(STRIKERS), env.num_dof, device=dev)
+        for k, name in enumerate(STRIKERS):
+            self.mask[k, masks[name]] = 1.0
+        K = bank.num_clips
+        self.acc = {k: torch.zeros(K, device=dev) for k in
+                    ('n', 'peak', 'ref_peak', 'lag', 'abs_lag', 'jerk2', 'ref_jerk2', 'jv2', 'ref_jv2', 'err2', 'jsteps', 'tlim', 'tsat', 'arate2', 'steps', 'dwell', 'prox')}
+        w = float(env._counter_hit_window)
+        self.win = ((bank.impact_time - w) / env.dt).long().clamp(min=0), ((bank.impact_time + w) / env.dt).long()
+
+    def ref_strikers(self):
+        p, nb = env.ref_body_pos_extend, env.num_bodies  # extended bodies after the rigid ones: left hand, right hand, head
+        knee, ankle = p[:, env._knee_ids], p[:, env._ankle_pitch_ids]
+        return torch.cat([p[:, [nb, nb + 1]], p[:, env._ankle_ids], knee + SHIN * (ankle - knee)], dim=1)
+
+    def step(self, dones, counted):
+        if not self.on:
+            return
+        prev_act, self.prev_act = self.prev_act, env.actions.clone()
+        active = env._counter_active
+        ended = self.prev_active & ~active & ~dones & counted
+        if ended.any():
+            self.finish(ended.nonzero(as_tuple=False).flatten())
+        self.idx[~active | dones] = 0
+        ids = (active & ~dones & counted).nonzero(as_tuple=False).flatten()
+        self.prev_active = active & ~dones
+        if len(ids) == 0:
+            return
+        s = self.bank.striker[env._counter_clip[ids]]
+        i = self.idx[ids].clamp(max=self.T - 1)
+        self.pos[0, ids, i] = env._defender_strikers()[ids, s]
+        self.pos[1, ids, i] = self.ref_strikers()[ids, s]
+        v = env.simulator.dof_vel[ids]
+        r = env.dif_joint_velocities[ids] + v
+        m = self.mask[s]
+        self.jv[0, ids, i] = (v.square() * m).sum(-1)
+        self.jv[1, ids, i] = (r.square() * m).sum(-1)
+        self.jv[2, ids, i] = ((r - v).square() * m).sum(-1)
+        tau, lim = env.torques[ids].abs(), env.torque_limits
+        soft = float(getattr(env, 'soft_torque_curriculum_value', env.config.rewards.reward_limit.soft_torque_limit))
+        over = (tau - lim * soft).clip(min=0., max=1.)
+        self.cost[0, ids, i] = (over * m).sum(-1)
+        self.cost[1, ids, i] = ((over > 0).float() * m).sum(-1)
+        self.cost[2, ids, i] = ((env.actions[ids] - prev_act[ids]).square() * m).sum(-1)
+        # dwell: steps in the hit window with the striker within the landing radius of the target, and the proximity
+        # reward the env pays on that step (counter.proximity_sigma kernel, before its scale)
+        near = env._counter_window[ids] * (env._counter_dist[ids] < env._counter_clip_radius[env._counter_clip[ids]]).float()
+        self.cost[3, ids, i] = near
+        self.cost[4, ids, i] = env._counter_window[ids] * torch.exp(-((env._counter_dist[ids] - env._counter_depth[ids]).clamp(min=0.0) / env._counter_sigma_now[ids]) ** 2)
+        self.idx[ids] += 1
+
+    def finish(self, ids):
+        L, clip = self.idx[ids], env._counter_clip[ids]
+        keep = L >= 10
+        ids, L, clip = ids[keep], L[keep], clip[keep]
+        if len(ids) == 0:
+            return
+        dt, T = env.dt, self.T
+        P = self.pos[:, ids]  # [2, n, T, 3]
+        t = torch.arange(T, device=dev)
+        valid = t[None] < L[:, None]
+        speed = (P[:, :, 1:] - P[:, :, :-1]).norm(dim=-1) / dt  # [2, n, T-1]
+        lo, hi = self.win[0][clip], self.win[1][clip]
+        in_win = (t[None, 1:] >= lo[:, None]) & (t[None, 1:] <= hi[:, None]) & valid[:, 1:]
+        peak, arg = (speed * in_win).max(dim=-1)  # [2, n]
+        lag = (arg[0] - arg[1]).float() * dt
+        j = P[:, :, 3:] - 3 * P[:, :, 2:-1] + 3 * P[:, :, 1:-2] - P[:, :, :-3]
+        vj = valid[:, 3:].float()
+        jerk2 = (j.square().sum(-1) * vj).sum(-1) / vj.sum(-1).clamp(min=1) / dt ** 6  # [2, n]
+        jv = (self.jv[:, ids] * valid).sum(-1)  # [3, n]
+        cost = (self.cost[:, ids] * valid).sum(-1)  # [3, n]
+        nj = self.mask[self.bank.striker[clip]].sum(-1) * L
+        a = self.acc
+        for k, val in (('n', torch.ones_like(lag)), ('peak', peak[0]), ('ref_peak', peak[1]), ('lag', lag), ('abs_lag', lag.abs()),
+                       ('jerk2', jerk2[0]), ('ref_jerk2', jerk2[1]), ('jv2', jv[0]), ('ref_jv2', jv[1]), ('err2', jv[2]), ('jsteps', nj),
+                       ('tlim', cost[0]), ('tsat', cost[1]), ('arate2', cost[2]), ('steps', L.float()), ('dwell', cost[3]), ('prox', cost[4])):
+            a[k].index_add_(0, clip, val)
+
+    def result(self):
+        if not self.on:
+            return None
+        a = {k: v.tolist() for k, v in self.acc.items()}
+        def one(sel):
+            n = max(sum(a['n'][k] for k in sel), 1)
+            js = max(sum(a['jsteps'][k] for k in sel), 1)
+            tot = lambda key: sum(a[key][k] for k in sel)
+            return {'counters': int(sum(a['n'][k] for k in sel)), 'peak_speed': tot('peak') / n, 'ref_peak_speed': tot('ref_peak') / n,
+                    'lag_s': tot('lag') / n, 'abs_lag_s': tot('abs_lag') / n,
+                    'jerk_rms': (tot('jerk2') / n) ** 0.5, 'ref_jerk_rms': (tot('ref_jerk2') / n) ** 0.5,
+                    'limb_vel_rms': (tot('jv2') / js) ** 0.5, 'ref_limb_vel_rms': (tot('ref_jv2') / js) ** 0.5,
+                    'limb_vel_err_rms': (tot('err2') / js) ** 0.5,
+                    'limb_torque_limit_raw_per_step': tot('tlim') / max(tot('steps'), 1),  # limits_torque's raw term, the limb's share
+                    'limb_near_torque_limit_share': tot('tsat') / js,  # share of limb joint-steps above the soft torque limit
+                    'limb_action_rate_rms': (tot('arate2') / js) ** 0.5,
+                    'dwell_s': tot('dwell') / n * env.dt,  # per counter: time the striker sits within the landing radius in the hit window
+                    'proximity_kernel_sum': tot('prox') / n}  # per counter: sum of the proximity kernel (x scale x dt = its reward)
+        K = self.bank.num_clips
+        out = {self.bank.names[k]: one([k]) for k in range(K) if a['n'][k] > 0}
+        out['all'] = one(list(range(K)))
+        return out
+
+
+cq = CounterQuality()
 smooth = Smoothness()
 lengths = []
 body_err_sum, err_steps = 0., 0
@@ -263,6 +392,7 @@ with torch.no_grad():
         dones = dones.bool()
         alive = ~dones & counted  # terminal states are reset already
         smooth.step(alive)
+        cq.step(dones, counted)
         if alive.any():
             body_err_sum += (env.ref_body_pos_extend[alive] - env._rigid_body_pos_extend[alive]).norm(dim=-1).mean(dim=-1).sum().item() * 1e3
             err_steps += int(alive.sum())
@@ -316,6 +446,7 @@ result = {
     'block_max_target_dist': env._block_max_target_dist,
     'per_class': per_class,
     'smoothness': smooth.result(),
+    'counter_quality': cq.result(),
 }
 if combo_outcomes.sum() > 0:
     n = combo_outcomes.tolist()
@@ -382,6 +513,16 @@ print(f"joint speed RMS above {Smoothness.HF_HZ:.0f} Hz (rad/s, robot / referenc
       f"waist {m['hf_vel_rms_waist']:.3f} / {m['ref_hf_vel_rms_waist']:.3f}, arms {m['hf_vel_rms_arms']:.3f} / {m['ref_hf_vel_rms_arms']:.3f}")
 print(f"penalty raw sums per step: action_rate {m['penalty_action_rate_raw']:.3g}, dof_acc {m['penalty_dof_acc_raw']:.3g}, "
       f"torques {m['penalty_torques_raw']:.3g}")
+if result['counter_quality']:
+    print(f"{'counter quality':16s} {'n':>5s} {'peak m/s rob/ref':>17s} {'lag ms':>7s} {'|lag| ms':>8s} {'jerk rob/ref':>14s} {'limb vel rob/ref':>17s} {'vel err':>8s}")
+    for name, q in result['counter_quality'].items():
+        print(f"cq {name:13s} {q['counters']:5d} {q['peak_speed']:8.2f} / {q['ref_peak_speed']:5.2f} {1e3 * q['lag_s']:7.0f} {1e3 * q['abs_lag_s']:8.0f} "
+              f"{q['jerk_rms']:6.0f} / {q['ref_jerk_rms']:5.0f} {q['limb_vel_rms']:8.2f} / {q['ref_limb_vel_rms']:5.2f} {q['limb_vel_err_rms']:8.2f}")
+    q = result['counter_quality']['all']
+    print(f"counter cost (striking limb): torque-limit penalty raw {q['limb_torque_limit_raw_per_step']:.3f} per step, "
+          f"{q['limb_near_torque_limit_share']:.1%} of joint-steps above the soft torque limit, action rate RMS {q['limb_action_rate_rms']:.3f}")
+    print(f"counter dwell: striker within the landing radius {1e3 * q['dwell_s']:.0f} ms per counter of the "
+          f"{2e3 * env._counter_hit_window:.0f} ms hit window; proximity kernel sum {q['proximity_kernel_sum']:.1f} per counter")
 if has_belief:
     b = result['belief']
     print(f"belief: class acc {b['class_acc']:.1%} (by phase guard/strike/retract/guard: "

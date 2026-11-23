@@ -40,6 +40,7 @@ env:
       block_max_target_dist: 0.2 # [m] a block counts only with the contact on the forearm this close to the target; null = anywhere
       overlap_margin: 0.05 # [m] defense_attacker_overlap: defender forearms closer than this to the attacker (outside its striking limb)
       threat_lead_time: 0.1 # [s] the threat window starts this long before the onset and ends at the recovered frame
+      upper_acc_joints: [waist, shoulder, elbow, wrist] # penalty_upper_dof_acc: the joints whose acceleration it charges
       tracking_relax: 0.5 # guard-tracking rewards are scaled by (1 - tracking_relax) in the threat window
       proximity_sigma: 0.1 # [m] defense_striker_proximity reward
       tti_clip: 1.0 # [s] time to impact in attack_privileged
@@ -77,6 +78,9 @@ env:
         leg_aim_depth: 0.06 # [m] the same for a strike at the attacker's leg (the calf kick)
         leg_hit_radius: 0.12 # [m]
         leg_reward_scale: 1.0 # defense_counter_hit and _proximity are multiplied by this for a strike at the leg
+        limb_vel_sigma: 4.0 # [rad^2/s^2] defense_counter_limb_vel: the striking limb's joint velocities follow the clip's
+        limb_vel_relative: False # True: the error relative to the clip's speed, steps weighted by it (the absolute kernel is ~0 during the strike itself)
+        limb_action_rate_scale: 1.0 # penalty_action_rate on the striking limb's joints during a counter is multiplied by this (it caps strike speed)
         leg_proximity_sigma: 0.3 # [m] wider than proximity_sigma: a kick that is not thrown yet starts far from the leg
         reanchor: 0.0 # [m] the reference stays stepped in until a counter ends, then the guard moves to the robot, at most this far (0: the robot steps back)
         reanchor_attacks: False # True: the guard also moves to the robot when an attack ends (not only when a counter ends)
