@@ -8,13 +8,18 @@ The 13-dim vector consists of 8 class logits (one for each attack), 4 phase logi
 Rolls out a defense checkpoint with an attack encoder (exp/defense*.yaml, AttackAwareActor), records at every step and env
 the actor's latent z [32] and belief head output [13] next to the privileged labels (attack class, phase, time to impact),
 and plots them. The 13 belief numbers are not treated as one 13-D vector: each slice gets its own plot.
+  example_attack.png  how to read the strips: one attack zoomed in, under a labelled timeline of its phases, with
+                  callouts (guessing before the onset, the moment the belief locks on, the strike remembered afterwards,
+                  the time-to-impact countdown). The attack is picked automatically (misread before its onset, recognised
+                  during the strike, not a calf kick, which is recognised early); --example-env picks the env to take it from
   strips.png      per example env, over time: class probabilities (heatmap, true class outlined), phase probabilities,
                   predicted vs true time to impact; dashed lines mark episode resets
   radviz.png      the 8 class probabilities as one point: the probability-weighted mean of an octagon's corners (one
                   corner per class); a confident belief sits on a corner, an unsure one near the centre. One panel per phase
   confusion.png   true vs predicted class, row-normalised, one panel per phase
-  z_embedding.png z in 2-D by PCA and t-SNE, coloured by class (strike and retract steps only; guard steps in grey), by
-                  phase, and by true time to impact
+  z_embedding.png z in 2-D by t-SNE, coloured by class (strike and retract steps only; guard steps in grey), by phase,
+                  and by true time to impact. Only which points are near each other means anything: not the axes, and not
+                  the distances between separate groups
 Phases: 0 guard (before onset), 1 strike (onset to impact), 2 retract, 3 guard (after). The class label of a guard step
 is the attack about to come (phase 0) or just thrown (phase 3); before the onset it cannot be seen in the keypoints.
 
@@ -40,6 +45,7 @@ parser.add_argument('--difficulty', type=float, default=1.0)
 parser.add_argument('--strip-envs', type=int, default=3, help='example envs in strips.png')
 parser.add_argument('--strip-s', type=float, default=15.0, help='seconds shown per example in strips.png')
 parser.add_argument('--max-points', type=int, default=6000, help='points per panel in radviz.png and for t-SNE')
+parser.add_argument('--example-env', type=int, default=None, help='env to take the attack in example_attack.png from')
 args, overrides = parser.parse_known_args()
 if (args.ckpt is None) == (args.from_npz is None):
     parser.error('give either CKPT or --from-npz')
@@ -182,6 +188,138 @@ def plot_strips(d, out, plt, cmap):
     plt.close(fig)
 
 
+PHASE_NOTES = ['attacker idle: the next attack\nis chosen but not visible yet',
+               'onset to impact:\nthe limb moves in',
+               'after the impact:\nthe limb comes back',
+               'back in guard: the strike is still\nin the keypoint history']
+
+
+def find_example(d, cls_p):
+    """ -> (env, a, o, i, r, b): the steps at which one complete attack's guard (before), strike, retract and guard (after)
+    start, and the next attack's guard (before); no reset near it. A typical attack if there is one (misread before the
+    onset, recognised during the strike, not a calf kick), else the first complete one; None if there is none. """
+    ph, lab, done = d['phase'], d['label'], d['done']
+    pred = cls_p.argmax(-1)
+    classes = list(d['classes'])
+    first = None
+    for e in ([args.example_env] if args.example_env is not None else range(ph.shape[1])):
+        x = ph[:, e]
+        starts = np.flatnonzero(np.diff(x)) + 1  # steps where a new phase starts
+        for k in range(len(starts) - 4):
+            a, o, i, r, b = starts[k:k + 5]
+            if [x[a], x[o], x[i], x[r], x[b]] != [0, 1, 2, 3, 0] or done[max(a - 12, 0):b + 18, e].any():
+                continue
+            first = first or (e, a, o, i, r, b)
+            if ((pred[a:o, e] == lab[a:o, e]).mean() < 0.5 and (pred[o:i, e] == lab[o:i, e]).mean() > 0.8
+                    and classes[lab[o, e]] != 'calf_kick'):
+                return e, a, o, i, r, b
+    return first
+
+
+def plot_example(d, out, plt, cmap):
+    """ example_attack.png: one attack zoomed in, under a labelled timeline of its phases, with callouts. """
+    classes = list(d['classes'])
+    cls_p, ph_p, tti_pred = split_belief(d)
+    ex = find_example(d, cls_p)
+    if ex is None:
+        print('example_attack.png: no complete attack without a reset nearby; skipped')
+        return
+    e, a, o, i, r, b = ex
+    dt = float(d['dt'])
+    lo, hi = max(a - 12, 0), min(b + 18, d['phase'].shape[0])
+    T = lambda s: (s - o) * dt  # seconds from the onset; a phase starting at step s is drawn from T(s) - dt / 2
+    t = T(np.arange(lo, hi))
+    c, name = int(d['label'][o, e]), classes[int(d['label'][o, e])]
+    ok = cls_p[o:i, e].argmax(-1) == c
+    lock = next((o + k for k in range(len(ok)) if ok[k:].all()), None)  # names the attack from here to the impact
+    box = dict(boxstyle='round,pad=0.35', fc=SURFACE, ec=GREY, alpha=0.95)
+    arrow = dict(arrowstyle='->', color=INK, lw=1)
+    note = dict(fontsize=8, color=INK, bbox=box, arrowprops=arrow, va='center')
+    up = c < len(classes) / 2  # callouts on the side of the class panel away from the true class
+    y_far, y_near = (6.3, 4.4) if up else (0.7, 2.6)
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 11), sharex=True,
+                             gridspec_kw={'height_ratios': [2.4, 8, 4, 3.6], 'hspace': 0.45})
+    fig.patch.set_facecolor(SURFACE)
+    a_band, a_cls, a_ph, a_tti = axes
+    extent = (t[0] - dt / 2, t[-1] + dt / 2)
+
+    # the timeline: one band per phase, the previous attack's end and the next attack's start faded
+    for s0, s1, p, alpha in [(lo, a, 3, 0.35), (a, o, 0, 1), (o, i, 1, 1), (i, r, 2, 1), (r, b, 3, 1), (b, hi, 0, 0.35)]:
+        if s1 <= s0:
+            continue
+        x0, x1 = T(s0) - dt / 2, T(s1) - dt / 2
+        a_band.axvspan(x0, x1, color=PHASE_COLORS[p], alpha=alpha, lw=0)
+        ink = SURFACE if p in (1, 3) and alpha == 1 else INK
+        if alpha == 1:
+            a_band.text((x0 + x1) / 2, 0.74, PHASES[p], ha='center', va='center', fontsize=9, color=ink, weight='bold')
+            a_band.text((x0 + x1) / 2, 0.34, PHASE_NOTES[p], ha='center', va='center', fontsize=7.5, color=ink, linespacing=1.3)
+        else:
+            a_band.text((x0 + x1) / 2, 0.5, 'previous\nattack' if s0 == lo else 'next\nattack', ha='center', va='center',
+                        fontsize=7.5, color=INK2)
+    a_band.set_ylim(0, 1)
+    a_band.set_yticks([])
+    for s in a_band.spines.values():
+        s.set_visible(False)
+    for s, label in ((o, 'onset'), (i, 'impact')):
+        a_band.text(T(s) - dt / 2, 1.04, label, ha='center', va='bottom', fontsize=8, color=INK, weight='bold')
+        for ax in axes:
+            ax.axvline(T(s) - dt / 2, color=INK, lw=1, ls=(0, (4, 3)))
+    for s in (a, r, b):
+        for ax in axes[1:]:
+            ax.axvline(T(s) - dt / 2, color=INK2, lw=0.6, alpha=0.6)
+
+    # class belief
+    a_cls.imshow(cls_p[lo:hi, e].T, aspect='auto', origin='lower', cmap=cmap, vmin=0, vmax=1, interpolation='nearest',
+                 extent=extent + (-0.5, len(classes) - 0.5))
+    a_cls.step(t, d['label'][lo:hi, e], where='mid', color=INK, lw=1.2)
+    a_cls.set_yticks(range(len(classes)), classes)
+    a_cls.set_title('Attack class belief: darker = more probability on that attack. Line: the true attack', fontsize=9,
+                    color=INK, loc='left')
+    pre = cls_p[a:o, e]
+    a_cls.annotate(f'Guessing. The next attack ({name}) is\nalready chosen, but the attacker has\nnot moved: the belief '
+                   f'is spread\n(on the true attack {(pre.argmax(-1) == c).mean():.0%} of these steps)',
+                   xy=(T((a + o) // 2), pre[(o - a) // 2].argmax()), xytext=(T(a) + 0.02, y_far), ha='left', **note)
+    if lock is not None:
+        a_cls.annotate(f'Locks on to {name} {1e3 * (lock - o) * dt:.0f} ms after the onset,\n'
+                       f'{1e3 * (i - lock) * dt:.0f} ms before the impact', xy=(T(lock), c), xytext=(T(o) + 0.05, y_near),
+                       ha='left', **note)
+    a_cls.annotate('Still sure once back in guard:\nthe strike is in the keypoint\nhistory (fades as it leaves it)',
+                   xy=(T(r + (b - r) // 4), c), xytext=(T(r) + 0.02, y_far), ha='left', **note)
+    nxt = int(d['label'][b, e])
+    a_cls.annotate(f"Next attack chosen ({classes[nxt]}{' again' if nxt == c else ''}):\nback to guessing",
+                   xy=(T(b) - dt / 2, nxt), xytext=(t[-1] - 0.02, y_near), ha='right', **note)
+
+    # phase belief
+    a_ph.imshow(ph_p[lo:hi, e].T, aspect='auto', origin='lower', cmap=cmap, vmin=0, vmax=1, interpolation='nearest',
+                extent=extent + (-0.5, len(PHASES) - 0.5))
+    a_ph.step(t, d['phase'][lo:hi, e], where='mid', color=INK, lw=1.2)
+    a_ph.set_yticks(range(len(PHASES)), PHASES)
+    a_ph.set_title('Phase belief (shading) and the true phase (line): a good belief follows the staircase', fontsize=9,
+                   color=INK, loc='left')
+
+    # time to impact
+    a_tti.axhline(0, color=GREY, lw=0.8)
+    a_tti.plot(t, d['tti'][lo:hi, e], color=INK2, lw=2)
+    a_tti.plot(t, tti_pred[lo:hi, e], color=BLUE_RAMP[4], lw=2)
+    a_tti.set_ylim(-1.35, 1.45)
+    a_tti.set_ylabel('[s]', color=INK2, fontsize=8)
+    a_tti.set_title('Time to impact: true (grey) counts down to 0 at the impact, then below; predicted (blue)',
+                    fontsize=9, color=INK, loc='left')
+    a_tti.annotate(f'flat at {tti_pred[a:o, e].mean():.1f} s: it cannot\ntell when the attack comes',
+                   xy=(T((a + o) // 2), tti_pred[(a + o) // 2, e]), xytext=(T(a) + 0.02, -0.8), ha='left', **note)
+    a_tti.annotate('impact: 0', xy=(T(i) - dt / 2, 0), xytext=(T(i) + 0.12, 0.95), ha='left', **note)
+    a_tti.set_xlabel("time from the attack's onset [s]", color=INK2)
+    for ax in axes[1:]:
+        style(ax)
+    a_band.tick_params(colors=INK2, labelsize=8)
+    a_band.set_xlim(*extent)
+    fig.suptitle(f'How to read the belief strips: one {name} thrown at the robot (env {e}), step by step',
+                 color=INK, fontsize=12, y=0.95)
+    fig.savefig(out / 'example_attack.png', dpi=150, bbox_inches='tight', facecolor=SURFACE)
+    plt.close(fig)
+
+
 def subsample(idx, n, rng):
     return idx if len(idx) <= n else rng.choice(idx, n, replace=False)
 
@@ -248,7 +386,6 @@ def plot_confusion(d, out, plt, cmap):
 
 
 def plot_z(d, out, plt, cmap, rng):
-    from sklearn.decomposition import PCA
     from sklearn.manifold import TSNE
     from matplotlib.lines import Line2D
     classes = list(d['classes'])
@@ -258,32 +395,31 @@ def plot_z(d, out, plt, cmap, rng):
     idx = np.concatenate([subsample(np.flatnonzero(phase == p), args.max_points // len(PHASES), rng) for p in range(len(PHASES))])
     rng.shuffle(idx)
     zs = (z[idx] - z.mean(0)) / (z.std(0) + 1e-6)
-    pca = PCA(2).fit(zs)
-    emb = {f'PCA (explains {pca.explained_variance_ratio_.sum():.0%} of the variance)': pca.transform(zs)}
     print(f't-SNE on {len(idx)} points ...')
-    emb['t-SNE'] = TSNE(2, perplexity=40, init='pca', random_state=args.seed).fit_transform(zs)
-    fig, axes = plt.subplots(2, 3, figsize=(16, 10.5))
+    xy = TSNE(2, perplexity=40, init='pca', random_state=args.seed).fit_transform(zs)
+    fig, axes = plt.subplots(1, 3, figsize=(17, 6.2))
     fig.patch.set_facecolor(SURFACE)
     lab, ph, tt = label[idx], phase[idx], tti[idx]
     attack = np.isin(ph, (1, 2))
-    for r, (name, xy) in enumerate(emb.items()):
-        a_cls, a_ph, a_tti = axes[r]
-        a_cls.scatter(*xy[~attack].T, s=5, color=GREY, alpha=0.3, lw=0)
-        a_cls.scatter(*xy[attack].T, s=7, c=np.array(CLASS_COLORS)[lab[attack]], alpha=0.6, lw=0)
-        a_cls.set_title(f'{name}\nby class (strike and retract; guard in grey)', fontsize=9, color=INK, loc='left')
-        a_ph.scatter(*xy.T, s=6, c=np.array(PHASE_COLORS)[ph], alpha=0.5, lw=0)
-        a_ph.set_title('by phase', fontsize=9, color=INK, loc='left')
-        a_ph.legend(handles=[Line2D([], [], marker='o', ls='', color=c, markersize=7, label=n) for c, n in zip(PHASE_COLORS, PHASES)],
-                    frameon=False, fontsize=8, labelcolor=INK2, loc='best')
-        sc = a_tti.scatter(*xy.T, s=6, c=tt, cmap=cmap.reversed(), vmin=-1, vmax=1, alpha=0.6, lw=0)
-        a_tti.set_title('by true time to impact (clipped to +-1 s; light: impact ahead, dark: impact past)', fontsize=9, color=INK, loc='left')
-        fig.colorbar(sc, ax=a_tti, fraction=0.04).set_label('time to impact [s]', color=INK2)
-        for ax in axes[r]:
-            style(ax)
-            ax.set_xticks([])
-            ax.set_yticks([])
-    class_legend(fig, classes, loc='lower center', bbox_to_anchor=(0.5, -0.01))
-    fig.suptitle(f'Attack encoder latent z ({z.shape[-1]}-D), {len(idx)} steps balanced over the phases', color=INK, fontsize=12)
+    a_cls, a_ph, a_tti = axes
+    a_cls.scatter(*xy[~attack].T, s=5, color=GREY, alpha=0.3, lw=0)
+    a_cls.scatter(*xy[attack].T, s=7, c=np.array(CLASS_COLORS)[lab[attack]], alpha=0.6, lw=0)
+    a_cls.set_title('by attack (strike and retract steps; guard steps in grey)', fontsize=9, color=INK, loc='left')
+    a_ph.scatter(*xy.T, s=6, c=np.array(PHASE_COLORS)[ph], alpha=0.5, lw=0)
+    a_ph.set_title('by phase', fontsize=9, color=INK, loc='left')
+    a_ph.legend(handles=[Line2D([], [], marker='o', ls='', color=c, markersize=7, label=n) for c, n in zip(PHASE_COLORS, PHASES)],
+                frameon=False, fontsize=8, labelcolor=INK2, loc='best')
+    sc = a_tti.scatter(*xy.T, s=6, c=tt, cmap=cmap.reversed(), vmin=-1, vmax=1, alpha=0.6, lw=0)
+    a_tti.set_title('by true time to impact (clipped to +-1 s; light: impact ahead, dark: impact past)', fontsize=9, color=INK, loc='left')
+    fig.colorbar(sc, ax=a_tti, fraction=0.04).set_label('time to impact [s]', color=INK2)
+    for ax in axes:
+        style(ax)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    class_legend(fig, classes, loc='lower center', bbox_to_anchor=(0.5, -0.04))
+    fig.suptitle(f'Attack encoder latent z ({z.shape[-1]}-D) by t-SNE: one dot per step ({len(idx)} steps, balanced over the '
+                 f'phases); nearby dots had similar z.\nAxes and the distances between separate groups carry no meaning.',
+                 color=INK, fontsize=11)
     fig.savefig(out / 'z_embedding.png', dpi=150, bbox_inches='tight', facecolor=SURFACE)
     plt.close(fig)
 
@@ -315,11 +451,12 @@ def main():
           f"{(cls_p.argmax(-1) == d['label']).mean():.1%} (strike {(cls_p.argmax(-1) == d['label'])[striking].mean():.1%}) | "
           f"phase acc {(ph_p.argmax(-1) == d['phase']).mean():.1%} | "
           f"tti MAE during strike {1e3 * np.abs(tti_pred - d['tti'])[striking].mean():.0f} ms")
+    plot_example(d, out, plt, cmap)
     plot_strips(d, out, plt, cmap)
     plot_radviz(d, out, plt, rng)
     plot_confusion(d, out, plt, cmap)
     plot_z(d, out, plt, point_cmap, rng)
-    print(f'wrote {out}/{{latents.npz, strips.png, radviz.png, confusion.png, z_embedding.png}}')
+    print(f'wrote {out}/{{latents.npz, example_attack.png, strips.png, radviz.png, confusion.png, z_embedding.png}}')
 
 
 if __name__ == '__main__':
